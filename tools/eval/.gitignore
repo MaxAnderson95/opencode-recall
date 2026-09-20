@@ -1,0 +1,3 @@
+# Mined labels contain real query text from private sessions. Regenerate with `bun run mine`.
+data/
+node_modules/
