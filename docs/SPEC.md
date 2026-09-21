@@ -82,11 +82,15 @@ Searchability is a property, not a condition on existence. Parts excluded from s
 
 **`segments`**: `(part_id, start, length)`, one per FTS row. **`fts`**: FTS5 external-content table over the segment text, so the search index holds no second copy.
 
-**`chunks`**: `(part_id, start, length)`, plus scope, time, and the chunk content hash. Chunks are references, not stored text. Re-chunking rewrites offsets.
+**`chunks`**: the **exact embedding-input text**, stored, plus provenance (session, anchor message, window index, scope), time, and the chunk content hash. Chunks belong to a chunk set, which belongs to a vector space.
 
-**`vector_spaces`**: one row per space: model, dimensions, chunk size, overlap, per-turn cap, and whether it is active. **`vectors`**: `(chunk_id, space_id, embedding)`.
+Chunks are not offsets into parts, and cannot be. The embedded unit is a **turn pair**, not a slice of a part: a user message joined with every assistant message that follows it, rendered as `USER: …\nASSISTANT: …`, windowed at 1,200/200, with every window past the first prefixed `(re: <first 160 chars of the user text>)`. Non-assistant roles are rendered `[role] …`. That text spans several messages and contains literals present in no part. A second pass emits `user-messages`-scope chunks from top-level user text alone, so that text is embedded twice under two scopes.
 
-Space identity covers all five parameters together, because chunk boundaries determine what a vector represents as surely as the model does.
+Storing the text costs about 72 MB, roughly 5% of the archive, and makes semantic-hit snippets trivial, which is how the current plugin already works.
+
+**`vector_spaces`**: one row per space, holding the full embedding recipe and whether it is active. **`chunk_sets`**: chunks belong to a set, and a set belongs to a space, so a re-chunk builds new chunks alongside the old rather than rewriting them. **`vectors`**: `(chunk_id, space_id, embedding)`.
+
+Space identity is the whole recipe, not five parameters: model artifact revision, dimensions, tokenizer and preprocessing, pooling, normalization, query prefix, chunk size, overlap, per-turn cap, and the chunk-rendering version. Anything that changes the bytes fed to the model changes what a vector means. Vector reuse across a change requires identical input text **and** identical recipe.
 
 **`summaries`**: `(session_id, model, focus)` with the summary, `time_updated`, and created time. Survives an index rebuild.
 
@@ -98,11 +102,13 @@ The plugin extracts; the hub stores what arrives and derives the rest.
 
 Part types: `text` and `reasoning` pass through. A `tool` part contributes searchable text only when completed with non-empty output, rendered as `<tool> <title>\n<output>` and capped at 16,000 characters. File attachments are dropped entirely.
 
-Chunking is hub-side: 1,200 characters with 200 overlap, capped at 60,000 characters per turn.
+**Searchable and embedded are different sets.** All three kinds are segmented into FTS rows. Only `text` parts are embedded: tool output and reasoning are findable by BM25 but never enter a chunk. This is today's behaviour and it is deliberate, since tool output is 85% of the archive's text and embedding it would multiply the vector corpus for content that lexical search already covers well.
+
+Chunking is hub-side, 1,200 characters with 200 overlap and a 60,000-character per-turn cap, over the turn-pair rendering described in §3.2.
 
 ### 3.4 Retrieval
 
-Unchanged from today, because it was measured and is good.
+Unchanged from today, because it was measured and is good. "Unchanged" includes the embedded unit: the turn-pair rendering in §3.2 is part of what was measured, not an implementation detail free to vary.
 
 BM25 over FTS5 with every filter pushed into the SQL, never applied after a fixed top-N cut. Cosine over an in-memory `Float32Array` of the active space. Both branches capped at 60 candidates, fused with RRF at `k=60`, grouped by session with `perBranchCap: 3` and `hitsPerKey: 2`.
 
@@ -126,11 +132,18 @@ Blocking ingest on embedding was considered. It does not simplify anything, beca
 
 On boot, if the configured space identity does not match the active one, the hub logs loudly, keeps serving on the existing vectors, and does not re-embed on its own.
 
-`reindex` reports chunk count and estimated duration, then builds the replacement space alongside the live one and swaps atomically. An interrupted reindex leaves the existing index untouched.
+`reindex` reports chunk count and estimated duration, then builds a replacement space alongside the live one and activates it in one transaction. An interrupted reindex leaves the existing index untouched, and its partial chunk set and vectors are reclaimed.
 
-Two requirements. Query embedding belongs to the **active** space, not the configured one, or queries get embedded with the new model and compared against old vectors. And ingest continues during the rebuild, so the new space runs a chunk-hash catch-up before the swap.
+The build gets **its own chunk set**. A change to chunk size, overlap, or the rendering version produces different chunks, and the old vectors still need the old chunks to stay queryable until the swap, so chunks cannot be rewritten in place.
 
-A full pass is roughly 75,000 chunks at ~45 chunks/s, about half an hour.
+Four requirements make the swap correct while ingest continues:
+
+- Query embedding belongs to the **active** space, not the configured one, or queries get embedded with the new model and compared against old vectors. The query embedder and the in-memory matrix swap together, in the same transaction as activation.
+- Background embedding results are **fenced** by the source chunk hash and build id, so a job that completes after its source chunk was replaced is discarded rather than written.
+- Catch-up has a defined completion condition: the build tracks an ingest watermark, and is complete when no session has changed past it.
+- Activation happens under a short **write barrier** so no snapshot lands between the final catch-up check and the swap.
+
+A full pass is roughly 75,000 chunks. At the 45 chunks/s measured on an M5 Pro that is about half an hour, but that figure is unmeasured on the Linux host and is the number to re-measure before trusting any duration estimate the subcommand prints.
 
 ## 4. API
 
@@ -150,17 +163,33 @@ Search results carry the source host name and a boolean for whether that source 
 
 ## 5. Sync
 
-**Revision** is `session_v2.time_updated`. OpenCode has no per-session counter; `version` holds the OpenCode version string that created the session.
+**Revision** is `event_sequence.seq`, OpenCode's per-session monotonic event counter. One row exists per session, keyed by session id, and it advances with activity in that session.
 
-The hub accepts a snapshot newer than what it holds, treats equal-with-matching-hash as a no-op, and rejects older or equal-with-different-hash. A clock stepping backwards costs a rejected upload and a status line, not silent data loss.
+`session_v2.time_updated` is **not** usable as a revision, despite being the obvious candidate. Message content is written without bumping it, and turn completion explicitly preserves it, so two different transcripts can carry the same value. Measured against the live database: **865 of 4,461 sessions (19.4%) hold messages newer than their own `time_updated`, by up to 16 hours.** Using it would leave changed transcripts un-uploaded, and would make the hub reject a corrected snapshot as not-newer. `session_v2.version` is also not a counter; it holds the OpenCode version string that created the session.
+
+Before relying on `event_sequence.seq`, verify its behaviour across imports, forks, and a restored database, since a counter that resets or is copied would reintroduce the same class of bug.
+
+The snapshot carries the revision, a content hash, and an extraction-format version, all read in one consistent database transaction so the revision cannot describe a different transcript than the one sent.
+
+The hub accepts a snapshot whose revision exceeds what it holds, treats equal-with-matching-hash as a no-op, and rejects older or equal-with-different-hash. Rejection is not the end of the story: a divergence that persists leaves the hub permanently stale, so `recall_status` reports it and `reindex`-style operator recovery is the documented escape, rather than a log line nobody reads.
 
 **Queue.** A work list of dirty session ids and observed `time_updated`, in `ctx.storage`. Snapshots are built at send time. Many offline changes to one session collapse into a single upload of current state, the queue stays small enough for a key-value store, and a session deleted before its upload sends a tombstone instead.
 
 **Deduplication.** One plugin instance runs per open location and every instance sees every event, so instances contend for a short-lived uploader lease in `ctx.storage`. The holder drains; the others enqueue.
 
-**Reconciliation.** On startup the hub returns a manifest of session id to accepted revision for that source, about 4,500 pairs and 200 KB. The host diffs and enqueues what is missing or locally newer. A high-water timestamp cannot see an old session edited recently, nor detect a gap.
+**Reconciliation.** On startup the hub returns a manifest of session id to `(revision, content hash, tombstone marker)`, **across all sources, not just the caller's**, about 4,500 entries and a few hundred KB. The host diffs and enqueues what is missing or locally newer.
 
-**Tombstones** block resurrection: any snapshot predating the tombstone is rejected. A genuinely newer snapshot clears it.
+Three details, each fixing a failure the obvious version has:
+
+- The manifest spans sources. Keyed per-source, a rebuilt or recopied host under a new token would see all 4,500 sessions as missing and extract, gzip, and upload every one to receive equal-hash no-ops.
+- It carries the content hash, so a host can skip a session whose content already matches without building a payload at all.
+- It includes tombstones. Without them, a session deleted on the hub but still present in the host's `opencode.db` is "missing" on every startup, gets uploaded, is rejected as `tombstoned`, records an error, and repeats forever.
+
+**Tombstones** block resurrection: any snapshot at or below the tombstone's revision is rejected. A genuinely newer revision clears it.
+
+**Hub-has-but-host-lacks.** A session the hub holds and the host no longer has is not automatically a deletion: OpenCode may have removed it while the plugin was not running, or the host may be a fresh machine that never had it. The host therefore never infers deletions from absence. Only an observed `session.deleted` event produces a tombstone. Sessions the hub holds from a host that no longer reports them remain in the archive, which is the desired behaviour for a memory system and means the only way to remove something is to delete it deliberately.
+
+**Source ownership.** A session's `source_id` is updated to whichever source last had a snapshot accepted. A no-op (equal hash) does not move it. This keeps origin honest after a machine rebuild without letting a stale host reclaim a session it did not write.
 
 **Retry.** Transport failures back off exponentially to a few minutes and retry indefinitely. Rejections are terminal, leave the queue, and are recorded.
 
@@ -191,6 +220,8 @@ No `migrate` subcommand: the hub is single-node and single-writer, so `serve` ap
 ## 8. Measurement
 
 `tools/eval/` scores retrieval against real usage. Labels come from pairing every real `recall_search` with the `recall_expand` or `recall_inspect` that followed it. Scoring is at session level, over the full corpus, through the real hybrid pipeline.
+
+These numbers were measured against turn-pair chunks as §3.2 describes them. Any change to the chunk rendering invalidates the comparison, which is why the rendering version is part of the space identity and why build step 4 gates on reproducing this table rather than assuming parity.
 
 Current baseline, 393 real queries:
 
@@ -236,4 +267,4 @@ Each layer is usable before the next exists.
 10. Container image and release pipeline.
 11. Cutover: run both plugins, compare, retire the old one.
 
-Cutover detail is unspecified. Since 1.0 keeps the same model and dimensions as today, existing vectors are reusable rather than needing recomputation.
+Cutover detail is unspecified beyond this: **the hub re-embeds everything.** Existing vectors are not reusable, despite 1.0 keeping the same model and dimensions. The hub never reads the old `index.db`, no import path exists and the map rejected a bulk-import tool, and the chunk text will not be byte-identical anyway once rendering is reimplemented. Budget a full embed of roughly 75,000 chunks on first backfill, and measure the rate on the Linux host rather than assuming the M5 Pro's 45 chunks/s.
