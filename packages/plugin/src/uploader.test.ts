@@ -138,4 +138,12 @@ test("the environment overrides the config file's hub URL and token", async () =
     token: "from-env",
   })
   expect(await loadHubConfig({}, join(dir, "absent.json"))).toBeNull()
+
+  writeConfig({ url: "", token: "" })
+  const env = { OPENCODE_RECALL_HUB_URL: "http://env", OPENCODE_RECALL_TOKEN: "from-env" }
+  expect(await loadHubConfig(env, configFile)).toEqual({ url: "http://env", token: "from-env" })
+  expect(await loadHubConfig({}, configFile)).toBeNull()
+
+  writeFileSync(configFile, JSON.stringify({ hub: { url: 7, token: "from-file" } }))
+  await expect(loadHubConfig({}, configFile)).rejects.toThrow()
 })
