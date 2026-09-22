@@ -1,0 +1,16 @@
+{
+  "name": "@opencode-recall/plugin",
+  "private": true,
+  "type": "module",
+  "main": "./index.ts",
+  "engines": { "opencode": ">=2.0.14" },
+  "dependencies": {
+    "@opencode-recall/protocol": "workspace:*"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "2.0.14"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.0.14"
+  }
+}
