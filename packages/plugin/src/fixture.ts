@@ -44,6 +44,12 @@ export function sourceDb() {
       db.run("UPDATE session_v2 SET title = ?, time_updated = ? WHERE id = ?", [title, time, sessionId])
       advance(sessionId)
     },
+    /** Delete a session as OpenCode does, taking its event counter with it. */
+    remove(sessionId: string) {
+      db.run("DELETE FROM session_message WHERE session_id = ?", [sessionId])
+      db.run("DELETE FROM session_v2 WHERE id = ?", [sessionId])
+      db.run("DELETE FROM event_sequence WHERE aggregate_id = ?", [sessionId])
+    },
     close: () => db.close(),
   }
 }

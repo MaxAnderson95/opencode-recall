@@ -3,12 +3,12 @@ import { Database } from "bun:sqlite"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { PROTOCOL_VERSION, type ErrorBody, type ErrorCode } from "@opencode-recall/protocol"
+import { PROTOCOL_VERSION, createClient, type ErrorBody, type ErrorCode } from "@opencode-recall/protocol"
 import { openArchive, type Archive } from "../../hub/src/archive/index.ts"
 import { DEFAULT_LIMITS, createHandler, type Limits } from "../../hub/src/server.ts"
 import { loadHubConfig } from "./config.ts"
 import { sourceDb, type SourceDb } from "./fixture.ts"
-import { readPosition, readSnapshot } from "./source.ts"
+import { readPosition, readPositions, readSnapshot } from "./source.ts"
 import { createUploader, type Storage, type Uploader } from "./uploader.ts"
 
 type Json = Parameters<Storage["set"]>[1]
@@ -17,13 +17,16 @@ type Json = Parameters<Storage["set"]>[1]
 function memoryStorage() {
   const entries = new Map<string, Json>()
   const storage: Storage = {
+    get: async (key) => entries.get(key),
     set: async (key, value) => void entries.set(key, value),
     remove: async (key) => void entries.delete(key),
     scan: async ({ prefix }) => ({
       entries: [...entries].filter(([key]) => key.startsWith(prefix)).map(([key, value]) => ({ key, value })),
     }),
   }
-  return { storage, entries }
+  /** Queued work, leaving out the acknowledged positions kept for the sweep. */
+  const pending = () => [...entries.keys()].filter((key) => !key.startsWith("acked/")).length
+  return { storage, entries, pending }
 }
 
 type Intercept = (req: Request, forward: (req: Request) => Promise<Response>) => Promise<Response>
@@ -36,12 +39,15 @@ let source: SourceDb
 let intercept: Intercept
 /** The outcome or error code of every snapshot request that reached the hub. */
 let outcomes: string[]
+/** The verb of every request that reached the hub. */
+let verbs: string[]
 const uploaders: Uploader[] = []
 
 function startHub(limits: Limits = DEFAULT_LIMITS) {
   const handler = createHandler({ archive, log: () => {}, limits })
   const forward = async (req: Request) => {
     const res = await handler(req)
+    verbs.push(new URL(req.url).pathname.slice("/v1/".length))
     if (new URL(req.url).pathname === "/v1/snapshot") {
       const body = (await res.clone().json()) as { outcome?: string } & Partial<ErrorBody>
       outcomes.push(body.outcome ?? body.error!.code)
@@ -57,6 +63,7 @@ beforeEach(() => {
   archive = openArchive(join(dir, "archive.db"))
   intercept = (req, forward) => forward(req)
   outcomes = []
+  verbs = []
   startHub()
   source = sourceDb()
   source.addSession("ses_a")
@@ -76,9 +83,17 @@ const writeConfig = (hubConfig: { url?: string; token?: string }) =>
 
 const configure = () => writeConfig({ url: hub.url.href, token: archive.issueToken("laptop") })
 
-function start(storage: Storage = memoryStorage().storage, timing: { quietMs?: number; retryMs?: number } = {}) {
+function start(
+  storage: Storage = memoryStorage().storage,
+  timing: { quietMs?: number; retryMs?: number; sweepIntervalMs?: number } = {},
+  db: SourceDb = source,
+) {
   const uploader = createUploader({
-    source: { position: (id) => readPosition(source.db, id), snapshot: (id) => readSnapshot(source.db, id) },
+    source: {
+      position: (id) => readPosition(db.db, id),
+      positions: () => readPositions(db.db),
+      snapshot: (id) => readSnapshot(db.db, id),
+    },
     storage,
     loadConfig: () => loadHubConfig({}, configFile),
     quietMs: 5,
@@ -107,7 +122,7 @@ function archivedTexts(): string[] {
 
 test("updating a session uploads a newer revision that replaces the archived copy", async () => {
   configure()
-  const { storage, entries } = memoryStorage()
+  const { storage, entries, pending } = memoryStorage()
   const uploader = start(storage)
   uploader.enqueue("ses_a")
   await until(() => outcomes.length === 1)
@@ -117,7 +132,7 @@ test("updating a session uploads a newer revision that replaces the archived cop
   await until(() => outcomes.length === 2)
   expect(outcomes).toEqual(["archived", "archived"])
   expect(archivedTexts()).toEqual(["first", "second"])
-  await until(() => entries.size === 0)
+  await until(() => pending() === 0)
 })
 
 test("a lost acknowledgement is retried and the retry is a no-op", async () => {
@@ -129,12 +144,12 @@ test("a lost acknowledgement is retried and the retry is a no-op", async () => {
     dropped = true
     return new Response("upstream reset", { status: 502 })
   }
-  const { storage, entries } = memoryStorage()
+  const { storage, entries, pending } = memoryStorage()
   start(storage).enqueue("ses_a")
 
   await until(() => outcomes.length === 2)
   expect(outcomes).toEqual(["archived", "unchanged"])
-  await until(() => entries.size === 0)
+  await until(() => pending() === 0)
   expect(archive.status()).toEqual({ sessions: 1 })
 })
 
@@ -151,7 +166,7 @@ test("a change made while an upload is in flight is still uploaded afterwards", 
     }
     return res
   }
-  const { storage, entries } = memoryStorage()
+  const { storage, entries, pending } = memoryStorage()
   const uploader = start(storage)
   uploader.enqueue("ses_a")
   await until(() => outcomes.length === 1)
@@ -163,12 +178,12 @@ test("a change made while an upload is in flight is still uploaded afterwards", 
 
   await until(() => outcomes.length === 2)
   expect(archivedTexts()).toEqual(["first", "mid-flight"])
-  await until(() => entries.size === 0)
+  await until(() => pending() === 0)
 })
 
 test("two plugin instances uploading the same session converge on one correct copy", async () => {
   configure()
-  const { storage, entries } = memoryStorage()
+  const { storage, entries, pending } = memoryStorage()
   // Every instance receives every event, so both see each change.
   const instances = [start(storage), start(storage)]
   for (const text of ["two", "three", "four"]) {
@@ -177,7 +192,7 @@ test("two plugin instances uploading the same session converge on one correct co
     await Bun.sleep(15)
   }
 
-  await until(() => entries.size === 0)
+  await until(() => pending() === 0)
   await Bun.sleep(30)
   expect(archivedTexts()).toEqual(["first", "two", "three", "four"])
   expect(outcomes.every((o) => o === "archived" || o === "unchanged")).toBe(true)
@@ -186,7 +201,7 @@ test("two plugin instances uploading the same session converge on one correct co
 
 test("an old acknowledgement never removes another instance's newer work", async () => {
   configure()
-  const { storage, entries } = memoryStorage()
+  const { storage, entries, pending } = memoryStorage()
   // Instance A's acknowledgement stops after it has read the work list and before it removes anything.
   let reachedRemove!: () => void
   const removing = new Promise<void>((resolve) => (reachedRemove = resolve))
@@ -215,7 +230,7 @@ test("an old acknowledgement never removes another instance's newer work", async
 
   await until(() => outcomes.length === 2)
   expect(archivedTexts()).toEqual(["first", "second"])
-  await until(() => entries.size === 0)
+  await until(() => pending() === 0)
 })
 
 test("a burst of child-turn events produces one upload after the quiet period", async () => {
@@ -234,10 +249,10 @@ test("a burst of child-turn events produces one upload after the quiet period", 
 
 test("an entry left in the work list by an earlier run is uploaded at startup", async () => {
   configure()
-  const { storage, entries } = memoryStorage()
+  const { storage, entries, pending } = memoryStorage()
   await storage.set("dirty/ses_a/101-2", readPosition(source.db, "ses_a")!)
   start(storage)
-  await until(() => outcomes.length === 1 && entries.size === 0)
+  await until(() => outcomes.length === 1 && pending() === 0)
   expect(archivedTexts()).toEqual(["first"])
 })
 
@@ -246,10 +261,10 @@ test("an oversize snapshot is rejected as payload_too_large and not retried", as
   startHub({ ...DEFAULT_LIMITS, decompressedBytes: 2_000 })
   configure()
   source.addMessage("ses_a", "user", { text: "x".repeat(5_000) }, 102)
-  const { storage, entries } = memoryStorage()
+  const { storage, entries, pending } = memoryStorage()
   start(storage).enqueue("ses_a")
 
-  await until(() => entries.size === 0)
+  await until(() => pending() === 0)
   await Bun.sleep(50)
   expect(outcomes).toEqual(["payload_too_large"])
   expect(archive.status()).toEqual({ sessions: 0 })
@@ -272,10 +287,10 @@ test.each<[ErrorCode | number, "retried" | "dropped"]>([
     const status = { rate_limited: 429, request_timeout: 408, payload_too_large: 413, invalid_request: 400 }[answer as string] ?? 409
     return Response.json({ error: { code: answer, message: "stub" } } satisfies ErrorBody, { status })
   }
-  const { storage, entries } = memoryStorage()
+  const { storage, entries, pending } = memoryStorage()
   start(storage).enqueue("ses_a")
 
-  await until(() => entries.size === 0)
+  await until(() => pending() === 0)
   await Bun.sleep(50)
   expect(requests).toBe(expected === "retried" ? 2 : 1)
   expect(archive.status()).toEqual({ sessions: expected === "retried" ? 1 : 0 })
@@ -284,7 +299,7 @@ test.each<[ErrorCode | number, "retried" | "dropped"]>([
 test("invalid_token pauses the queue without losing work, and a fixed config file resumes it", async () => {
   writeConfig({ url: hub.url.href, token: "opencode-recall_revoked" })
   source.addSession("ses_b")
-  const { storage, entries } = memoryStorage()
+  const { storage, entries, pending } = memoryStorage()
   const uploader = start(storage)
 
   uploader.enqueue("ses_a")
@@ -348,4 +363,133 @@ test("the environment overrides the config file's hub URL and token", async () =
 
   writeFileSync(configFile, JSON.stringify({ hub: { url: 7, token: "from-file" } }))
   await expect(loadHubConfig({}, configFile)).rejects.toThrow()
+})
+
+const clientFor = (name: string) => createClient({ url: hub.url.href, token: archive.issueToken(name) })
+
+test("deleting a session tombstones it, and a later upload from before the deletion is rejected", async () => {
+  configure()
+  const { storage, entries, pending } = memoryStorage()
+  const uploader = start(storage)
+  uploader.enqueue("ses_a")
+  await until(() => outcomes.length === 1)
+  const stale = readSnapshot(source.db, "ses_a")!
+
+  source.remove("ses_a")
+  uploader.delete("ses_a", { revision: 3, timeDeleted: 200 })
+  await until(() => archive.status().sessions === 0 && pending() === 0)
+  expect(archive.manifest().tombstones).toEqual([{ sessionId: "ses_a", timeDeleted: 200 }])
+
+  const error = await clientFor("desktop").snapshot(stale).catch((e: unknown) => e)
+  expect(error).toMatchObject({ code: "tombstoned", status: 409 })
+  expect(archive.status()).toEqual({ sessions: 0 })
+})
+
+test("a session deleted before its queued upload sends a tombstone instead of the upload", async () => {
+  configure()
+  const { storage, entries, pending } = memoryStorage()
+  const uploader = start(storage)
+  uploader.enqueue("ses_a")
+  source.remove("ses_a")
+  uploader.delete("ses_a", { revision: 3, timeDeleted: 200 })
+
+  await until(() => archive.manifest().tombstones.length === 1 && pending() === 0)
+  expect(verbs).toEqual(["tombstone"])
+})
+
+test("a re-import after the deletion is uploaded and clears the tombstone", async () => {
+  configure()
+  const uploader = start()
+  uploader.enqueue("ses_a")
+  await until(() => outcomes.length === 1)
+  source.remove("ses_a")
+  uploader.delete("ses_a", { revision: 3, timeDeleted: 200 })
+  await until(() => archive.manifest().tombstones.length === 1)
+
+  // Importing sets `time_updated` to the import time and restarts the counter.
+  source.addSession("ses_a", { time: 300 })
+  source.addMessage("ses_a", "user", { text: "first" }, 101)
+  uploader.enqueue("ses_a")
+  await until(() => archive.status().sessions === 1)
+  expect(archive.manifest().tombstones).toEqual([])
+  expect(archivedTexts()).toEqual(["first"])
+})
+
+test("a session changed while the plugin was not running is uploaded on the next startup", async () => {
+  configure()
+  const { storage } = memoryStorage()
+  const first = start(storage)
+  first.enqueue("ses_a")
+  await until(() => outcomes.length === 1)
+  first.stop()
+
+  source.addMessage("ses_a", "user", { text: "while down" }, 102)
+  source.addSession("ses_b", { time: 150 })
+  await start(storage).reconcile()
+  await until(() => outcomes.length === 3)
+  expect(archivedTexts()).toEqual(["first", "while down"])
+  expect(archive.status()).toEqual({ sessions: 2 })
+})
+
+test("a dropped event is caught by the periodic sweep without asking the hub", async () => {
+  configure()
+  const uploader = start(memoryStorage().storage, { sweepIntervalMs: 20 })
+  await uploader.reconcile()
+  await until(() => outcomes.length === 1)
+
+  // No enqueue: the change event was lost.
+  source.addMessage("ses_a", "user", { text: "lost event" }, 102)
+  await until(() => outcomes.length === 2)
+  expect(archivedTexts()).toEqual(["first", "lost event"])
+  await Bun.sleep(60)
+  expect(verbs.filter((v) => v === "manifest")).toHaveLength(1)
+  expect(outcomes).toHaveLength(2)
+})
+
+test("a rebuilt host with a new token uploads nothing for sessions the hub holds with matching hashes", async () => {
+  configure()
+  source.addSession("ses_b", { time: 150 })
+  const original = start()
+  original.enqueue("ses_a")
+  original.enqueue("ses_b")
+  await until(() => outcomes.length === 2)
+  original.stop()
+
+  // Fresh plugin storage and token; the counter was re-derived higher without changing content.
+  writeConfig({ url: hub.url.href, token: archive.issueToken("laptop-rebuilt") })
+  source.db.run("UPDATE event_sequence SET seq = seq + 5 WHERE aggregate_id = 'ses_b'")
+  const rebuilt = start(memoryStorage().storage, { sweepIntervalMs: 10 })
+  await rebuilt.reconcile()
+  await Bun.sleep(60)
+  expect(outcomes).toHaveLength(2)
+})
+
+test("a session tombstoned on the hub but still present locally is not re-uploaded on every sweep", async () => {
+  configure()
+  await clientFor("desktop").tombstone({ sessionId: "ses_a", revision: 9, timeDeleted: 200 })
+  const uploader = start(memoryStorage().storage, { sweepIntervalMs: 10 })
+  await uploader.reconcile()
+  await uploader.reconcile()
+  await Bun.sleep(60)
+  expect(outcomes).toEqual([])
+  expect(archive.manifest().tombstones).toHaveLength(1)
+})
+
+test("sessions the hub holds that this host no longer reports stay in the archive", async () => {
+  configure()
+  source.addSession("ses_b", { time: 150 })
+  const uploader = start(memoryStorage().storage, { sweepIntervalMs: 10 })
+  uploader.enqueue("ses_a")
+  uploader.enqueue("ses_b")
+  await until(() => outcomes.length === 2)
+
+  // Removed without an observed deletion, even with an upload still queued for it.
+  source.addMessage("ses_b", "user", { text: "queued" }, 160)
+  uploader.enqueue("ses_b")
+  source.remove("ses_b")
+  await uploader.reconcile()
+  await Bun.sleep(60)
+  expect(archive.status()).toEqual({ sessions: 2 })
+  expect(archive.manifest().tombstones).toEqual([])
+  expect(verbs).not.toContain("tombstone")
 })

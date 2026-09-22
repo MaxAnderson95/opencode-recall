@@ -40,8 +40,19 @@ export const Snapshot = z.object({
   extractorVersion: z.number().int().positive(),
 })
 
+/** An observed upstream deletion of a session. */
+export const Tombstone = z.object({
+  sessionId: z.string().min(1),
+  /** The `session.deleted` event's own sequence number. */
+  revision: z.number().int().nonnegative(),
+  /** The `session.deleted` event's creation time; a snapshot must be active after it to return. */
+  timeDeleted: z.number().int(),
+})
+
 export const requests = {
   snapshot: z.object({ protocolVersion: version, ...Snapshot.shape }),
+  tombstone: z.object({ protocolVersion: version, ...Tombstone.shape }),
+  manifest: z.object({ protocolVersion: version }),
   status: z.object({ protocolVersion: version }),
 }
 
@@ -56,7 +67,14 @@ export type Part = z.infer<typeof Part>
 export type Message = z.infer<typeof Message>
 export type Session = z.infer<typeof Session>
 export type Snapshot = z.infer<typeof Snapshot>
+export type Tombstone = z.infer<typeof Tombstone>
 export type Request<V extends Verb> = z.infer<(typeof requests)[V]>
+
+/** What the hub holds for every session from every source, so a host can diff without uploading. */
+export type Manifest = {
+  sessions: ({ sessionId: string } & Pick<Snapshot, "revision" | "lastActivity" | "contentHash" | "extractorVersion">)[]
+  tombstones: Pick<Tombstone, "sessionId" | "timeDeleted">[]
+}
 
 export type Responses = {
   /**
@@ -64,6 +82,9 @@ export type Responses = {
    * `rewound`: accepted at a later position whose revision is not higher than the one held.
    */
   snapshot: { outcome: "archived" | "rewound" | "unchanged" }
+  /** `removed`: whether the archive held a copy of the session that this deleted. */
+  tombstone: { removed: boolean }
+  manifest: Manifest
   status: { sessions: number }
 }
 
@@ -74,6 +95,7 @@ export type ErrorCode =
   | "unknown_verb"
   | "stale_revision"
   | "hash_divergence"
+  | "tombstoned"
   | "payload_too_large"
   | "rate_limited"
   | "request_timeout"
@@ -127,6 +149,8 @@ export function createClient({ url, token, fetch: fetcher = fetch }: ClientOptio
 
   return {
     snapshot: (snapshot: Snapshot) => call("snapshot", snapshot),
+    tombstone: (tombstone: Tombstone) => call("tombstone", tombstone),
+    manifest: () => call("manifest", {}),
     status: () => call("status", {}),
   }
 }

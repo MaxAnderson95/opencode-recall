@@ -40,16 +40,22 @@ function extractParts(type: Message["type"], data: Record<string, unknown>): Par
   return texts.filter((t): t is string => typeof t === "string" && t.trim() !== "").map((text) => ({ kind: "text", text }))
 }
 
+const POSITIONS = `SELECT s.id AS sessionId,
+    coalesce((SELECT seq FROM event_sequence WHERE aggregate_id = s.id), 0) AS revision,
+    max(s.time_updated, coalesce((SELECT max(time_created) FROM session_message WHERE session_id = s.id), 0))
+      AS lastActivity
+  FROM session_v2 s`
+
 /** The session's current position, or `null` if the database does not hold it. */
 export function readPosition(db: Database, sessionId: string): Position | null {
-  return db
-    .query(
-      `SELECT coalesce((SELECT seq FROM event_sequence WHERE aggregate_id = s.id), 0) AS revision,
-         max(s.time_updated, coalesce((SELECT max(time_created) FROM session_message WHERE session_id = s.id), 0))
-           AS lastActivity
-       FROM session_v2 s WHERE s.id = ?`,
-    )
-    .get(sessionId) as Position | null
+  const row = db.query(`${POSITIONS} WHERE s.id = ?`).get(sessionId) as ({ sessionId: string } & Position) | null
+  return row && { revision: row.revision, lastActivity: row.lastActivity }
+}
+
+/** The current position of every session the database holds. */
+export function readPositions(db: Database): Map<string, Position> {
+  const rows = db.query(POSITIONS).all() as ({ sessionId: string } & Position)[]
+  return new Map(rows.map(({ sessionId, ...position }) => [sessionId, position]))
 }
 
 /**

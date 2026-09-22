@@ -54,6 +54,19 @@ test("the typed client archives a snapshot and status counts it", async () => {
   expect(await client.status()).toEqual({ sessions: 1 })
 })
 
+test("the typed client tombstones a session, lists it in the manifest, and a stale upload is tombstoned", async () => {
+  const client = clientFor(handler)
+  await client.snapshot(snapshot)
+  expect(await client.manifest()).toEqual({
+    sessions: [{ sessionId: "ses_a", revision: 3, lastActivity: 2, contentHash: "hash-1", extractorVersion: 1 }],
+    tombstones: [],
+  })
+  expect(await client.tombstone({ sessionId: "ses_a", revision: 4, timeDeleted: 5 })).toEqual({ removed: true })
+  expect(await client.manifest()).toEqual({ sessions: [], tombstones: [{ sessionId: "ses_a", timeDeleted: 5 }] })
+  const error = await client.snapshot(snapshot).catch((e: unknown) => e)
+  expect(error).toMatchObject({ code: "tombstoned", status: 409 })
+})
+
 test("the client sends gzip-encoded bodies with Content-Encoding set", async () => {
   let seen: Request | undefined
   const client = createClient({

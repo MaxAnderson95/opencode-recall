@@ -6,7 +6,7 @@
  */
 import { Database } from "bun:sqlite"
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
-import type { Snapshot } from "@opencode-recall/protocol"
+import type { Manifest, Snapshot, Tombstone } from "@opencode-recall/protocol"
 import { migrations } from "./migrations.ts"
 
 export const SCHEMA_VERSION = migrations.length
@@ -19,7 +19,7 @@ export type Source = { id: number; name: string }
 export type TokenInfo = { id: number; source: string; timeCreated: number }
 
 /** How `putSnapshot` resolved a snapshot against the copy the archive holds (§5 acceptance). */
-export type PutResult = "archived" | "rewound" | "unchanged" | "stale_revision" | "hash_divergence"
+export type PutResult = "archived" | "rewound" | "unchanged" | "stale_revision" | "hash_divergence" | "tombstoned"
 
 export type Archive = {
   /** Schema versions before and after the migrations applied by this open. */
@@ -28,8 +28,19 @@ export type Archive = {
    * Resolve the snapshot against the held copy by position `(lastActivity, revision)` and, when it
    * is accepted, replace the session and its whole transcript in one transaction, attributing it to
    * `sourceId`. A matching content hash is `unchanged` at any position and moves nothing.
+   *
+   * A tombstoned session is `tombstoned` unless the snapshot's last activity is after the deletion
+   * time; such a snapshot is archived and clears the tombstone.
    */
   putSnapshot(snapshot: Snapshot, sourceId: number): PutResult
+  /**
+   * Delete the session and its transcript, and record a tombstone so no snapshot active at or
+   * before the deletion time can bring it back. Of two tombstones for one session the later
+   * deletion is kept. `removed` is whether a copy was held.
+   */
+  putTombstone(tombstone: Tombstone, sourceId: number): { removed: boolean }
+  /** Every held session's position and hash, and every tombstone, across all sources. */
+  manifest(): Manifest
   /**
    * Mint a token for the named source, creating the source if it is new.
    * The returned value is the only copy; the archive keeps just its hash.
@@ -99,6 +110,23 @@ function bind(db: Database, migration: { from: number; to: number }): Archive {
     `INSERT INTO parts (message_id, ordinal, kind, text) VALUES ($messageId, $ordinal, $kind, $text)`,
   )
   const countSessions = db.prepare("SELECT count(*) AS n FROM sessions")
+  const selectTombstone = db.prepare("SELECT time_deleted AS timeDeleted FROM tombstones WHERE session_id = ?")
+  const deleteTombstone = db.prepare("DELETE FROM tombstones WHERE session_id = ?")
+  const upsertTombstone = db.prepare(
+    `INSERT INTO tombstones (session_id, source_id, revision, time_deleted, reason)
+     VALUES ($sessionId, $sourceId, $revision, $timeDeleted, 'deleted')
+     ON CONFLICT (session_id) DO UPDATE SET source_id = excluded.source_id, revision = excluded.revision,
+       time_deleted = excluded.time_deleted, reason = excluded.reason
+     WHERE excluded.time_deleted > tombstones.time_deleted`,
+  )
+  const selectManifestSessions = db.prepare(
+    `SELECT id AS sessionId, revision, last_activity AS lastActivity, content_hash AS contentHash,
+       extractor_version AS extractorVersion
+     FROM sessions ORDER BY id`,
+  )
+  const selectManifestTombstones = db.prepare(
+    "SELECT session_id AS sessionId, time_deleted AS timeDeleted FROM tombstones ORDER BY session_id",
+  )
   const upsertSource = db.prepare(
     `INSERT INTO sources (name, time_created) VALUES (?, ?)
      ON CONFLICT (name) DO UPDATE SET name = excluded.name RETURNING id`,
@@ -131,10 +159,14 @@ function bind(db: Database, migration: { from: number; to: number }): Archive {
 
   const putSnapshot = db.transaction((snapshot: Snapshot, sourceId: number): PutResult => {
     const { session } = snapshot
+    const tombstone = selectTombstone.get(session.id) as Pick<Tombstone, "timeDeleted"> | null
+    // Revisions are not compared: a delete-then-reimport restarts the counter below the tombstone's.
+    if (tombstone && snapshot.lastActivity <= tombstone.timeDeleted) return "tombstoned"
     const held = selectHeld.get(session.id) as Held | null
     const result = held ? resolve(snapshot, held) : "archived"
     if (result !== "archived" && result !== "rewound") return result
 
+    if (tombstone) deleteTombstone.run(session.id)
     // Cascades to messages and parts, so a shrunken transcript leaves nothing behind.
     deleteSession.run(session.id)
     insertSession.run({
@@ -166,10 +198,20 @@ function bind(db: Database, migration: { from: number; to: number }): Archive {
     return result
   })
 
+  const putTombstone = db.transaction((tombstone: Tombstone, sourceId: number) => {
+    upsertTombstone.run({ ...tombstone, sourceId })
+    return { removed: deleteSession.run(tombstone.sessionId).changes > 0 }
+  })
+
   return {
     migration,
     // Immediate: the read-then-write must not race a `token` subcommand writing the same file.
     putSnapshot: (snapshot, sourceId) => putSnapshot.immediate(snapshot, sourceId),
+    putTombstone: (tombstone, sourceId) => putTombstone.immediate(tombstone, sourceId),
+    manifest: db.transaction(() => ({
+      sessions: selectManifestSessions.all() as Manifest["sessions"],
+      tombstones: selectManifestTombstones.all() as Manifest["tombstones"],
+    })),
     issueToken: (source) => issueToken(source),
     listTokens: () => selectTokens.all() as TokenInfo[],
     revokeToken: (id) => deleteToken.run(id).changes > 0,
