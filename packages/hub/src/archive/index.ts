@@ -36,7 +36,9 @@ export type Archive = {
   /**
    * Delete the session and its transcript, and record a tombstone so no snapshot active at or
    * before the deletion time can bring it back. Of two tombstones for one session the later
-   * deletion is kept. `removed` is whether a copy was held.
+   * deletion is kept. A held copy active after the deletion time wins and the tombstone is a
+   * no-op, so a retried old deletion cannot remove a later re-import. `removed` is whether a copy
+   * was deleted.
    */
   putTombstone(tombstone: Tombstone, sourceId: number): { removed: boolean }
   /** Every held session's position and hash, and every tombstone, across all sources. */
@@ -199,6 +201,9 @@ function bind(db: Database, migration: { from: number; to: number }): Archive {
   })
 
   const putTombstone = db.transaction((tombstone: Tombstone, sourceId: number) => {
+    // A copy active after the deletion already superseded it, as it would have cleared the tombstone.
+    const held = selectHeld.get(tombstone.sessionId) as Held | null
+    if (held && held.lastActivity > tombstone.timeDeleted) return { removed: false }
     upsertTombstone.run({ ...tombstone, sourceId })
     return { removed: deleteSession.run(tombstone.sessionId).changes > 0 }
   })

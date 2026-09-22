@@ -165,6 +165,17 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     expect(archive.putSnapshot(session("ses_a", ["one"], { lastActivity: 45 }), laptop)).toBe("tombstoned")
   })
 
+  test("a retried deletion older than the held copy's activity leaves the re-import archived", () => {
+    const archive = open(path())
+    const laptop = sourceOf(archive)
+    archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 200 }, laptop)
+    expect(archive.putSnapshot(session("ses_a", ["one"], { lastActivity: 300 }), laptop)).toBe("archived")
+    expect(archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 200 }, laptop)).toEqual({ removed: false })
+    expect(archive.status()).toEqual({ sessions: 1 })
+    expect(archive.manifest().tombstones).toEqual([])
+    expect(archive.putTombstone({ sessionId: "ses_a", revision: 5, timeDeleted: 400 }, laptop)).toEqual({ removed: true })
+  })
+
   test("the manifest spans every source and lists tombstones", () => {
     const archive = open(path())
     const [laptop, desktop] = [sourceOf(archive, "laptop"), sourceOf(archive, "desktop")]
