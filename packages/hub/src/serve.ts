@@ -5,11 +5,16 @@ import type { Config } from "./config.ts"
 import type { Log } from "./log.ts"
 import { createHandler } from "./server.ts"
 
-/** Open and migrate the archive, then listen. Throws if the archive cannot be opened. */
-export function serve(config: Config, log: Log) {
+/** Open and migrate the archive in the configured data directory, creating both if needed. */
+export function openDataArchive(config: Config) {
   mkdirSync(config.dataDir, { recursive: true })
   const path = join(config.dataDir, "archive.db")
-  const archive = openArchive(path)
+  return { path, archive: openArchive(path) }
+}
+
+/** Open and migrate the archive, then listen. Throws if the archive cannot be opened. */
+export function serve(config: Config, log: Log) {
+  const { path, archive } = openDataArchive(config)
   log("info", "archive opened", { path, schemaFrom: archive.migration.from, schemaTo: archive.migration.to })
 
   const separator = config.listen.lastIndexOf(":")

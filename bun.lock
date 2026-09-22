@@ -23,6 +23,7 @@
       "name": "@opencode-recall/plugin",
       "dependencies": {
         "@opencode-recall/protocol": "workspace:*",
+        "zod": "4.6.5",
       },
       "devDependencies": {
         "@opencode/plugin": "2.0.14",

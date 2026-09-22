@@ -5,16 +5,34 @@
  * protocol values and get plain results back.
  */
 import { Database } from "bun:sqlite"
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
 import type { Session } from "@opencode-recall/protocol"
 import { migrations } from "./migrations.ts"
 
 export const SCHEMA_VERSION = migrations.length
 
+const TOKEN_PREFIX = "opencode-recall_"
+
+/** One host. Outlives any single token, so rotating tokens never changes attribution. */
+export type Source = { id: number; name: string }
+
+export type TokenInfo = { id: number; source: string; timeCreated: number }
+
 export type Archive = {
   /** Schema versions before and after the migrations applied by this open. */
   readonly migration: { from: number; to: number }
-  /** Replace the session and its whole transcript in one transaction. */
-  putSnapshot(session: Session): void
+  /** Replace the session and its whole transcript in one transaction, attributing it to `sourceId`. */
+  putSnapshot(session: Session, sourceId: number): void
+  /**
+   * Mint a token for the named source, creating the source if it is new.
+   * The returned value is the only copy; the archive keeps just its hash.
+   */
+  issueToken(source: string): string
+  listTokens(): TokenInfo[]
+  /** Delete the token so the next request presenting it fails. False if no such token. */
+  revokeToken(id: number): boolean
+  /** The source a presented token maps to, or `null`. Compares against every live token in constant time. */
+  authenticate(token: string): Source | null
   status(): { sessions: number }
   close(): void
 }
@@ -27,6 +45,8 @@ export function openArchive(path: string): Archive {
   const db = new Database(path, { create: true, strict: true })
   try {
     db.run("PRAGMA foreign_keys = ON")
+    // `token` subcommands write while `serve` holds the same file.
+    db.run("PRAGMA busy_timeout = 5000")
     if (path !== ":memory:") db.run("PRAGMA journal_mode = WAL")
     const migration = migrate(db)
     return bind(db, migration)
@@ -55,8 +75,8 @@ function migrate(db: Database): { from: number; to: number } {
 function bind(db: Database, migration: { from: number; to: number }): Archive {
   const deleteSession = db.prepare("DELETE FROM sessions WHERE id = ?")
   const insertSession = db.prepare(
-    `INSERT INTO sessions (id, slug, title, directory, parent_id, time_created, time_updated)
-     VALUES ($id, $slug, $title, $directory, $parentId, $timeCreated, $timeUpdated)`,
+    `INSERT INTO sessions (id, source_id, slug, title, directory, parent_id, time_created, time_updated)
+     VALUES ($id, $sourceId, $slug, $title, $directory, $parentId, $timeCreated, $timeUpdated)`,
   )
   const insertMessage = db.prepare(
     `INSERT INTO messages (id, session_id, ordinal, type, time_created)
@@ -66,12 +86,42 @@ function bind(db: Database, migration: { from: number; to: number }): Archive {
     `INSERT INTO parts (message_id, ordinal, kind, text) VALUES ($messageId, $ordinal, $kind, $text)`,
   )
   const countSessions = db.prepare("SELECT count(*) AS n FROM sessions")
+  const upsertSource = db.prepare(
+    `INSERT INTO sources (name, time_created) VALUES (?, ?)
+     ON CONFLICT (name) DO UPDATE SET name = excluded.name RETURNING id`,
+  )
+  const insertToken = db.prepare("INSERT INTO tokens (source_id, hash, time_created) VALUES (?, ?, ?)")
+  const selectTokens = db.prepare(
+    `SELECT tokens.id, sources.name AS source, tokens.time_created AS timeCreated
+     FROM tokens JOIN sources ON sources.id = tokens.source_id ORDER BY sources.name, tokens.id`,
+  )
+  const deleteToken = db.prepare("DELETE FROM tokens WHERE id = ?")
+  const selectTokenHashes = db.prepare(
+    "SELECT tokens.hash, sources.id, sources.name FROM tokens JOIN sources ON sources.id = tokens.source_id",
+  )
 
-  const putSnapshot = db.transaction((session: Session) => {
+  const issueToken = db.transaction((source: string) => {
+    const { id } = upsertSource.get(source, Date.now()) as { id: number }
+    const token = TOKEN_PREFIX + randomBytes(32).toString("base64url")
+    insertToken.run(id, hashToken(token), Date.now())
+    return token
+  })
+
+  function authenticate(token: string): Source | null {
+    const presented = hashToken(token)
+    const rows = selectTokenHashes.all() as { hash: Uint8Array; id: number; name: string }[]
+    let match: Source | null = null
+    // No early exit, so response time does not depend on which row matched.
+    for (const row of rows) if (timingSafeEqual(row.hash, presented)) match = { id: row.id, name: row.name }
+    return match
+  }
+
+  const putSnapshot = db.transaction((session: Session, sourceId: number) => {
     // Cascades to messages and parts, so a shrunken transcript leaves nothing behind.
     deleteSession.run(session.id)
     insertSession.run({
       id: session.id,
+      sourceId,
       slug: session.slug,
       title: session.title,
       directory: session.directory,
@@ -95,8 +145,14 @@ function bind(db: Database, migration: { from: number; to: number }): Archive {
 
   return {
     migration,
-    putSnapshot: (session) => putSnapshot(session),
+    putSnapshot: (session, sourceId) => putSnapshot(session, sourceId),
+    issueToken: (source) => issueToken(source),
+    listTokens: () => selectTokens.all() as TokenInfo[],
+    revokeToken: (id) => deleteToken.run(id).changes > 0,
+    authenticate,
     status: () => ({ sessions: (countSessions.get() as { n: number }).n }),
     close: () => db.close(),
   }
 }
+
+const hashToken = (token: string): Buffer => createHash("sha256").update(token).digest()

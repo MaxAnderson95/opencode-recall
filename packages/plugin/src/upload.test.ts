@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createClient } from "@opencode-recall/protocol"
+import { openArchive } from "../../hub/src/archive/index.ts"
 import { createLog } from "../../hub/src/log.ts"
 import { serve } from "../../hub/src/serve.ts"
 import { uploadSession } from "./index.ts"
@@ -49,6 +50,14 @@ let dataDir: string
 let hub: ReturnType<typeof serve>
 let db: Database
 
+/** Issue a token the way `opencode-recall-hub token issue` does, through its own connection. */
+function issueToken(source: string): string {
+  const admin = openArchive(join(dataDir, "archive.db"))
+  const token = admin.issueToken(source)
+  admin.close()
+  return token
+}
+
 beforeEach(() => {
   dataDir = mkdtempSync(join(tmpdir(), "recall-plugin-"))
   hub = serve({ dataDir, listen: "127.0.0.1:0", logLevel: "error" }, createLog("error", () => {}))
@@ -79,7 +88,7 @@ test("reads a v2 session as plain text, dropping bookkeeping messages", () => {
 })
 
 test("an uploaded session is stored by the hub as sessions, messages, and parts rows", async () => {
-  const client = createClient({ url: hub.url.href })
+  const client = createClient({ url: hub.url.href, token: issueToken("laptop") })
   expect(await uploadSession(db, client, "ses_a")).toBe(true)
   expect(await client.status()).toEqual({ sessions: 1 })
 
@@ -92,6 +101,22 @@ test("an uploaded session is stored by the hub as sessions, messages, and parts 
   expect(archive.query("SELECT message_id, text FROM parts ORDER BY message_id").all()).toEqual([
     { message_id: "msg_1", text: "how do I list files?" },
     { message_id: "msg_3", text: "Use ls." },
+  ])
+  archive.close()
+})
+
+test("uploads under two tokens for one source are attributed to that one source", async () => {
+  const [first, second] = [issueToken("laptop"), issueToken("laptop")]
+  await uploadSession(db, createClient({ url: hub.url.href, token: first }), "ses_a")
+  db.run("INSERT INTO session_v2 VALUES ('ses_b', NULL, 'calm-heron', '/work/demo', 'Other', 300, 400)")
+  await uploadSession(db, createClient({ url: hub.url.href, token: second }), "ses_b")
+
+  const archive = new Database(join(dataDir, "archive.db"), { readonly: true })
+  expect(
+    archive.query("SELECT sessions.id, sources.name FROM sessions JOIN sources ON sources.id = source_id ORDER BY sessions.id").all(),
+  ).toEqual([
+    { id: "ses_a", name: "laptop" },
+    { id: "ses_b", name: "laptop" },
   ])
   archive.close()
 })

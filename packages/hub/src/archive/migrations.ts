@@ -31,4 +31,18 @@ export const migrations: readonly string[] = [
   );
   CREATE INDEX parts_message_idx ON parts(message_id, ordinal);
   `,
+  `
+  CREATE TABLE sources (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    time_created INTEGER NOT NULL
+  );
+  CREATE TABLE tokens (
+    id INTEGER PRIMARY KEY,
+    source_id INTEGER NOT NULL REFERENCES sources(id),
+    hash BLOB NOT NULL UNIQUE,
+    time_created INTEGER NOT NULL
+  );
+  ALTER TABLE sessions ADD COLUMN source_id INTEGER REFERENCES sources(id);
+  `,
 ]
