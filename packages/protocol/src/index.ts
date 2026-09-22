@@ -78,8 +78,9 @@ export function createClient({ url, fetch: fetcher = fetch }: ClientOptions) {
       body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, ...input }),
     })
     if (res.ok) return (await res.json()) as Responses[V]
-    const body = (await res.json().catch(() => null)) as ErrorBody | null
-    throw new HubError(body?.error.code ?? "internal", body?.error.message ?? `HTTP ${res.status}`, res.status)
+    // A proxy in front of the hub can answer with any body, so the envelope is not assumed.
+    const body = (await res.json().catch(() => null)) as Partial<ErrorBody> | null
+    throw new HubError(body?.error?.code ?? "internal", body?.error?.message ?? `HTTP ${res.status}`, res.status)
   }
 
   return {

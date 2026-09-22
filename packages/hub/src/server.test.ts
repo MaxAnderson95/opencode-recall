@@ -83,3 +83,13 @@ test("the client raises the hub's rejection as a HubError carrying its code", as
   expect(error).toBeInstanceOf(HubError)
   expect(error).toMatchObject({ code: "protocol_version", status: 400 })
 })
+
+test.each([
+  ["JSON without an error envelope", () => Response.json({ message: "Bad Gateway" }, { status: 502 })],
+  ["a non-JSON body", () => new Response("<html>Bad Gateway</html>", { status: 502 })],
+])("the client falls back to the HTTP status when a proxy answers with %s", async (_, respond) => {
+  const client = createClient({ url: "http://hub", fetch: async () => respond() })
+  const error = await client.status().catch((e: unknown) => e)
+  expect(error).toBeInstanceOf(HubError)
+  expect(error).toMatchObject({ code: "internal", message: "HTTP 502", status: 502 })
+})
