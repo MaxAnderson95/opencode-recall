@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { Session } from "@opencode-recall/protocol"
+import type { Snapshot } from "@opencode-recall/protocol"
 import { SCHEMA_VERSION, openArchive, type Archive } from "./index.ts"
 import { migrations } from "./migrations.ts"
 
@@ -27,21 +27,29 @@ afterEach(() => {
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true })
 })
 
-function session(id: string, texts: string[]): Session {
+/** A snapshot whose position defaults to one past its last message and whose hash names its texts. */
+function session(id: string, texts: string[], fields: Partial<Omit<Snapshot, "session">> = {}): Snapshot {
   return {
-    id,
-    slug: "slug",
-    title: "title",
-    directory: "/work",
-    parentId: null,
-    timeCreated: 1,
-    timeUpdated: 2,
-    messages: texts.map((text, i) => ({
-      id: `${id}_msg_${i}`,
-      type: i % 2 ? "assistant" : "user",
-      timeCreated: 10 + i,
-      parts: [{ kind: "text", text }],
-    })),
+    session: {
+      id,
+      slug: "slug",
+      title: "title",
+      directory: "/work",
+      parentId: null,
+      timeCreated: 1,
+      timeUpdated: 2,
+      messages: texts.map((text, i) => ({
+        id: `${id}_msg_${i}`,
+        type: i % 2 ? "assistant" : "user",
+        timeCreated: 10 + i,
+        parts: [{ kind: "text", text }],
+      })),
+    },
+    revision: texts.length,
+    lastActivity: 10 + texts.length,
+    contentHash: texts.join("|"),
+    extractorVersion: 1,
+    ...fields,
   }
 }
 
@@ -66,6 +74,60 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     archive.putSnapshot(session("ses_b", ["other"]), sourceOf(archive))
     archive.putSnapshot(session("ses_a", ["hello", "hi", "more"]), sourceOf(archive))
     expect(archive.status()).toEqual({ sessions: 2 })
+  })
+
+  test("a later position replaces the held copy; an earlier one is stale and changes nothing", () => {
+    const archive = open(path())
+    const laptop = sourceOf(archive)
+    expect(archive.putSnapshot(session("ses_a", ["one"]), laptop)).toBe("archived")
+    expect(archive.putSnapshot(session("ses_a", ["one", "two"]), laptop)).toBe("archived")
+    expect(archive.putSnapshot(session("ses_a", ["one"]), laptop)).toBe("stale_revision")
+    expect(archive.putSnapshot(session("ses_a", ["one", "two", "x"], { revision: 1, lastActivity: 12 }), laptop)).toBe(
+      "stale_revision",
+    )
+    expect(archive.putSnapshot(session("ses_a", ["one", "two"]), laptop)).toBe("unchanged")
+  })
+
+  test("a matching hash is a no-op at any position", () => {
+    const archive = open(path())
+    const laptop = sourceOf(archive)
+    archive.putSnapshot(session("ses_a", ["one", "two"]), laptop)
+    expect(archive.putSnapshot(session("ses_a", ["one", "two"]), laptop)).toBe("unchanged")
+    expect(archive.putSnapshot(session("ses_a", ["one", "two"], { revision: 9, lastActivity: 99 }), laptop)).toBe(
+      "unchanged",
+    )
+    expect(archive.putSnapshot(session("ses_a", ["one", "two"], { revision: 0, lastActivity: 0 }), laptop)).toBe(
+      "unchanged",
+    )
+  })
+
+  test("an equal position with different content diverges unless the extractor is newer", () => {
+    const archive = open(path())
+    const laptop = sourceOf(archive)
+    archive.putSnapshot(session("ses_a", ["one", "two"], { extractorVersion: 2 }), laptop)
+    const differing = { revision: 2, lastActivity: 12, contentHash: "re-extracted" }
+    expect(archive.putSnapshot(session("ses_a", ["one", "two"], { ...differing, extractorVersion: 2 }), laptop)).toBe(
+      "hash_divergence",
+    )
+    expect(archive.putSnapshot(session("ses_a", ["one", "two"], { ...differing, extractorVersion: 1 }), laptop)).toBe(
+      "hash_divergence",
+    )
+    expect(archive.putSnapshot(session("ses_a", ["one", "two"], { ...differing, extractorVersion: 3 }), laptop)).toBe(
+      "archived",
+    )
+  })
+
+  test("a rewind with newer activity is accepted and the stale pre-rewind copy never displaces it", () => {
+    const archive = open(path())
+    const [laptop, desktop] = [sourceOf(archive, "laptop"), sourceOf(archive, "desktop")]
+    const preRewind = session("ses_a", ["x1", "x2"], { revision: 9, lastActivity: 50 })
+    const rewound = session("ses_a", ["y1"], { revision: 6, lastActivity: 60 })
+    archive.putSnapshot(preRewind, desktop)
+    expect(archive.putSnapshot(rewound, laptop)).toBe("rewound")
+    for (let sweep = 0; sweep < 3; sweep++) {
+      expect(archive.putSnapshot(preRewind, desktop)).toBe("stale_revision")
+      expect(archive.putSnapshot(rewound, laptop)).toBe("unchanged")
+    }
   })
 
   test("an issued token authenticates as its source and has the documented shape", () => {
@@ -118,12 +180,31 @@ describe("archive (file-backed only)", () => {
     const path = tempPath()
     const archive = open(path)
     archive.putSnapshot(session("ses_a", ["one", "two", "three"]), sourceOf(archive))
-    archive.putSnapshot(session("ses_a", ["one"]), sourceOf(archive))
+    // A revert: fewer messages, a newer `time_updated`, and a higher revision.
+    expect(archive.putSnapshot(session("ses_a", ["one"], { revision: 5, lastActivity: 20 }), sourceOf(archive))).toBe(
+      "archived",
+    )
 
     const db = new Database(path, { readonly: true })
     const count = (table: string) => (db.query(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n
     expect([count("sessions"), count("messages"), count("parts")]).toEqual([1, 1, 1])
     expect(db.query("SELECT text FROM parts").get()).toEqual({ text: "one" })
+    db.close()
+  })
+
+  test("source_id moves to the source of each accepted snapshot, but not on a no-op", () => {
+    const path = tempPath()
+    const archive = open(path)
+    const [laptop, desktop] = [sourceOf(archive, "laptop"), sourceOf(archive, "desktop")]
+    const db = new Database(path, { readonly: true })
+    const owner = () => (db.query("SELECT sources.name FROM sessions JOIN sources ON sources.id = source_id").get() as { name: string }).name
+
+    archive.putSnapshot(session("ses_a", ["one"]), laptop)
+    expect(owner()).toBe("laptop")
+    archive.putSnapshot(session("ses_a", ["one"]), desktop)
+    expect(owner()).toBe("laptop")
+    archive.putSnapshot(session("ses_a", ["one", "two"]), desktop)
+    expect(owner()).toBe("desktop")
     db.close()
   })
 
@@ -153,6 +234,8 @@ describe("archive (file-backed only)", () => {
     const archive = open(path)
     expect(archive.migration).toEqual({ from: 1, to: SCHEMA_VERSION })
     expect(archive.status()).toEqual({ sessions: 1 })
+    // A row archived before positions existed sits behind any real snapshot.
+    expect(archive.putSnapshot(session("ses_old", ["one"]), sourceOf(archive))).toBe("archived")
   })
 
   test("a token revoked through another connection fails on the serving connection's next check", () => {

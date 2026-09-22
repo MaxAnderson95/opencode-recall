@@ -6,7 +6,7 @@
  */
 import { Database } from "bun:sqlite"
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
-import type { Session } from "@opencode-recall/protocol"
+import type { Snapshot } from "@opencode-recall/protocol"
 import { migrations } from "./migrations.ts"
 
 export const SCHEMA_VERSION = migrations.length
@@ -18,11 +18,18 @@ export type Source = { id: number; name: string }
 
 export type TokenInfo = { id: number; source: string; timeCreated: number }
 
+/** How `putSnapshot` resolved a snapshot against the copy the archive holds (§5 acceptance). */
+export type PutResult = "archived" | "rewound" | "unchanged" | "stale_revision" | "hash_divergence"
+
 export type Archive = {
   /** Schema versions before and after the migrations applied by this open. */
   readonly migration: { from: number; to: number }
-  /** Replace the session and its whole transcript in one transaction, attributing it to `sourceId`. */
-  putSnapshot(session: Session, sourceId: number): void
+  /**
+   * Resolve the snapshot against the held copy by position `(lastActivity, revision)` and, when it
+   * is accepted, replace the session and its whole transcript in one transaction, attributing it to
+   * `sourceId`. A matching content hash is `unchanged` at any position and moves nothing.
+   */
+  putSnapshot(snapshot: Snapshot, sourceId: number): PutResult
   /**
    * Mint a token for the named source, creating the source if it is new.
    * The returned value is the only copy; the archive keeps just its hash.
@@ -74,9 +81,15 @@ function migrate(db: Database): { from: number; to: number } {
 
 function bind(db: Database, migration: { from: number; to: number }): Archive {
   const deleteSession = db.prepare("DELETE FROM sessions WHERE id = ?")
+  const selectHeld = db.prepare(
+    `SELECT revision, last_activity AS lastActivity, extractor_version AS extractorVersion, content_hash AS contentHash
+     FROM sessions WHERE id = ?`,
+  )
   const insertSession = db.prepare(
-    `INSERT INTO sessions (id, source_id, slug, title, directory, parent_id, time_created, time_updated)
-     VALUES ($id, $sourceId, $slug, $title, $directory, $parentId, $timeCreated, $timeUpdated)`,
+    `INSERT INTO sessions (id, source_id, slug, title, directory, parent_id, time_created, time_updated,
+       revision, last_activity, extractor_version, content_hash)
+     VALUES ($id, $sourceId, $slug, $title, $directory, $parentId, $timeCreated, $timeUpdated,
+       $revision, $lastActivity, $extractorVersion, $contentHash)`,
   )
   const insertMessage = db.prepare(
     `INSERT INTO messages (id, session_id, ordinal, type, time_created)
@@ -116,7 +129,12 @@ function bind(db: Database, migration: { from: number; to: number }): Archive {
     return match
   }
 
-  const putSnapshot = db.transaction((session: Session, sourceId: number) => {
+  const putSnapshot = db.transaction((snapshot: Snapshot, sourceId: number): PutResult => {
+    const { session } = snapshot
+    const held = selectHeld.get(session.id) as Held | null
+    const result = held ? resolve(snapshot, held) : "archived"
+    if (result !== "archived" && result !== "rewound") return result
+
     // Cascades to messages and parts, so a shrunken transcript leaves nothing behind.
     deleteSession.run(session.id)
     insertSession.run({
@@ -128,6 +146,10 @@ function bind(db: Database, migration: { from: number; to: number }): Archive {
       parentId: session.parentId,
       timeCreated: session.timeCreated,
       timeUpdated: session.timeUpdated,
+      revision: snapshot.revision,
+      lastActivity: snapshot.lastActivity,
+      extractorVersion: snapshot.extractorVersion,
+      contentHash: snapshot.contentHash,
     })
     session.messages.forEach((message, ordinal) => {
       insertMessage.run({
@@ -141,11 +163,13 @@ function bind(db: Database, migration: { from: number; to: number }): Archive {
         insertPart.run({ messageId: message.id, ordinal: partOrdinal, kind: part.kind, text: part.text }),
       )
     })
+    return result
   })
 
   return {
     migration,
-    putSnapshot: (session, sourceId) => putSnapshot(session, sourceId),
+    // Immediate: the read-then-write must not race a `token` subcommand writing the same file.
+    putSnapshot: (snapshot, sourceId) => putSnapshot.immediate(snapshot, sourceId),
     issueToken: (source) => issueToken(source),
     listTokens: () => selectTokens.all() as TokenInfo[],
     revokeToken: (id) => deleteToken.run(id).changes > 0,
@@ -153,6 +177,21 @@ function bind(db: Database, migration: { from: number; to: number }): Archive {
     status: () => ({ sessions: (countSessions.get() as { n: number }).n }),
     close: () => db.close(),
   }
+}
+
+type Held = Pick<Snapshot, "revision" | "lastActivity" | "extractorVersion" | "contentHash">
+
+/**
+ * The §5 acceptance rules. Last activity leads the comparison so that a rewound copy, once
+ * accepted, is never displaced by a stale copy still holding the pre-rewind revision.
+ */
+function resolve(incoming: Snapshot, held: Held): PutResult {
+  if (incoming.contentHash === held.contentHash) return "unchanged"
+  const order = Math.sign(incoming.lastActivity - held.lastActivity) || Math.sign(incoming.revision - held.revision)
+  if (order > 0) return incoming.revision > held.revision ? "archived" : "rewound"
+  if (order < 0) return "stale_revision"
+  // Equal position, different content: only a newer extractor may re-extract unchanged history.
+  return incoming.extractorVersion > held.extractorVersion ? "archived" : "hash_divergence"
 }
 
 const hashToken = (token: string): Buffer => createHash("sha256").update(token).digest()

@@ -3,7 +3,14 @@
  * read-only and never written.
  */
 import type { Database } from "bun:sqlite"
-import { Message, type Part, type Session } from "@opencode-recall/protocol"
+import { createHash } from "node:crypto"
+import { Message, type Part, type Session, type Snapshot } from "@opencode-recall/protocol"
+
+/** Bump whenever extraction output changes for unchanged input, so the hub accepts re-extracted history. */
+export const EXTRACTOR_VERSION = 1
+
+/** Where a session stands in the §5 order: last activity first, then revision. */
+export type Position = Pick<Snapshot, "lastActivity" | "revision">
 
 type SessionRow = {
   id: string
@@ -33,7 +40,33 @@ function extractParts(type: Message["type"], data: Record<string, unknown>): Par
   return texts.filter((t): t is string => typeof t === "string" && t.trim() !== "").map((text) => ({ kind: "text", text }))
 }
 
-/** Read one v2 session as a snapshot, or `null` if the database does not hold it. */
+/** The session's current position, or `null` if the database does not hold it. */
+export function readPosition(db: Database, sessionId: string): Position | null {
+  return db
+    .query(
+      `SELECT coalesce((SELECT seq FROM event_sequence WHERE aggregate_id = s.id), 0) AS revision,
+         max(s.time_updated, coalesce((SELECT max(time_created) FROM session_message WHERE session_id = s.id), 0))
+           AS lastActivity
+       FROM session_v2 s WHERE s.id = ?`,
+    )
+    .get(sessionId) as Position | null
+}
+
+/**
+ * Read one session with its position and content hash, all inside one read transaction so the
+ * revision cannot describe a different transcript than the one sent. `null` if the session is absent.
+ */
+export function readSnapshot(db: Database, sessionId: string): Snapshot | null {
+  return db.transaction(() => {
+    const position = readPosition(db, sessionId)
+    const session = readSession(db, sessionId)
+    if (!position || !session) return null
+    const contentHash = createHash("sha256").update(JSON.stringify(session)).digest("hex")
+    return { session, ...position, contentHash, extractorVersion: EXTRACTOR_VERSION }
+  })()
+}
+
+/** Read one v2 session's transcript, or `null` if the database does not hold it. */
 export function readSession(db: Database, sessionId: string): Session | null {
   const row = db
     .query(

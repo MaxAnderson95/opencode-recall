@@ -46,4 +46,11 @@ export const migrations: readonly string[] = [
   );
   ALTER TABLE sessions ADD COLUMN source_id INTEGER REFERENCES sources(id);
   `,
+  // The zero defaults place rows archived before positions existed behind any real snapshot.
+  `
+  ALTER TABLE sessions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE sessions ADD COLUMN last_activity INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE sessions ADD COLUMN extractor_version INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE sessions ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';
+  `,
 ]
