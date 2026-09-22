@@ -99,6 +99,18 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     expect(archive.authenticate(fresh)).toMatchObject({ name: "laptop" })
     expect(archive.revokeToken(tokens[0]!.id)).toBe(false)
   })
+
+  test("a revoked token's id is never reused, so repeating the revoke cannot hit a newer token", () => {
+    const archive = open(path())
+    archive.issueToken("laptop")
+    const [revoked] = archive.listTokens()
+    archive.revokeToken(revoked!.id)
+
+    const desktop = archive.issueToken("desktop")
+    expect(archive.listTokens()[0]!.id).not.toBe(revoked!.id)
+    expect(archive.revokeToken(revoked!.id)).toBe(false)
+    expect(archive.authenticate(desktop)).toMatchObject({ name: "desktop" })
+  })
 })
 
 describe("archive (file-backed only)", () => {

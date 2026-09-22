@@ -38,7 +38,8 @@ export const migrations: readonly string[] = [
     time_created INTEGER NOT NULL
   );
   CREATE TABLE tokens (
-    id INTEGER PRIMARY KEY,
+    -- AUTOINCREMENT: ids are revocation handles, so a revoked id must never name a newer token.
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_id INTEGER NOT NULL REFERENCES sources(id),
     hash BLOB NOT NULL UNIQUE,
     time_created INTEGER NOT NULL
