@@ -17,7 +17,6 @@ type Json = Parameters<Storage["set"]>[1]
 function memoryStorage() {
   const entries = new Map<string, Json>()
   const storage: Storage = {
-    get: async (key) => entries.get(key),
     set: async (key, value) => void entries.set(key, value),
     remove: async (key) => void entries.delete(key),
     scan: async ({ prefix }) => ({
@@ -185,6 +184,40 @@ test("two plugin instances uploading the same session converge on one correct co
   expect(archive.status()).toEqual({ sessions: 1 })
 })
 
+test("an old acknowledgement never removes another instance's newer work", async () => {
+  configure()
+  const { storage, entries } = memoryStorage()
+  // Instance A's acknowledgement stops after it has read the work list and before it removes anything.
+  let reachedRemove!: () => void
+  const removing = new Promise<void>((resolve) => (reachedRemove = resolve))
+  let release!: () => void
+  const released = new Promise<void>((resolve) => (release = resolve))
+  const held: Storage = {
+    ...storage,
+    remove: async (key) => {
+      reachedRemove()
+      await released
+      return storage.remove(key)
+    },
+  }
+  // B is already running with an empty work list; it only sees the second change.
+  const b = start(storage, { quietMs: 100 })
+  const a = start(held)
+  a.enqueue("ses_a")
+  await removing
+
+  // A shuts down with its acknowledgement in flight while B records a newer change.
+  a.stop()
+  source.addMessage("ses_a", "user", { text: "second" }, 102)
+  b.enqueue("ses_a")
+  await until(() => [...entries.values()].some((entry) => (entry as { revision: number }).revision === 3))
+  release()
+
+  await until(() => outcomes.length === 2)
+  expect(archivedTexts()).toEqual(["first", "second"])
+  await until(() => entries.size === 0)
+})
+
 test("a burst of child-turn events produces one upload after the quiet period", async () => {
   configure()
   const uploader = start(memoryStorage().storage, { quietMs: 50 })
@@ -202,7 +235,7 @@ test("a burst of child-turn events produces one upload after the quiet period", 
 test("an entry left in the work list by an earlier run is uploaded at startup", async () => {
   configure()
   const { storage, entries } = memoryStorage()
-  await storage.set("dirty/ses_a", readPosition(source.db, "ses_a")!)
+  await storage.set("dirty/ses_a/101-2", readPosition(source.db, "ses_a")!)
   start(storage)
   await until(() => outcomes.length === 1 && entries.size === 0)
   expect(archivedTexts()).toEqual(["first"])
@@ -260,7 +293,7 @@ test("invalid_token pauses the queue without losing work, and a fixed config fil
   uploader.enqueue("ses_b")
   await Bun.sleep(30)
   expect(archive.status()).toEqual({ sessions: 0 })
-  expect([...entries.keys()].sort()).toEqual(["dirty/ses_a", "dirty/ses_b"])
+  expect([...entries.keys()].map((key) => key.split("/")[1]).sort()).toEqual(["ses_a", "ses_b"])
 
   configure()
   await until(() => archive.status().sessions === 2)

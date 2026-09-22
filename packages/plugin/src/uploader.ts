@@ -24,12 +24,19 @@ function classify(e: unknown): "pause" | "terminal" | "retry" {
   return e.status >= 500 ? "retry" : "terminal"
 }
 
-/** Work-list entries live under this prefix in `ctx.storage`, one per dirty session. */
+/**
+ * Work-list entries live in `ctx.storage` at `dirty/<sessionId>/<lastActivity>-<revision>`, one per
+ * observed position. A key names exactly one piece of work, so an acknowledgement can remove the
+ * entries its upload covers without ever touching one written after it read the list; that is what
+ * makes the rule hold without compare-and-set. Rewriting a removed key only costs a no-op upload.
+ */
 const DIRTY = "dirty/"
+const sessionPrefix = (sessionId: string) => `${DIRTY}${sessionId}/`
+const entryKey = (sessionId: string, p: Position) => `${sessionPrefix(sessionId)}${p.lastActivity}-${p.revision}`
 
 const later = (a: Position, b: Position) => a.lastActivity - b.lastActivity || a.revision - b.revision
 
-export type Storage = Pick<StorageDomain, "get" | "set" | "remove" | "scan">
+export type Storage = Pick<StorageDomain, "set" | "remove" | "scan">
 
 /** The host's OpenCode database, as the uploader needs it. */
 export type Source = {
@@ -87,17 +94,16 @@ export function createUploader({
   let draining = false
   let stopped = false
   let probeTimer: ReturnType<typeof setTimeout> | undefined
-  let storageChain: Promise<unknown> = Promise.resolve()
 
-  /**
-   * Runs this instance's work-list writes one at a time, so its own acknowledgement cannot read an
-   * entry, lose the race to a newer `enqueue`, and then remove that newer entry. Other instances can
-   * still interleave, since `ctx.storage` has no compare-and-set; reconciliation is the backstop.
-   */
-  function exclusive<T>(fn: () => Promise<T>): Promise<T> {
-    const run = storageChain.then(fn)
-    storageChain = run.catch(() => {})
-    return run
+  async function entries(sessionId: string) {
+    const found: { key: string; position: Position }[] = []
+    let after: string | undefined
+    do {
+      const page = await storage.scan({ prefix: sessionPrefix(sessionId), after })
+      for (const { key, value } of page.entries) found.push({ key, position: value as Position })
+      after = page.next
+    } while (after !== undefined)
+    return found
   }
 
   const describe = (e: unknown) => (e instanceof Error ? e.message : String(e))
@@ -141,18 +147,21 @@ export function createUploader({
     void drain()
   }
 
-  /** Remove the entry only if `sent` covers it; a later observation stays for the next pass. */
-  const acknowledge = (sessionId: string, sent: Position) =>
-    exclusive(async () => {
-      const entry = (await storage.get(DIRTY + sessionId)) as Position | undefined
-      if (entry && later(entry, sent) <= 0) await storage.remove(DIRTY + sessionId)
-    })
+  /** Remove the entries `sent` covers; a later observation stays for the next pass. */
+  async function acknowledge(sessionId: string, sent: Position) {
+    for (const { key, position } of await entries(sessionId))
+      if (later(position, sent) <= 0) await storage.remove(key)
+  }
 
   async function send(client: Client, sessionId: string): Promise<"pause" | void> {
-    if (!(await storage.get(DIRTY + sessionId))) return // Another instance already uploaded it.
+    const pending = await entries(sessionId)
+    if (pending.length === 0) return // Another instance already uploaded it.
     const snapshot = source.snapshot(sessionId)
-    // Deleted since it was queued; tombstones are not sent yet.
-    if (!snapshot) return exclusive(() => storage.remove(DIRTY + sessionId))
+    // Deleted since it was queued; tombstones are not sent yet. Only the entries read are removed.
+    if (!snapshot) {
+      for (const { key } of pending) await storage.remove(key)
+      return
+    }
     try {
       await client.snapshot(snapshot)
     } catch (e) {
@@ -205,7 +214,7 @@ export function createUploader({
     let after: string | undefined
     do {
       const page = await storage.scan({ prefix: DIRTY, after })
-      for (const { key } of page.entries) due.add(key.slice(DIRTY.length))
+      for (const { key } of page.entries) due.add(key.slice(DIRTY.length, key.lastIndexOf("/")))
       after = page.next
     } while (after !== undefined)
     void drain()
@@ -215,13 +224,11 @@ export function createUploader({
 
   return {
     enqueue(sessionId) {
-      void exclusive(async () => {
-        // Read inside the chain, so entries are written in the order their positions were read.
-        const position = source.position(sessionId)
-        if (position) await storage.set(DIRTY + sessionId, position)
-        return position
-      })
-        .then((position) => position && schedule(sessionId, quietMs))
+      const position = source.position(sessionId)
+      if (!position) return
+      void storage
+        .set(entryKey(sessionId, position), position)
+        .then(() => schedule(sessionId, quietMs))
         .catch((e) => log(`could not record ${sessionId} as dirty: ${describe(e)}`))
     },
     get pausedBy() {
