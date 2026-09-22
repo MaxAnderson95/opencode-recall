@@ -5,10 +5,22 @@ export const PROTOCOL_VERSION = 1
 
 const version = z.literal(PROTOCOL_VERSION)
 
-export const Part = z.object({
-  kind: z.enum(["text", "reasoning", "tool"]),
-  text: z.string(),
-})
+export const Part = z.discriminatedUnion("kind", [
+  z.object({ kind: z.enum(["text", "reasoning"]), text: z.string() }),
+  z.object({
+    kind: z.literal("tool"),
+    tool: z.string(),
+    title: z.string(),
+    /** OpenCode's tool state: `completed`, `error`, or in flight (`streaming`, `running`). */
+    status: z.string().min(1),
+    /** The failure message, present only on a failed call. */
+    error: z.string().optional(),
+    /** `<tool> <title>\n<output or error>`, at most 16,000 characters; empty while in flight. */
+    text: z.string(),
+    /** False for a part archived for transcripts but kept out of the index. */
+    searchable: z.boolean(),
+  }),
+])
 
 export const Message = z.object({
   id: z.string().min(1),

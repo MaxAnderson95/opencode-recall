@@ -4,10 +4,11 @@
  */
 import type { Database } from "bun:sqlite"
 import { createHash } from "node:crypto"
-import { Message, type Part, type Session, type Snapshot } from "@opencode-recall/protocol"
+import { Message, type Session, type Snapshot } from "@opencode-recall/protocol"
+import { WORKER_PREFIX, extractParts } from "./extract.ts"
 
 /** Bump whenever extraction output changes for unchanged input, so the hub accepts re-extracted history. */
-export const EXTRACTOR_VERSION = 1
+export const EXTRACTOR_VERSION = 2
 
 /** Where a session stands in the §5 order: last activity first, then revision. */
 export type Position = Pick<Snapshot, "lastActivity" | "revision">
@@ -24,31 +25,18 @@ type SessionRow = {
 
 type MessageRow = { id: string; type: string; time_created: number; data: string }
 
-type TextItem = { type: "text"; text: string }
-
-const isTextItem = (item: unknown): item is TextItem =>
-  typeof item === "object" && item !== null && "type" in item && item.type === "text" && "text" in item && typeof item.text === "string"
-
-/** Plain text only; reasoning, tool output, and the full type mapping are not extracted yet. */
-function extractParts(type: Message["type"], data: Record<string, unknown>): Part[] {
-  const texts =
-    type === "user" || type === "synthetic"
-      ? [data.text]
-      : type === "assistant" && Array.isArray(data.content)
-        ? data.content.filter(isTextItem).map((item) => item.text)
-        : []
-  return texts.filter((t): t is string => typeof t === "string" && t.trim() !== "").map((text) => ({ kind: "text", text }))
-}
+// Summarizer workers are never uploaded, so they are invisible to everything that reads a session.
+const UPLOADED = `substr(coalesce(s.title, ''), 1, ${WORKER_PREFIX.length}) <> '${WORKER_PREFIX}'`
 
 const POSITIONS = `SELECT s.id AS sessionId,
     coalesce((SELECT seq FROM event_sequence WHERE aggregate_id = s.id), 0) AS revision,
     max(s.time_updated, coalesce((SELECT max(time_created) FROM session_message WHERE session_id = s.id), 0))
       AS lastActivity
-  FROM session_v2 s`
+  FROM session_v2 s WHERE ${UPLOADED}`
 
-/** The session's current position, or `null` if the database does not hold it. */
+/** The session's current position, or `null` if the database does not hold it or it is never uploaded. */
 export function readPosition(db: Database, sessionId: string): Position | null {
-  const row = db.query(`${POSITIONS} WHERE s.id = ?`).get(sessionId) as ({ sessionId: string } & Position) | null
+  const row = db.query(`${POSITIONS} AND s.id = ?`).get(sessionId) as ({ sessionId: string } & Position) | null
   return row && { revision: row.revision, lastActivity: row.lastActivity }
 }
 
@@ -72,11 +60,12 @@ export function readSnapshot(db: Database, sessionId: string): Snapshot | null {
   })()
 }
 
-/** Read one v2 session's transcript, or `null` if the database does not hold it. */
+/** Read one v2 session's transcript, or `null` if the database does not hold it or it is never uploaded. */
 export function readSession(db: Database, sessionId: string): Session | null {
   const row = db
     .query(
-      "SELECT id, slug, title, directory, parent_id, time_created, time_updated FROM session_v2 WHERE id = ?",
+      `SELECT id, slug, title, directory, parent_id, time_created, time_updated FROM session_v2 s
+       WHERE ${UPLOADED} AND id = ?`,
     )
     .get(sessionId) as SessionRow | null
   if (!row) return null
