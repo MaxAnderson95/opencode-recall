@@ -397,6 +397,39 @@ test("a session deleted before its queued upload sends a tombstone instead of th
   expect(verbs).toEqual(["tombstone"])
 })
 
+test("acknowledging a deletion never removes a newer deletion recorded meanwhile", async () => {
+  configure()
+  const { storage, pending } = memoryStorage()
+  // The first deletion's acknowledgement stops before it removes anything.
+  let reachedRemove!: () => void
+  const removing = new Promise<void>((resolve) => (reachedRemove = resolve))
+  let release!: () => void
+  const released = new Promise<void>((resolve) => (release = resolve))
+  let held = false
+  const blocking: Storage = {
+    ...storage,
+    remove: async (key) => {
+      if (!held && key.startsWith("deleted/")) {
+        held = true
+        reachedRemove()
+        await released
+      }
+      return storage.remove(key)
+    },
+  }
+  const uploader = start(blocking)
+  source.remove("ses_a")
+  uploader.delete("ses_a", { revision: 3, timeDeleted: 200 })
+  await removing
+
+  uploader.delete("ses_a", { revision: 5, timeDeleted: 400 })
+  await Bun.sleep(20)
+  release()
+
+  await until(() => archive.manifest().tombstones[0]?.timeDeleted === 400 && pending() === 0)
+  expect(verbs).toEqual(["tombstone", "tombstone"])
+})
+
 test("a re-import after the deletion is uploaded and clears the tombstone", async () => {
   configure()
   const uploader = start()

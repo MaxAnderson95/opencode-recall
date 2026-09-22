@@ -31,15 +31,17 @@ function classify(e: unknown): "pause" | "terminal" | "retry" {
  * entries its upload covers without ever touching one written after it read the list; that is what
  * makes the rule hold without compare-and-set. Rewriting a removed key only costs a no-op upload.
  *
- * An observed deletion waits at `deleted/<sessionId>`. The last position the hub answered for each
- * session, whether it accepted it or not, is kept at `acked/<sessionId>` so the periodic sweep can
- * find sessions whose change events were lost without asking the hub.
+ * Each observed deletion waits at its own `deleted/<sessionId>/<timeDeleted>` key for the same
+ * reason. The last position the hub answered for each session, whether it accepted it or not, is
+ * kept at `acked/<sessionId>` so the periodic sweep can find sessions whose change events were lost
+ * without asking the hub.
  */
 const DIRTY = "dirty/"
 const DELETED = "deleted/"
 const ACKED = "acked/"
 const sessionPrefix = (sessionId: string) => `${DIRTY}${sessionId}/`
 const entryKey = (sessionId: string, p: Position) => `${sessionPrefix(sessionId)}${p.lastActivity}-${p.revision}`
+const deletedPrefix = (sessionId: string) => `${DELETED}${sessionId}/`
 
 const later = (a: Position, b: Position) => a.lastActivity - b.lastActivity || a.revision - b.revision
 
@@ -229,13 +231,21 @@ export function createUploader({
     }
   }
 
-  async function sendTombstone(client: Client, sessionId: string, deletion: Deletion): Promise<"pause" | void> {
+  /**
+   * Send the latest queued deletion; the hub keeps the later of two tombstones, so it covers the
+   * earlier ones. Only the keys read before sending are removed, so a deletion observed meanwhile stays.
+   */
+  async function sendTombstone(
+    client: Client,
+    sessionId: string,
+    deletions: { key: string; deletion: Deletion }[],
+  ): Promise<"pause" | void> {
+    const { deletion } = deletions.reduce((a, b) => (b.deletion.timeDeleted > a.deletion.timeDeleted ? b : a))
     const pending = await entries(sessionId)
     const outcome = await attempt(sessionId, () => client.tombstone({ sessionId, ...deletion }))
     if (outcome !== "done") return outcome === "pause" ? "pause" : undefined
 
-    const current = (await storage.get(DELETED + sessionId)) as Deletion | undefined
-    if (current?.timeDeleted === deletion.timeDeleted) await storage.remove(DELETED + sessionId)
+    for (const { key } of deletions) await storage.remove(key)
     await storage.remove(ACKED + sessionId)
     // Work observed after the deletion belongs to a re-import and is uploaded on its own.
     let reimported = false
@@ -246,8 +256,11 @@ export function createUploader({
   }
 
   async function send(client: Client, sessionId: string): Promise<"pause" | void> {
-    const deletion = (await storage.get(DELETED + sessionId)) as Deletion | undefined
-    if (deletion) return sendTombstone(client, sessionId, deletion)
+    const deletions = (await scanAll(deletedPrefix(sessionId))).map(({ key, value }) => ({
+      key,
+      deletion: value as Deletion,
+    }))
+    if (deletions.length > 0) return sendTombstone(client, sessionId, deletions)
 
     const pending = await entries(sessionId)
     if (pending.length === 0) return // Another instance already uploaded it.
@@ -294,7 +307,7 @@ export function createUploader({
   /** Pick up work left by a previous run or another instance. */
   async function resume() {
     for (const { key } of await scanAll(DIRTY)) due.add(key.slice(DIRTY.length, key.lastIndexOf("/")))
-    for (const { key } of await scanAll(DELETED)) due.add(key.slice(DELETED.length))
+    for (const { key } of await scanAll(DELETED)) due.add(key.slice(DELETED.length, key.lastIndexOf("/")))
     void drain()
   }
 
@@ -366,7 +379,7 @@ export function createUploader({
     },
     delete(sessionId, deletion) {
       void storage
-        .set(DELETED + sessionId, deletion)
+        .set(`${deletedPrefix(sessionId)}${deletion.timeDeleted}`, deletion)
         .then(() => schedule(sessionId, quietMs))
         .catch((e) => log(`could not record ${sessionId} as deleted: ${describe(e)}`))
     },
