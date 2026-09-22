@@ -1,13 +1,17 @@
 import { z } from "zod"
 
-/** Bumped on any incompatible change to a request or response shape. */
-export const PROTOCOL_VERSION = 1
+/**
+ * Bumped on any change to a request or response shape, including an added field. Request schemas
+ * reject unknown fields, so a field sent without a bump fails loudly instead of being stripped
+ * while the hub records the content hash that covered it.
+ */
+export const PROTOCOL_VERSION = 2
 
 const version = z.literal(PROTOCOL_VERSION)
 
 export const Part = z.discriminatedUnion("kind", [
-  z.object({ kind: z.enum(["text", "reasoning"]), text: z.string() }),
-  z.object({
+  z.strictObject({ kind: z.enum(["text", "reasoning"]), text: z.string() }),
+  z.strictObject({
     kind: z.literal("tool"),
     tool: z.string(),
     title: z.string(),
@@ -22,14 +26,14 @@ export const Part = z.discriminatedUnion("kind", [
   }),
 ])
 
-export const Message = z.object({
+export const Message = z.strictObject({
   id: z.string().min(1),
   type: z.enum(["user", "synthetic", "assistant", "compaction", "shell", "skill"]),
   timeCreated: z.number().int(),
   parts: z.array(Part),
 })
 
-export const Session = z.object({
+export const Session = z.strictObject({
   id: z.string().min(1),
   slug: z.string(),
   title: z.string(),
@@ -42,7 +46,7 @@ export const Session = z.object({
 })
 
 /** One session as the host read it, with the §5 position fields read in the same transaction. */
-export const Snapshot = z.object({
+export const Snapshot = z.strictObject({
   session: Session,
   /** `event_sequence.seq` for the session. */
   revision: z.number().int().nonnegative(),
@@ -53,7 +57,7 @@ export const Snapshot = z.object({
 })
 
 /** An observed upstream deletion of a session. */
-export const Tombstone = z.object({
+export const Tombstone = z.strictObject({
   sessionId: z.string().min(1),
   /** The `session.deleted` event's own sequence number. */
   revision: z.number().int().nonnegative(),
@@ -62,10 +66,10 @@ export const Tombstone = z.object({
 })
 
 export const requests = {
-  snapshot: z.object({ protocolVersion: version, ...Snapshot.shape }),
-  tombstone: z.object({ protocolVersion: version, ...Tombstone.shape }),
-  manifest: z.object({ protocolVersion: version }),
-  status: z.object({ protocolVersion: version }),
+  snapshot: z.strictObject({ protocolVersion: version, ...Snapshot.shape }),
+  tombstone: z.strictObject({ protocolVersion: version, ...Tombstone.shape }),
+  manifest: z.strictObject({ protocolVersion: version }),
+  status: z.strictObject({ protocolVersion: version }),
 }
 
 /**
