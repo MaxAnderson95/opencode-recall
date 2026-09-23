@@ -1,0 +1,15 @@
+{
+  "name": "@opencode-recall/hub",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "opencode-recall-hub": "./src/main.ts"
+  },
+  "scripts": {
+    "serve": "bun src/main.ts serve"
+  },
+  "dependencies": {
+    "@opencode-recall/protocol": "workspace:*",
+    "zod": "4.6.5"
+  }
+}
