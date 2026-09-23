@@ -17,6 +17,7 @@ import type {
 import { Effect, Exit, Option, Scope, type Types } from "effect"
 import { Embedder } from "../embedder.ts"
 import { fakeEmbedder } from "../fake-embedder.ts"
+import { DEFAULT_CHUNKING, type ChunkParams } from "./chunks.ts"
 import { Archive, SCHEMA_VERSION } from "./index.ts"
 import { SEGMENTED, migrations } from "./migrations.ts"
 
@@ -49,6 +50,8 @@ function handle(archive: Archive.Interface, scope: Scope.Closeable) {
     getSummary: (key: SummaryGet, callerSourceId = 0) => Effect.runSync(archive.getSummary(key, callerSourceId)),
     putSummary: (summary: SummaryPut) => Effect.runSync(archive.putSummary(summary)),
     embedPending: (limit: number) => Effect.runPromise(archive.embedPending(limit)),
+    reclaim: () => Effect.runSync(archive.reclaim()),
+    rebuild: () => Option.getOrNull(Effect.runSync(archive.rebuild())),
     issueToken: (source: string) => Effect.runSync(archive.issueToken(source)),
     listTokens: () => Effect.runSync(archive.listTokens()),
     revokeToken: (id: number) => Effect.runSync(archive.revokeToken(id)),
@@ -59,12 +62,16 @@ function handle(archive: Archive.Interface, scope: Scope.Closeable) {
 }
 type Handle = ReturnType<typeof handle>
 
-/** Open the archive at `path` with `embedder`; it is closed after the test unless closed before. */
-function open(path: string, embedder: Embedder.Interface = fakeEmbedder()): Handle {
+/**
+ * Open the archive at `path` with `embedder`, set to build `chunking` with the embedder's model;
+ * it is closed after the test unless closed before.
+ */
+function open(path: string, embedder: Embedder.Interface = fakeEmbedder(), chunking?: ChunkParams): Handle {
   const scope = Effect.runSync(Scope.make())
   scopes.push(scope)
+  const configured = chunking && Archive.recipeFor(embedder.model, chunking)
   const archive = Effect.runSync(
-    Archive.make(path).pipe(Effect.provideService(Embedder.Service, embedder), Scope.provide(scope)),
+    Archive.make(path, configured).pipe(Effect.provideService(Embedder.Service, embedder), Scope.provide(scope)),
   )
   return handle(archive, scope)
 }
@@ -1126,6 +1133,116 @@ describe("archive (file-backed only)", () => {
     const second = open(path)
     expect(second.migration).toEqual({ from: SCHEMA_VERSION, to: SCHEMA_VERSION })
     expect(second.status()).toMatchObject({ sessions: 1 })
+  })
+
+  /** Windows small enough that one short session yields several chunks. */
+  const SMALL: ChunkParams = { ...DEFAULT_CHUNKING, chunkChars: 10, chunkOverlap: 2 }
+
+  /** Every vector space's activity, chunk size, and vector count, and the chunks held in all of them. */
+  function spaces(path: string) {
+    const db = new Database(path, { readonly: true })
+    const rows = db
+      .query(
+        `SELECT active, json_extract(recipe, '$.model') AS model, json_extract(recipe, '$.chunkChars') AS chunkChars,
+           (SELECT count(*) FROM vectors v WHERE v.space_id = s.id) AS vectors
+         FROM vector_spaces s ORDER BY id`,
+      )
+      .all()
+    const { n: chunks } = db.query("SELECT count(*) AS n FROM chunks").get() as { n: number }
+    db.close()
+    return { spaces: rows, chunks }
+  }
+
+  const embedAll = async (rebuild: Archive.Rebuild) => {
+    let embedded = 0
+    for (let n; (n = await Effect.runPromise(rebuild.embedNext(4))); ) embedded += n
+    return embedded
+  }
+
+  /** An archive holding one embedded session in a space of the default chunking. */
+  async function seeded(embedder = fakeEmbedder()) {
+    const path = tempPath()
+    const first = open(path, embedder)
+    first.putSnapshot(session("ses_a", ["deployment question", "a long answer about the rollout"]), sourceOf(first))
+    await first.embedPending(32)
+    first.close()
+    return path
+  }
+
+  test("a rebuild fills a new space beside the active one; activating it drops the old space and its vectors", async () => {
+    const path = await seeded()
+    const archive = open(path, fakeEmbedder(), SMALL)
+    expect(archive.status().activeSpace.matchesConfigured).toBe(false)
+
+    const rebuild = archive.rebuild()!
+    expect(rebuild.recipe.chunkChars).toBe(10)
+    expect(rebuild.chunks).toBeGreaterThan(2)
+    expect(await embedAll(rebuild)).toBe(rebuild.chunks)
+    // Until the new space is activated, searches and status stay on the old one.
+    expect(archive.status()).toMatchObject({ chunks: 2, embeddedChunks: 2, activeSpace: { recipe: { chunkChars: 1200 } } })
+    expect(ids((await archive.search({ query: "deploying", limit: 8, mode: "semantic" }, 0)).sessions)).toEqual(["ses_a"])
+
+    await Effect.runPromise(rebuild.activate)
+    expect(archive.status()).toMatchObject({
+      chunks: rebuild.chunks,
+      embeddedChunks: rebuild.chunks,
+      activeSpace: { recipe: { chunkChars: 10 }, matchesConfigured: true },
+    })
+    expect(spaces(path)).toEqual({
+      spaces: [{ active: 1, model: "fake/bag-of-words", chunkChars: 10, vectors: rebuild.chunks }],
+      chunks: rebuild.chunks,
+    })
+    const [hit] = (await archive.search({ query: "deploying", limit: 8, mode: "semantic" }, 0)).sessions
+    expect(hit!.hits[0]!.snippet.length).toBeLessThan(20)
+    expect(archive.rebuild()).toBeNull()
+  })
+
+  test("activating refuses while any chunk of the new space is unembedded, and the old space stays active", async () => {
+    const archive = open(await seeded(), fakeEmbedder(), SMALL)
+    const rebuild = archive.rebuild()!
+    await Effect.runPromise(rebuild.embedNext(1))
+    const refused = await Effect.runPromise(Effect.flip(rebuild.activate))
+    expect(refused).toBeInstanceOf(Archive.Incomplete)
+    expect(refused.pending).toBe(rebuild.chunks - 1)
+    expect(archive.status()).toMatchObject({ chunks: 2, activeSpace: { recipe: { chunkChars: 1200 } } })
+  })
+
+  test("an abandoned rebuild leaves the old space serving until it is reclaimed, and never piles up", async () => {
+    const path = await seeded()
+    const interrupted = open(path, fakeEmbedder(), SMALL)
+    const rebuild = interrupted.rebuild()!
+    await Effect.runPromise(rebuild.embedNext(2))
+    interrupted.close()
+
+    const archive = open(path)
+    expect(archive.status()).toMatchObject({ chunks: 2, embeddedChunks: 2, activeSpace: { matchesConfigured: true } })
+    expect(ids((await archive.search({ query: "deploying", limit: 8, mode: "semantic" }, 0)).sessions)).toEqual(["ses_a"])
+    expect(spaces(path).spaces).toHaveLength(2)
+    expect(archive.reclaim()).toBe(rebuild.chunks)
+    expect(spaces(path)).toEqual({ spaces: [{ active: 1, model: "fake/bag-of-words", chunkChars: 1200, vectors: 2 }], chunks: 2 })
+    expect(archive.reclaim()).toBe(0)
+    archive.close()
+
+    open(path, fakeEmbedder(), SMALL).rebuild()
+    open(path, fakeEmbedder(), SMALL).rebuild()
+    expect(spaces(path).spaces).toHaveLength(2)
+  })
+
+  test("once a space of another model is active, the hub's embedder answers queries and fills its queue again", async () => {
+    const path = await seeded()
+    const other = fakeEmbedder({ model: "fake/other" })
+    const archive = open(path, other)
+    expect((await archive.search({ query: "deploying", limit: 8 }, 0)).semanticUnavailable).toContain("run reindex")
+
+    const rebuild = archive.rebuild()!
+    await embedAll(rebuild)
+    await Effect.runPromise(rebuild.activate)
+    const { sessions, semanticUnavailable } = await archive.search({ query: "deploying", limit: 8, mode: "semantic" }, 0)
+    expect(semanticUnavailable).toBeUndefined()
+    expect(ids(sessions)).toEqual(["ses_a"])
+    archive.putSnapshot(single("ses_b", "fresh needle"), sourceOf(archive))
+    expect(await archive.embedPending(32)).toBe(2)
+    expect(spaces(path).spaces).toEqual([{ active: 1, model: "fake/other", chunkChars: 1200, vectors: 4 }])
   })
 
   test("refuses a database migrated by a newer binary, naming both versions", async () => {

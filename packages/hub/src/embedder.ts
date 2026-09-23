@@ -23,19 +23,38 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode-recall/hub/Embedder") {}
 
-export const BGE_SMALL: EmbeddingModel = {
+/** transformers.js weight types with a fixed meaning; `auto` picks one per device, so it names no recipe. */
+export const Dtype = Schema.Literals(["fp32", "fp16", "q8", "int8", "uint8", "q4", "bnb4", "q4f16"])
+
+/** The model fields an operator chooses. Runtime, mean pooling, and normalization are this binary's. */
+export const ModelChoice = Schema.Struct({
+  model: Schema.String.check(Schema.isNonEmpty()),
+  /** The Hugging Face commit the model files are fetched at, so `main` moving cannot change a space. */
+  revision: Schema.String.check(Schema.isNonEmpty()),
+  dtype: Dtype,
+  dims: Schema.Int.check(Schema.isGreaterThan(0)),
+  queryPrefix: Schema.String,
+})
+export interface ModelChoice extends Schema.Schema.Type<typeof ModelChoice> {}
+
+export const BGE_SMALL: ModelChoice = {
   model: "Xenova/bge-small-en-v1.5",
-  // The Hugging Face commit the model files are fetched at, so `main` moving cannot change a space.
   revision: "ea104dacec62c0de699686887e3f920caeb4f3e3",
   dtype: "q8",
   dims: 384,
-  // Tokenization and pooling are the library's, so its pinned version is part of the recipe.
-  runtime: `@huggingface/transformers ${hub.dependencies["@huggingface/transformers"]}`,
-  pooling: "mean",
-  normalize: true,
   // bge retrieval queries want this prefix and documents do not; omitting it costs measurable recall.
   queryPrefix: "Represent this sentence for searching relevant passages: ",
 }
+
+/** The recipe fields `choice` decides, with this binary's runtime, pooling, and normalization. */
+export const modelOf = (choice: ModelChoice) =>
+  ({
+    ...choice,
+    // Tokenization and pooling are the library's, so its pinned version is part of the recipe.
+    runtime: `@huggingface/transformers ${hub.dependencies["@huggingface/transformers"]}`,
+    pooling: "mean",
+    normalize: true,
+  }) satisfies EmbeddingModel
 
 /** Texts per inference call, as the single-machine plugin measured. */
 const BATCH = 8
@@ -43,14 +62,15 @@ const BATCH = 8
 const failed = (cause: unknown) => new Failed({ message: cause instanceof Error ? cause.message : String(cause), cause })
 
 /**
- * `bge-small-en-v1.5` on ONNX Runtime, in-process. The model loads on first use, from `cacheDir`
- * or downloaded into it, and a failed load is retried on the next call. Calls run one at a time.
+ * The chosen model (by default `bge-small-en-v1.5`) on ONNX Runtime, in-process. The model loads
+ * on first use, from `cacheDir` or downloaded into it, and a failed load is retried on the next
+ * call. Calls run one at a time.
  */
-export const onnx = (cacheDir: string) =>
+export const onnx = (cacheDir: string, choice: ModelChoice = BGE_SMALL) =>
   Layer.effect(
     Service,
     Effect.gen(function* () {
-      const model = BGE_SMALL
+      const model = modelOf(choice)
       const serial = yield* Semaphore.make(1)
       let loaded: FeatureExtractionPipeline | undefined
 
@@ -59,7 +79,7 @@ export const onnx = (cacheDir: string) =>
           // Imported here so nothing that never embeds loads the native runtime.
           const { pipeline, env } = await import("@huggingface/transformers")
           env.cacheDir = cacheDir
-          return pipeline("feature-extraction", model.model, { dtype: "q8", revision: model.revision })
+          return pipeline("feature-extraction", model.model, { dtype: model.dtype, revision: model.revision })
         },
         catch: failed,
       })

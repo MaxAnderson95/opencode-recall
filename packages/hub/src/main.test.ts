@@ -65,6 +65,35 @@ test("token issue prints the token once, list shows it by source without its val
   expect((await hub(dataDir, "token", "bogus")).code).toBe(2)
 })
 
+test("reindex exits with a clear error while serve runs, and runs once serve has stopped", async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), "recall-hub-"))
+  dirs.push(dataDir)
+  const serve = Bun.spawn(["bun", join(import.meta.dir, "main.ts"), "serve"], {
+    env: { ...process.env, OPENCODE_RECALL_DATA_DIR: dataDir, OPENCODE_RECALL_LISTEN: "127.0.0.1:0" },
+    stdout: "pipe",
+    stderr: "pipe",
+  })
+  try {
+    const reader = serve.stdout.getReader()
+    for (let out = ""; !out.includes('"msg":"listening"'); ) {
+      const { value, done } = await reader.read()
+      if (done) throw new Error(`serve exited before listening: ${out}`)
+      out += new TextDecoder().decode(value)
+    }
+    const refused = await hub(dataDir, "reindex")
+    expect(refused.code).toBe(1)
+    expect(refused.stderr).toContain(`${dataDir} is held by another opencode-recall-hub process (serve or reindex); stop it first`)
+  } finally {
+    serve.kill("SIGTERM")
+    await serve.exited
+  }
+
+  const ran = await hub(dataDir, "reindex")
+  expect(ran.code).toBe(0)
+  expect(ran.stdout).toContain("nothing to reindex")
+  expect((await hub(dataDir, "reindex", "extra")).code).toBe(2)
+})
+
 test("status prints the hub's view, naming a divergent session with its remedy", async () => {
   const dataDir = mkdtempSync(join(tmpdir(), "recall-hub-"))
   dirs.push(dataDir)

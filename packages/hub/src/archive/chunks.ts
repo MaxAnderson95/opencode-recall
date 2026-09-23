@@ -10,6 +10,9 @@ export const RENDERING_VERSION = 1
 
 export type ChunkParams = Pick<SpaceRecipe, "chunkChars" | "chunkOverlap" | "turnChars">
 
+/** The windowing the single-machine plugin measured (§8). */
+export const DEFAULT_CHUNKING: ChunkParams = { chunkChars: 1_200, chunkOverlap: 200, turnChars: 60_000 }
+
 /** The parts of a session chunking reads; only non-blank text parts are embedded. */
 export type ChunkSource = Pick<Session, "parentId"> & {
   messages: readonly (Pick<Message, "id" | "type" | "timeCreated"> & { parts: readonly Pick<Part, "kind" | "text">[] })[]

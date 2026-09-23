@@ -26,7 +26,7 @@ import type {
 } from "@opencode-recall/protocol"
 import { Context, Effect, Layer, Option, Schema, type Scope } from "effect"
 import { Embedder, type EmbeddingModel } from "../embedder.ts"
-import { RENDERING_VERSION, renderChunks, type ChunkSource } from "./chunks.ts"
+import { DEFAULT_CHUNKING, RENDERING_VERSION, renderChunks, type ChunkParams, type ChunkSource } from "./chunks.ts"
 import { SEGMENTED, migrations } from "./migrations.ts"
 import { clean, cut, ftsQuery, fuse, makeSnippet, middleOut, queryTokens, segments, transcriptBlock } from "./text.ts"
 import { createMatrix, type Matrix, type VectorRow } from "./vectors.ts"
@@ -57,6 +57,30 @@ export class BadVectors extends Schema.TaggedError<BadVectors>()("Archive.BadVec
 
 /** The active space's vectors were made by another model than this hub's embedder runs. */
 class ModelMismatch extends Schema.TaggedError<ModelMismatch>()("Archive.ModelMismatch", { message: Schema.String }) {}
+
+/** A rebuilt space was asked to activate with chunks still unembedded; nothing changed. */
+export class Incomplete extends Schema.TaggedError<Incomplete>()("Archive.Incomplete", {
+  message: Schema.String,
+  pending: Schema.Number,
+}) {}
+
+/**
+ * A new vector space of the configured recipe, chunked from every held session and not yet
+ * searched. Until `activate` succeeds the active space is untouched, and an abandoned rebuild is
+ * dropped by the next `reclaim` or `rebuild`.
+ */
+export interface Rebuild {
+  readonly recipe: SpaceRecipe
+  /** Chunks in the new space, every one waiting to be embedded when the rebuild starts. */
+  readonly chunks: number
+  /** Embed up to `limit` of the new space's unembedded chunks and return how many; 0 once none are left. */
+  readonly embedNext: (limit: number) => Effect.Effect<number, Embedder.Failed | BadVectors>
+  /**
+   * In one transaction, make the new space the active one and drop the superseded space with its
+   * chunks and vectors. Fails with {@link Incomplete}, changing nothing, while any chunk is unembedded.
+   */
+  readonly activate: Effect.Effect<void, Incomplete>
+}
 
 export interface Interface {
   /** Schema versions before and after the migrations applied by this open. */
@@ -130,6 +154,19 @@ export interface Interface {
    */
   readonly embedPending: (limit: number) => Effect.Effect<number, Embedder.Failed | BadVectors>
   /**
+   * Drop every inactive space with its chunk set and vectors: what an interrupted rebuild left.
+   * Returns how many chunks went with them. Only the process holding the archive (`serve` or
+   * `reindex`) may call it, since an inactive space may be a rebuild in progress.
+   */
+  readonly reclaim: () => Effect.Effect<number>
+  /**
+   * Start building a space of the configured recipe, reclaiming any abandoned one first, or
+   * nothing when the active space already has that recipe. Chunking every held session runs in
+   * one transaction, so this blocks for as long as that takes. Nothing else may write meanwhile:
+   * a snapshot accepted during a rebuild is chunked only into the active space.
+   */
+  readonly rebuild: () => Effect.Effect<Option.Option<Rebuild>>
+  /**
    * Mint a token for the named source, creating the source if it is new.
    * The returned value is the only copy; the archive keeps just its hash.
    */
@@ -150,12 +187,16 @@ export class Service extends Context.Service<Service, Interface>()("@opencode-re
  * scope. Fails with {@link NewerSchema}, without touching the database, when it was migrated by a
  * newer binary.
  *
- * An archive with no active vector space gets one built from the embedder's model and this
- * binary's chunking, and every held session is chunked into it. An existing active space is kept
- * even when it differs (see `status().activeSpace.matchesConfigured`); only a reindex replaces it.
+ * `configured` is the recipe this hub is set to build, by default the embedder's model with the
+ * default chunking. An archive with no active vector space gets one of that recipe, and every held
+ * session is chunked into it. An existing active space is kept even when it differs (see
+ * `status().activeSpace.matchesConfigured`); only a `rebuild` replaces it. The embedder answers
+ * queries and fills the queue only while it runs the active space's model; `rebuild` needs it to
+ * run the configured one.
  */
 export const make = Effect.fn("Archive.make")(function* (
   path: string,
+  configured?: SpaceRecipe,
 ): Effect.fn.Return<Interface, NewerSchema, Embedder.Service | Scope.Scope> {
   const embedder = yield* Embedder.Service
   const db = yield* Effect.acquireRelease(
@@ -167,11 +208,29 @@ export const make = Effect.fn("Archive.make")(function* (
   db.run("PRAGMA busy_timeout = 5000")
   if (path !== ":memory:") db.run("PRAGMA journal_mode = WAL")
   const migration = yield* migrate(db)
-  return bind(db, migration, embedder)
+  return bind(db, migration, embedder, configured ?? recipeFor(embedder.model, DEFAULT_CHUNKING))
 })
 
 /** The archive at `path` as the {@link Service}, closed when the layer is released. */
-export const layer = (path: string) => Layer.effect(Service, make(path))
+export const layer = (path: string, configured?: SpaceRecipe) => Layer.effect(Service, make(path, configured))
+
+/**
+ * The recipe of the active space in the archive at `path`, read without opening it for writing or
+ * migrating it: none when there is no such file or it has no active space yet.
+ */
+export const activeRecipe = Effect.fn("Archive.activeRecipe")(function* (path: string) {
+  if (path === ":memory:" || !(yield* Effect.promise(() => Bun.file(path).exists()))) return Option.none<SpaceRecipe>()
+  const db = new Database(path, { readonly: true })
+  try {
+    const hasSpaces = db.query("SELECT 1 FROM sqlite_master WHERE name = 'vector_spaces'").get()
+    const row = hasSpaces
+      ? (db.query("SELECT recipe FROM vector_spaces WHERE active = 1").get() as { recipe: string } | null)
+      : null
+    return row ? Option.some(JSON.parse(row.recipe) as SpaceRecipe) : Option.none<SpaceRecipe>()
+  } finally {
+    db.close()
+  }
+})
 
 function migrate(db: Database): Effect.Effect<{ from: number; to: number }, NewerSchema> {
   return Effect.suspend(() => {
@@ -210,8 +269,8 @@ const TOOL_TITLE_CHARS = 80
 const TOOL_ERROR_CHARS = 200
 const RECENT_REWINDS = 5
 
-/** The space this binary builds for `model`. Key order is fixed, since the JSON is the identity. */
-function recipeFor(model: EmbeddingModel): SpaceRecipe {
+/** The space this binary builds for `model` and `chunking`. Key order is fixed, since the JSON is the identity. */
+export function recipeFor(model: EmbeddingModel, chunking: ChunkParams): SpaceRecipe {
   return {
     model: model.model,
     revision: model.revision,
@@ -221,9 +280,9 @@ function recipeFor(model: EmbeddingModel): SpaceRecipe {
     pooling: model.pooling,
     normalize: model.normalize,
     queryPrefix: model.queryPrefix,
-    chunkChars: 1_200,
-    chunkOverlap: 200,
-    turnChars: 60_000,
+    chunkChars: chunking.chunkChars,
+    chunkOverlap: chunking.chunkOverlap,
+    turnChars: chunking.turnChars,
     rendering: RENDERING_VERSION,
   }
 }
@@ -318,7 +377,12 @@ type Space = { id: number; setId: number; recipe: SpaceRecipe }
 /** A vector already in the space, carried over to the new chunk with the same text. */
 type Reused = { row: VectorRow; vector: Float32Array }
 
-function bind(db: Database, migration: { from: number; to: number }, embedder: Embedder.Interface): Interface {
+function bind(
+  db: Database,
+  migration: { from: number; to: number },
+  embedder: Embedder.Interface,
+  configured: SpaceRecipe,
+): Interface {
   const segment = segmenter(db)
   const insertChunk = db.prepare(
     `INSERT INTO chunks (chunk_set_id, session_id, message_id, window_index, scope, time_created, hash, text)
@@ -372,8 +436,23 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
     return { parentId, messages }
   }
 
-  const configured = recipeFor(embedder.model)
-  const space = db
+  /** A new space of `recipe` with one chunk set holding every held session's chunks, all unembedded. */
+  function createSpace(recipe: SpaceRecipe, active: boolean): Space {
+    const { id } = db
+      .query("INSERT INTO vector_spaces (recipe, active, time_created) VALUES (?, ?, ?) RETURNING id")
+      .get(JSON.stringify(recipe), active, Date.now()) as { id: number }
+    const { id: setId } = db
+      .query("INSERT INTO chunk_sets (space_id, time_created) VALUES (?, ?) RETURNING id")
+      .get(id, Date.now()) as { id: number }
+    const created = { id, setId, recipe }
+    const held = db.query("SELECT id, parent_id AS parentId FROM sessions").all() as { id: string; parentId: string | null }[]
+    for (const s of held) writeChunks(created, s.id, readChunkSource(s.id, s.parentId), new Map())
+    return created
+  }
+
+  const sameRecipe = (a: SpaceRecipe, b: SpaceRecipe) => JSON.stringify(a) === JSON.stringify(b)
+
+  let space = db
     .transaction((): Space => {
       const held = db
         .query(
@@ -382,21 +461,12 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
         )
         .get() as { id: number; setId: number; recipe: string } | null
       if (held) return { ...held, recipe: JSON.parse(held.recipe) as SpaceRecipe }
-      const { id } = db
-        .query("INSERT INTO vector_spaces (recipe, active, time_created) VALUES (?, 1, ?) RETURNING id")
-        .get(JSON.stringify(configured), Date.now()) as { id: number }
-      const { id: setId } = db
-        .query("INSERT INTO chunk_sets (space_id, time_created) VALUES (?, ?) RETURNING id")
-        .get(id, Date.now()) as { id: number }
-      const created = { id, setId, recipe: configured }
-      // Sessions archived before vector spaces existed.
-      const archived = db.query("SELECT id, parent_id AS parentId FROM sessions").all() as { id: string; parentId: string | null }[]
-      for (const s of archived) writeChunks(created, s.id, readChunkSource(s.id, s.parentId), new Map())
-      return created
+      // Sessions archived before vector spaces existed are chunked into the first one.
+      return createSpace(configured, true)
     })
     .immediate()
-  const matchesConfigured = JSON.stringify(space.recipe) === JSON.stringify(configured)
-  const embedderFits = sameModel(space.recipe, embedder.model)
+  let matchesConfigured = sameRecipe(space.recipe, configured)
+  let embedderFits = sameModel(space.recipe, embedder.model)
 
   const selectPriorVectors = db.prepare(
     `SELECT c.hash, v.embedding FROM chunks c JOIN vectors v ON v.chunk_id = c.id AND v.space_id = ?
@@ -427,25 +497,82 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
     return (matrix = loaded)
   }
 
-  const storeVectors = db.transaction((rows: VectorRow[], embedded: Float32Array[]): Reused[] =>
+  const storeVectors = db.transaction((target: Space, rows: VectorRow[], embedded: Float32Array[]): Reused[] =>
     rows.flatMap((row, i) => {
       const vector = embedded[i]!
-      return insertVector.run(row.chunkId, space.id, blobOf(vector), row.chunkId).changes ? [{ row, vector }] : []
+      return insertVector.run(row.chunkId, target.id, blobOf(vector), row.chunkId).changes ? [{ row, vector }] : []
     }),
   )
 
-  const embedPending = Effect.fn("Archive.embedPending")(function* (limit: number) {
-    if (!embedderFits) return 0
+  /** Embed up to `limit` of `target`'s unembedded chunks, oldest first; `stored` are the vectors written. */
+  const embedInto = Effect.fnUntraced(function* (target: Space, limit: number) {
     type Pending = VectorRow & { text: string }
-    const pending = (selectPending.all(space.setId, space.id, limit) as Pending[]).map(({ text, ...row }) => ({ row, text }))
-    if (!pending.length) return 0
+    const pending = (selectPending.all(target.setId, target.id, limit) as Pending[]).map(({ text, ...row }) => ({ row, text }))
+    if (!pending.length) return { taken: 0, stored: [] }
     const embedded = yield* embedder.embed(pending.map((p) => p.text))
-    if (embedded.length !== pending.length || embedded.some((v) => v.length !== space.recipe.dims))
+    if (embedded.length !== pending.length || embedded.some((v) => v.length !== target.recipe.dims))
       return yield* new BadVectors({
         message: `embedder returned ${embedded.length} vectors for ${pending.length} chunks, or the wrong dimensions`,
       })
-    for (const { row, vector } of storeVectors.immediate(pending.map((p) => p.row), embedded)) matrix?.add(row, vector)
-    return pending.length
+    return { taken: pending.length, stored: storeVectors.immediate(target, pending.map((p) => p.row), embedded) }
+  })
+
+  const embedPending = Effect.fn("Archive.embedPending")(function* (limit: number) {
+    if (!embedderFits) return 0
+    const { taken, stored } = yield* embedInto(space, limit)
+    for (const { row, vector } of stored) matrix?.add(row, vector)
+    return taken
+  })
+
+  const countPending = db.prepare(
+    `SELECT count(*) AS n FROM chunks c
+     WHERE c.chunk_set_id = ? AND NOT EXISTS (SELECT 1 FROM vectors v WHERE v.chunk_id = c.id AND v.space_id = ?)`,
+  )
+  const countInactiveChunks = db.prepare(
+    `SELECT count(*) AS n FROM chunks WHERE chunk_set_id IN
+       (SELECT c.id FROM chunk_sets c JOIN vector_spaces s ON s.id = c.space_id WHERE s.active = 0)`,
+  )
+  // Cascades to each space's chunk sets, their chunks, and the space's vectors.
+  const deleteInactiveSpaces = db.prepare("DELETE FROM vector_spaces WHERE active = 0")
+
+  const reclaimTx = db.transaction(() => {
+    const { n } = countInactiveChunks.get() as { n: number }
+    deleteInactiveSpaces.run()
+    return n
+  })
+
+  const activateTx = db.transaction((next: Space) => {
+    const { n: pending } = countPending.get(next.setId, next.id) as { n: number }
+    if (pending) return new Incomplete({ pending, message: `${pending} chunks of the new vector space are not embedded` })
+    // At most one space is active at a time, so the old one steps down before the new one steps up.
+    db.query("UPDATE vector_spaces SET active = 0 WHERE id = ?").run(space.id)
+    db.query("UPDATE vector_spaces SET active = 1 WHERE id = ?").run(next.id)
+    deleteInactiveSpaces.run()
+    return undefined
+  })
+
+  const rebuild = Effect.fn("Archive.rebuild")(function* () {
+    const next = db
+      .transaction(() => {
+        reclaimTx()
+        return sameRecipe(space.recipe, configured) ? undefined : createSpace(configured, false)
+      })
+      .immediate()
+    if (!next) return Option.none<Rebuild>()
+    return Option.some<Rebuild>({
+      recipe: next.recipe,
+      chunks: (countChunks.get(next.setId) as { n: number }).n,
+      embedNext: (limit) => Effect.map(embedInto(next, limit), ({ taken }) => taken),
+      activate: Effect.suspend(() => {
+        const refused = activateTx.immediate(next)
+        if (refused) return Effect.fail(refused)
+        space = next
+        matrix = null
+        matchesConfigured = true
+        embedderFits = sameModel(next.recipe, embedder.model)
+        return Effect.void
+      }),
+    })
   })
 
   const embedQuery = Effect.fnUntraced(function* (query: string) {
@@ -997,6 +1124,10 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
       return summaryPutTx.immediate(f)
     }),
     embedPending,
+    reclaim: Effect.fn("Archive.reclaim")(function* () {
+      return reclaimTx.immediate()
+    }),
+    rebuild,
     issueToken: Effect.fn("Archive.issueToken")(function* (source: string) {
       return issueTokenTx(source)
     }),

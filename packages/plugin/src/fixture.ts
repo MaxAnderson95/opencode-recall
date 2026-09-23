@@ -76,7 +76,7 @@ export type SourceDb = ReturnType<typeof sourceDb>
  * through its own connection, as `opencode-recall-hub token issue` does.
  */
 export async function startHub(dataDir: string, embedder: Embedder.Interface = fakeEmbedder()) {
-  const settings = { dataDir, listen: "127.0.0.1:0", logLevel: "error" } as const
+  const settings: HubConfig.Settings = { ...HubConfig.DEFAULTS, dataDir, listen: "127.0.0.1:0", logLevel: "error" }
   const runtime = ManagedRuntime.make(
     Hub.layer(fakeLayer(embedder)).pipe(
       Layer.provide(Layer.succeed(HubConfig.Service, settings)),
