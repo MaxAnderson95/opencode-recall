@@ -102,6 +102,37 @@ export const Search = Schema.Struct({
 })
 export interface Search extends Schema.Schema.Type<typeof Search> {}
 
+/** A session id, or a slug naming the most recently updated session that has it. */
+const SessionRef = NonEmptyString
+
+/**
+ * A look inside one session. With a non-blank query, its messages ranked by fusing both branches
+ * per message; without one, an outline of its user turns.
+ */
+export const Inspect = Schema.Struct({
+  session: SessionRef,
+  query: Schema.optionalKey(Schema.String),
+  mode: Search.fields.mode,
+  scope: Search.fields.scope,
+  includeTools: Search.fields.includeTools,
+  /** Messages returned in query mode. */
+  limit: Int.check(Schema.isBetween({ minimum: 1, maximum: 30 })),
+  exclude: Search.fields.exclude,
+})
+export interface Inspect extends Schema.Schema.Type<typeof Inspect> {}
+
+/** A window of consecutive messages around one message, or at the end of the session. */
+export const Expand = Schema.Struct({
+  session: SessionRef,
+  /** The message to center on; absent, or not in the session, means the session's last message. */
+  messageId: Schema.optionalKey(Schema.String),
+  /** Messages in the window. */
+  window: Int.check(Schema.isBetween({ minimum: 2, maximum: 60 })),
+  /** Characters of each message's text, after whitespace is collapsed. */
+  maxChars: Int.check(Schema.isBetween({ minimum: 100, maximum: 4_000 })),
+})
+export interface Expand extends Schema.Schema.Type<typeof Expand> {}
+
 const version = { protocolVersion: Schema.Literal(PROTOCOL_VERSION) }
 
 export const requests = {
@@ -109,6 +140,8 @@ export const requests = {
   tombstone: Schema.Struct({ ...version, ...Tombstone.fields }),
   manifest: Schema.Struct(version),
   search: Schema.Struct({ ...version, ...Search.fields }),
+  inspect: Schema.Struct({ ...version, ...Inspect.fields }),
+  expand: Schema.Struct({ ...version, ...Expand.fields }),
   status: Schema.Struct(version),
 }
 
@@ -157,8 +190,7 @@ export const SearchHit = Schema.Union([
 ])
 export type SearchHit = typeof SearchHit.Type
 
-/** One ranked session. Where it came from is reported and never affects its rank. */
-export const SearchResult = Schema.Struct({
+const archivedFields = {
   sessionId: Schema.String,
   slug: Schema.String,
   title: Schema.String,
@@ -171,6 +203,37 @@ export const SearchResult = Schema.Struct({
   ownSource: Schema.Boolean,
   /** The archived revision, which may trail the host's newest turn. */
   revision: Int,
+}
+
+/** The session a reference resolved to, and any others that share its slug, newest first. */
+const resolvedFields = {
+  session: Schema.Struct({ ...archivedFields, timeCreated: Int }),
+  sameSlug: Schema.Array(Schema.Struct({ sessionId: Schema.String, title: Schema.String, timeUpdated: Int })),
+}
+
+/** No archived session has the id or slug the request named. */
+const Missing = Schema.Struct({ kind: Schema.Literal("missing") })
+
+/** One archived message, cut down for reading in a window. */
+export const WindowMessage = Schema.Struct({
+  messageId: Schema.String,
+  type: MessageType,
+  time: Int,
+  /** Its text parts joined, whitespace collapsed, cut to the requested characters with `…`. */
+  text: Schema.String,
+  /**
+   * Every tool call in order, including failed and in-flight ones, whitespace collapsed: `title`
+   * cut to 80 characters and `error` to 200.
+   */
+  tools: Schema.Array(
+    Schema.Struct({ tool: Schema.String, title: Schema.String, status: Schema.String, error: Schema.optionalKey(Schema.String) }),
+  ),
+})
+export interface WindowMessage extends Schema.Schema.Type<typeof WindowMessage> {}
+
+/** One ranked session. Where it came from is reported and never affects its rank. */
+export const SearchResult = Schema.Struct({
+  ...archivedFields,
   /** Lexical candidates that matched in this session. */
   lexicalMatches: Int,
   /** Semantic candidates that matched in this session. */
@@ -220,6 +283,38 @@ export const responses = {
    * could not run; hybrid results are then lexical only.
    */
   search: Schema.Struct({ sessions: Schema.Array(SearchResult), semanticUnavailable: Schema.optionalKey(Schema.String) }),
+  /**
+   * `outline`: every user turn with text, in order, each cut to 120 characters.
+   * `matches`: the best-ranked messages, one hit each, in chronological order; `total` counts every
+   * message that matched. In hybrid mode, semantic hits below 0.55 cosine are dropped first.
+   */
+  inspect: Schema.Union([
+    Missing,
+    Schema.Struct({
+      kind: Schema.Literal("outline"),
+      ...resolvedFields,
+      messages: Int,
+      turns: Schema.Array(Schema.Struct({ messageId: Schema.String, time: Int, text: Schema.String })),
+    }),
+    Schema.Struct({
+      kind: Schema.Literal("matches"),
+      ...resolvedFields,
+      total: Int,
+      hits: Schema.Array(SearchHit),
+      semanticUnavailable: Schema.optionalKey(Schema.String),
+    }),
+  ]),
+  /** `start` is the zero-based position of the window's first message among the session's `total`. */
+  expand: Schema.Union([
+    Missing,
+    Schema.Struct({
+      kind: Schema.Literal("window"),
+      ...resolvedFields,
+      total: Int,
+      start: Int,
+      messages: Schema.Array(WindowMessage),
+    }),
+  ]),
   status: Schema.Struct({
     sessions: Int,
     /** Chunks in the active space, and how many of them are embedded; the rest wait in the queue. */
@@ -280,6 +375,8 @@ export interface Client {
   readonly tombstone: (tombstone: Tombstone) => Effect.Effect<Responses["tombstone"], HubError | TransportError>
   readonly manifest: () => Effect.Effect<Responses["manifest"], HubError | TransportError>
   readonly search: (search: Search) => Effect.Effect<Responses["search"], HubError | TransportError>
+  readonly inspect: (inspect: Inspect) => Effect.Effect<Responses["inspect"], HubError | TransportError>
+  readonly expand: (expand: Expand) => Effect.Effect<Responses["expand"], HubError | TransportError>
   readonly status: () => Effect.Effect<Responses["status"], HubError | TransportError>
 }
 
@@ -329,6 +426,8 @@ export function makeClient({ url, token, fetch: fetcher = fetch }: ClientOptions
     tombstone: (tombstone) => call("tombstone", tombstone),
     manifest: () => call("manifest", {}),
     search: (search) => call("search", search),
+    inspect: (inspect) => call("inspect", inspect),
+    expand: (expand) => call("expand", expand),
     status: () => call("status", {}),
   }
 }

@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { Message, Part, Search, Snapshot } from "@opencode-recall/protocol"
+import type { Expand, Inspect, Message, Part, Search, Snapshot } from "@opencode-recall/protocol"
 import { Effect, Exit, Option, Scope, type Types } from "effect"
 import { Embedder } from "../embedder.ts"
 import { fakeEmbedder } from "../fake-embedder.ts"
@@ -33,6 +33,8 @@ function handle(archive: Archive.Interface, scope: Scope.Closeable) {
     putTombstone: (...args: Parameters<Archive.Interface["putTombstone"]>) => Effect.runSync(archive.putTombstone(...args)),
     manifest: () => Effect.runSync(archive.manifest()),
     search: (search: Search, callerSourceId: number) => Effect.runPromise(archive.search(search, callerSourceId)),
+    inspect: (inspect: Inspect, callerSourceId = 0) => Effect.runPromise(archive.inspect(inspect, callerSourceId)),
+    expand: (expand: Expand, callerSourceId = 0) => Effect.runSync(archive.expand(expand, callerSourceId)),
     embedPending: (limit: number) => Effect.runPromise(archive.embedPending(limit)),
     issueToken: (source: string) => Effect.runSync(archive.issueToken(source)),
     listTokens: () => Effect.runSync(archive.listTokens()),
@@ -596,6 +598,116 @@ describe.each(backends)("archive ($name)", ({ path }) => {
       "ses_child",
       "ses_early",
     ])
+  })
+
+  test("inspect ranks one session's messages by message, returned chronologically, with ids expand accepts", async () => {
+    const archive = open(path())
+    const [laptop, desktop] = [sourceOf(archive, "laptop"), sourceOf(archive, "desktop")]
+    archive.putSnapshot(session("ses_a", ["needle one", "no match", "needle needle two", "needle three"]), desktop)
+    archive.putSnapshot(session("ses_b", ["needle elsewhere"]), desktop)
+
+    const answer = await archive.inspect({ session: "ses_a", query: "needle", mode: "lexical", limit: 2 }, laptop)
+    if (answer.kind !== "matches") throw new Error(`expected matches, got ${answer.kind}`)
+    expect(answer.session).toMatchObject({ sessionId: "ses_a", source: "desktop", ownSource: false, revision: 4 })
+    expect(answer.total).toBe(3)
+    // The best two by BM25, then put in transcript order.
+    const ids = answer.hits.map((h) => h.messageId)
+    expect(ids).toHaveLength(2)
+    expect(ids).toContain("ses_a_msg_2")
+    expect(answer.hits.map((h) => h.time)).toEqual([...answer.hits.map((h) => h.time)].sort((a, b) => a - b))
+    expect(answer.hits.find((h) => h.messageId === "ses_a_msg_2")!.snippet).toBe("«needle» «needle» two")
+
+    const window = archive.expand({ session: "ses_a", messageId: ids[0]!, window: 2, maxChars: 800 })
+    if (window.kind !== "window") throw new Error(`expected a window, got ${window.kind}`)
+    expect(window.messages.map((m) => m.messageId)).toContain(ids[0]!)
+
+    const excluded = await archive.inspect(
+      { session: "ses_a", query: "needle", mode: "lexical", limit: 30, exclude: { sessionId: "ses_a", before: 12 } },
+      laptop,
+    )
+    expect(excluded).toMatchObject({ kind: "matches", total: 1, hits: [{ messageId: "ses_a_msg_0" }] })
+  })
+
+  test("inspect without a query outlines the session's user turns", async () => {
+    const archive = open(path())
+    const draft = session("ses_a", ["first  question\n\nwith newlines", "answer", "x".repeat(200), "answer"])
+    draft.session.messages.push({ id: "ses_a_synthetic", type: "synthetic", timeCreated: 20, parts: [{ kind: "text", text: "injected" }] })
+    archive.putSnapshot(draft, sourceOf(archive))
+
+    const outline = await archive.inspect({ session: "ses_a", query: "  ", limit: 12 })
+    expect(outline).toMatchObject({
+      kind: "outline",
+      messages: 5,
+      turns: [
+        { messageId: "ses_a_msg_0", time: 10, text: "first question with newlines" },
+        { messageId: "ses_a_msg_2", time: 12, text: "x".repeat(120) + "…" },
+      ],
+    })
+  })
+
+  test("a hybrid inspect drops semantic hits below 0.55 cosine; semantic mode keeps them", async () => {
+    const archive = open(path())
+    archive.putSnapshot(session("ses_a", ["walrus tusks walrus tusks", "ok", "zebra stripes", "fine"]), sourceOf(archive))
+    while ((await archive.embedPending(64)) > 0);
+
+    const semantic = await archive.inspect({ session: "ses_a", query: "walrus tusks", mode: "semantic", limit: 30 })
+    if (semantic.kind !== "matches") throw new Error(`expected matches, got ${semantic.kind}`)
+    const scores = new Map(semantic.hits.map((h) => [h.messageId, h.branch === "semantic" ? h.score : NaN]))
+    expect(scores.get("ses_a_msg_0")).toBeGreaterThanOrEqual(0.55)
+    expect(scores.get("ses_a_msg_2")).toBeLessThan(0.55)
+
+    const hybrid = await archive.inspect({ session: "ses_a", query: "walrus tusks", limit: 30 })
+    expect(hybrid).toMatchObject({ kind: "matches", total: 1, hits: [{ messageId: "ses_a_msg_0" }] })
+  })
+
+  test("expand returns a window around a message, or the session's end, capping each message's text", async () => {
+    const archive = open(path())
+    const draft = session("ses_a", Array.from({ length: 10 }, (_, i) => `message ${i} ` + "word ".repeat(100)))
+    draft.session.messages[9]!.parts.push(
+      { kind: "reasoning", text: "hidden thoughts" },
+      { kind: "tool", tool: "bash", title: "git   push", status: "error", error: "rejected:\n non-fast-forward", text: "bash git push\nrejected", searchable: true },
+      { kind: "tool", tool: "bash", title: "sleep 9", status: "running", text: "", searchable: false },
+    )
+    archive.putSnapshot(draft, sourceOf(archive))
+
+    const at = (f: Omit<Expand, "session">) => {
+      const answer = archive.expand({ session: "ses_a", ...f })
+      if (answer.kind !== "window") throw new Error(`expected a window, got ${answer.kind}`)
+      return answer
+    }
+    const end = at({ window: 4, maxChars: 100 })
+    expect([end.total, end.start]).toEqual([10, 6])
+    expect(end.messages.map((m) => m.messageId)).toEqual(["ses_a_msg_6", "ses_a_msg_7", "ses_a_msg_8", "ses_a_msg_9"])
+    const last = end.messages.at(-1)!
+    expect(last.text).toBe(("message 9 " + "word ".repeat(100)).slice(0, 100) + "…")
+    expect(last.tools).toEqual([
+      { tool: "bash", title: "git push", status: "error", error: "rejected: non-fast-forward" },
+      { tool: "bash", title: "sleep 9", status: "running" },
+    ])
+
+    expect(at({ messageId: "ses_a_msg_4", window: 3, maxChars: 4000 }).start).toBe(3)
+    expect(at({ messageId: "ses_a_msg_0", window: 4, maxChars: 4000 }).start).toBe(0)
+    expect(at({ messageId: "msg_not_here", window: 4, maxChars: 4000 }).start).toBe(6)
+    expect(at({ window: 60, maxChars: 4000 }).messages).toHaveLength(10)
+  })
+
+  test("a slug names the most recently updated session with it and lists the others; an unknown one is missing", async () => {
+    const archive = open(path())
+    const older = session("ses_old", ["old"])
+    const newer = session("ses_new", ["new"])
+    newer.session.timeUpdated = 50
+    archive.putSnapshot(older, sourceOf(archive))
+    archive.putSnapshot(newer, sourceOf(archive))
+
+    expect(archive.expand({ session: "slug", window: 12, maxChars: 800 })).toMatchObject({
+      kind: "window",
+      session: { sessionId: "ses_new" },
+      sameSlug: [{ sessionId: "ses_old", title: "title", timeUpdated: 2 }],
+    })
+    expect(archive.expand({ session: "ses_old", window: 12, maxChars: 800 })).toMatchObject({ sameSlug: [] })
+    expect(archive.expand({ session: "nope", window: 12, maxChars: 800 })).toEqual({ kind: "missing" })
+    expect(await archive.inspect({ session: "nope", limit: 12 })).toEqual({ kind: "missing" })
+    expect(await archive.inspect({ session: "nope", query: "x", limit: 12 })).toEqual({ kind: "missing" })
   })
 
   test("status reports the active space's full recipe", async () => {

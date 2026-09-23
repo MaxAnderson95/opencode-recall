@@ -145,6 +145,8 @@ export const makeHandler = Effect.fnUntraced(function* ({
     }),
     manifest: () => archive.manifest(),
     search: ({ protocolVersion: _, ...search }, source) => archive.search(search, source.id),
+    inspect: ({ protocolVersion: _, ...inspect }, source) => archive.inspect(inspect, source.id),
+    expand: ({ protocolVersion: _, ...expand }, source) => archive.expand(expand, source.id),
     status: () => archive.status(),
   }
 

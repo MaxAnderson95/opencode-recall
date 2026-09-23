@@ -7,8 +7,11 @@
 import { Database } from "bun:sqlite"
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
 import type {
+  Expand,
+  Inspect,
   Manifest,
   Message,
+  Part,
   Responses,
   Search,
   SearchHit,
@@ -16,12 +19,13 @@ import type {
   Snapshot,
   SpaceRecipe,
   Tombstone,
+  WindowMessage,
 } from "@opencode-recall/protocol"
 import { Context, Effect, Layer, Option, Schema, type Scope } from "effect"
 import { Embedder, type EmbeddingModel } from "../embedder.ts"
 import { RENDERING_VERSION, renderChunks, type ChunkSource } from "./chunks.ts"
 import { SEGMENTED, migrations } from "./migrations.ts"
-import { ftsQuery, fuse, makeSnippet, queryTokens, segments } from "./text.ts"
+import { clean, ftsQuery, fuse, makeSnippet, queryTokens, segments } from "./text.ts"
 import { createMatrix, type Matrix, type VectorRow } from "./vectors.ts"
 
 export const SCHEMA_VERSION = migrations.length
@@ -81,6 +85,16 @@ export interface Interface {
    * vectors for the active space, the lexical branch still runs and `semanticUnavailable` says why.
    */
   readonly search: (search: Search, callerSourceId: number) => Effect.Effect<Responses["search"]>
+  /**
+   * Look inside the session `inspect.session` names: an exact id, else the most recently updated
+   * session with that slug. With a non-blank query, both branches run as `search` runs them,
+   * restricted to that session, and are fused per message; in hybrid mode semantic hits below 0.55
+   * cosine are dropped first, since within one session nothing else competes to bury a weak one.
+   * Without a query, its user turns.
+   */
+  readonly inspect: (inspect: Inspect, callerSourceId: number) => Effect.Effect<Responses["inspect"]>
+  /** A window of the named session's messages, centered on `expand.messageId` or ending the session. */
+  readonly expand: (expand: Expand, callerSourceId: number) => Effect.Effect<Responses["expand"]>
   /**
    * Embed up to `limit` chunks waiting in the active space's queue, oldest first, and return how
    * many were taken from it (0 once it is empty, or when the embedder does not match the active
@@ -160,6 +174,11 @@ const SEGMENT_CHARS = 8_000
 /** Candidates each branch ranks before fusion. */
 const CANDIDATES = 60
 const RRF_K = 60
+/** Cosine below which a hybrid inspect drops a semantic hit. */
+const INSPECT_SEMANTIC_MIN = 0.55
+const OUTLINE_CHARS = 120
+const TOOL_TITLE_CHARS = 80
+const TOOL_ERROR_CHARS = 200
 
 /** The space this binary builds for `model`. Key order is fixed, since the JSON is the identity. */
 function recipeFor(model: EmbeddingModel): SpaceRecipe {
@@ -214,8 +233,11 @@ type Candidate = { sessionId: string } & (
 
 const likeSubstring = (text: string) => `%${text.replace(/[\\%_]/g, "\\$&")}%`
 
+/** What narrows both branches' candidates. */
+type Filters = Omit<Search, "query" | "mode" | "limit">
+
 /** The ids of sessions passing the session-level filters, or `null` when none is set. */
-function sessionFilterQuery(f: Search): { sql: string; args: string[] } | null {
+function sessionFilterQuery(f: Filters): { sql: string; args: string[] } | null {
   const where: string[] = []
   const args: string[] = []
   if (f.directory !== undefined) {
@@ -234,7 +256,7 @@ function sessionFilterQuery(f: Search): { sql: string; args: string[] } | null {
 }
 
 /** The lexical branch's statement and arguments. Every filter is a condition here, never a post-filter. */
-function lexicalQuery(match: string, f: Search): { sql: string; args: (string | number)[] } {
+function lexicalQuery(match: string, f: Filters): { sql: string; args: (string | number)[] } {
   const where = ["fts MATCH ?"]
   const args: (string | number)[] = [match]
   const add = (condition: string, ...values: (string | number)[]) => {
@@ -410,7 +432,7 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
   })
 
   /** The cosine branch. Every filter is applied before the candidate cut, as the lexical branch does. */
-  function semantic(query: Float32Array, f: Search): Candidate[] {
+  function semantic(query: Float32Array, f: Filters): Candidate[] {
     const filter = sessionFilterQuery(f)
     const allowed = filter && new Set((db.query(filter.sql).all(...filter.args) as { id: string }[]).map((r) => r.id))
     const scope = f.scope ?? "all"
@@ -468,6 +490,25 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
     `SELECT s.id AS sessionId, s.slug, s.title, s.directory, s.parent_id AS parentId, s.time_updated AS timeUpdated,
        coalesce(src.name, '') AS source, s.source_id IS ? AS ownSource, s.revision
      FROM sessions s LEFT JOIN sources src ON src.id = s.source_id WHERE s.id = ?`,
+  )
+  const selectSessionsByRef = db.prepare(
+    `SELECT s.id AS sessionId, s.slug, s.title, s.directory, s.parent_id AS parentId, s.time_created AS timeCreated,
+       s.time_updated AS timeUpdated, coalesce(src.name, '') AS source, s.source_id IS ? AS ownSource, s.revision
+     FROM sessions s LEFT JOIN sources src ON src.id = s.source_id
+     WHERE s.id = ? OR s.slug = ? ORDER BY s.id = ? DESC, s.time_updated DESC LIMIT 5`,
+  )
+  const selectMessages = db.prepare(
+    "SELECT id AS messageId, type, time_created AS time FROM messages WHERE session_id = ? ORDER BY ordinal",
+  )
+  const countMessages = db.prepare("SELECT count(*) AS n FROM messages WHERE session_id = ?")
+  const selectUserTurns = db.prepare(
+    `SELECT m.id AS messageId, m.time_created AS time, p.text FROM messages m
+     JOIN parts p ON p.message_id = m.id AND p.kind = 'text'
+     WHERE m.session_id = ? AND m.type = 'user' ORDER BY m.ordinal, p.ordinal`,
+  )
+  const selectWindowParts = db.prepare(
+    `SELECT kind, text, tool_name AS tool, tool_title AS title, status, error FROM parts
+     WHERE message_id = ? ORDER BY ordinal`,
   )
   const selectSegmentText = db.prepare("SELECT text FROM segment_text WHERE id = ?")
   const countSessions = db.prepare("SELECT count(*) AS n FROM sessions")
@@ -586,22 +627,35 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
     return { removed: deleteSession(tombstone.sessionId) }
   })
 
-  const lexical = (match: string, f: Search): Candidate[] => {
+  const lexical = (match: string, f: Filters): Candidate[] => {
     const { sql, args } = lexicalQuery(match, f)
     // `query` caches the compiled statement per distinct filter combination.
     return db.query(sql).all(...args) as Candidate[]
   }
 
-  /** Both branches and the fusion, over one consistent read. `query` is absent when semantic is not run. */
-  const rank = db.transaction((f: Search, lexicalToo: boolean, query: Float32Array | undefined, callerSourceId: number) => {
-    const tokens = queryTokens(f.query)
+  /** Each branch's candidates, best first. `vector` is absent when semantic is not run. */
+  function branches(query: string, f: Filters, lexicalToo: boolean, vector: Float32Array | undefined) {
+    const tokens = queryTokens(query)
     let lex: Candidate[] = []
     if (lexicalToo && tokens.length) {
-      lex = lexical(ftsQuery(f.query, "AND")!, f)
-      if (!lex.length && tokens.length > 1) lex = lexical(ftsQuery(f.query, "OR")!, f)
+      lex = lexical(ftsQuery(query, "AND")!, f)
+      if (!lex.length && tokens.length > 1) lex = lexical(ftsQuery(query, "OR")!, f)
     }
-    const sem = query ? semantic(query, f) : []
+    return { tokens, lex, sem: vector ? semantic(vector, f) : [] }
+  }
 
+  function toHit(c: Candidate, tokens: string[]): SearchHit {
+    if (c.branch === "lexical") {
+      const { sessionId: _, segmentId, ...rest } = c
+      return { ...rest, snippet: makeSnippet((selectSegmentText.get(segmentId) as { text: string }).text, tokens) }
+    }
+    const { sessionId: _, chunkId, ...rest } = c
+    return { ...rest, snippet: makeSnippet((selectChunkText.get(chunkId) as { text: string }).text, tokens) }
+  }
+
+  /** Both branches and the fusion, over one consistent read. */
+  const rank = db.transaction((f: Search, lexicalToo: boolean, vector: Float32Array | undefined, callerSourceId: number) => {
+    const { tokens, lex, sem } = branches(f.query, f, lexicalToo, vector)
     const groups = fuse(
       [
         { hits: lex, which: "lex" },
@@ -610,29 +664,120 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
       (h) => h.sessionId,
       { rrfK: RRF_K, perBranchCap: 3, hitsPerKey: 2 },
     )
-    const snippet = (text: string) => makeSnippet(text, tokens)
-    const hit = (c: Candidate): SearchHit => {
-      if (c.branch === "lexical") {
-        const { sessionId: _, segmentId, ...rest } = c
-        return { ...rest, snippet: snippet((selectSegmentText.get(segmentId) as { text: string }).text) }
-      }
-      const { sessionId: _, chunkId, ...rest } = c
-      return { ...rest, snippet: snippet((selectChunkText.get(chunkId) as { text: string }).text) }
-    }
     return groups.slice(0, f.limit).map((g): SearchResult => {
       type Row = Omit<SearchResult, "lexicalMatches" | "semanticMatches" | "hits" | "ownSource"> & { ownSource: number }
       const row = selectResultSession.get(callerSourceId, g.key) as Row
-      return { ...row, ownSource: row.ownSource === 1, lexicalMatches: g.nLex, semanticMatches: g.nSem, hits: g.hits.map(hit) }
+      return {
+        ...row,
+        ownSource: row.ownSource === 1,
+        lexicalMatches: g.nLex,
+        semanticMatches: g.nSem,
+        hits: g.hits.map((h) => toHit(h, tokens)),
+      }
     })
   })
+
+  /** The query's vector, or why the semantic branch cannot run; nothing when `mode` does not ask for it. */
+  const embedFor = (mode: Search["mode"], query: string) =>
+    mode === "lexical" ? Effect.succeed(undefined) : Effect.result(embedQuery(query))
 
   const search = Effect.fn("Archive.search")(function* (f: Search, callerSourceId: number) {
     if (!f.query.trim()) return { sessions: [] }
     const mode = f.mode ?? "hybrid"
-    const embedded = mode === "lexical" ? undefined : yield* Effect.result(embedQuery(f.query))
-    const query = embedded?._tag === "Success" ? embedded.success : undefined
-    const sessions = rank(f, mode !== "semantic", query, callerSourceId)
+    const embedded = yield* embedFor(mode, f.query)
+    const vector = embedded?._tag === "Success" ? embedded.success : undefined
+    const sessions = rank(f, mode !== "semantic", vector, callerSourceId)
     return embedded?._tag === "Failure" ? { sessions, semanticUnavailable: embedded.failure.message } : { sessions }
+  })
+
+  type Resolved = Pick<Extract<Responses["expand"], { kind: "window" }>, "session" | "sameSlug">
+
+  /** The session `ref` names, as an id first, then as the newest session with that slug. */
+  function resolveSession(ref: string, callerSourceId: number): Resolved | undefined {
+    type Row = Omit<Resolved["session"], "ownSource"> & { ownSource: number }
+    const rows = selectSessionsByRef.all(callerSourceId, ref, ref, ref) as Row[]
+    const [first] = rows
+    if (!first) return undefined
+    const sameSlug = first.sessionId === ref ? [] : rows.slice(1).map(({ sessionId, title, timeUpdated }) => ({ sessionId, title, timeUpdated }))
+    return { session: { ...first, ownSource: first.ownSource === 1 }, sameSlug }
+  }
+
+  const outlineTx = db.transaction((ref: string, callerSourceId: number): Responses["inspect"] => {
+    const resolved = resolveSession(ref, callerSourceId)
+    if (!resolved) return { kind: "missing" }
+    const { sessionId } = resolved.session
+    const turns = (selectUserTurns.all(sessionId) as { messageId: string; time: number; text: string }[]).map((t) => ({
+      ...t,
+      text: clean(t.text, OUTLINE_CHARS),
+    }))
+    return { kind: "outline", ...resolved, messages: (countMessages.get(sessionId) as { n: number }).n, turns }
+  })
+
+  const matchesTx = db.transaction(
+    (f: Inspect, query: string, vector: Float32Array | undefined, callerSourceId: number): Responses["inspect"] => {
+      const resolved = resolveSession(f.session, callerSourceId)
+      if (!resolved) return { kind: "missing" }
+      const mode = f.mode ?? "hybrid"
+      const filters: Filters = {
+        sessionId: resolved.session.sessionId,
+        scope: f.scope,
+        includeTools: f.includeTools,
+        exclude: f.exclude,
+      }
+      const { tokens, lex, sem } = branches(query, filters, mode !== "semantic", vector)
+      // Cosine always ranks something, even for an unrelated query; explicit semantic mode keeps the raw ranking.
+      const kept = mode === "hybrid" ? sem.filter((c) => c.branch === "semantic" && c.score >= INSPECT_SEMANTIC_MIN) : sem
+      const fused = fuse(
+        [
+          { hits: lex, which: "lex" },
+          { hits: kept, which: "sem" },
+        ],
+        (h) => h.messageId,
+        { rrfK: RRF_K },
+      )
+      const top = fused.slice(0, f.limit).map((g) => g.hits[0]!)
+      top.sort((a, b) => a.time - b.time)
+      return { kind: "matches", ...resolved, total: fused.length, hits: top.map((c) => toHit(c, tokens)) }
+    },
+  )
+
+  const inspect = Effect.fn("Archive.inspect")(function* (f: Inspect, callerSourceId: number) {
+    const query = f.query?.trim() ? f.query : undefined
+    if (query === undefined) return outlineTx(f.session, callerSourceId)
+    const embedded = yield* embedFor(f.mode ?? "hybrid", query)
+    const result = matchesTx(f, query, embedded?._tag === "Success" ? embedded.success : undefined, callerSourceId)
+    return result.kind === "matches" && embedded?._tag === "Failure"
+      ? { ...result, semanticUnavailable: embedded.failure.message }
+      : result
+  })
+
+  const expandTx = db.transaction((f: Expand, callerSourceId: number): Responses["expand"] => {
+    const resolved = resolveSession(f.session, callerSourceId)
+    if (!resolved) return { kind: "missing" }
+    type Row = { messageId: string; type: Message["type"]; time: number }
+    const messages = selectMessages.all(resolved.session.sessionId) as Row[]
+    const found = f.messageId === undefined ? -1 : messages.findIndex((m) => m.messageId === f.messageId)
+    const center = found >= 0 ? found : messages.length - 1
+    const start = Math.max(0, Math.min(center - Math.floor(f.window / 2), messages.length - f.window))
+    const window = messages.slice(start, start + f.window).map((m): WindowMessage => {
+      type PartRow = { kind: Part["kind"]; text: string; tool: string | null; title: string | null; status: string | null; error: string | null }
+      const parts = selectWindowParts.all(m.messageId) as PartRow[]
+      const texts = parts.filter((p) => p.kind === "text").map((p) => p.text)
+      const tools = parts.flatMap((p) =>
+        p.kind === "tool" && p.tool !== null
+          ? [
+              {
+                tool: p.tool,
+                title: clean(p.title ?? "", TOOL_TITLE_CHARS),
+                status: p.status ?? "unknown",
+                ...(p.error !== null && { error: clean(p.error, TOOL_ERROR_CHARS) }),
+              },
+            ]
+          : [],
+      )
+      return { ...m, text: texts.length ? clean(texts.join("\n"), f.maxChars) : "", tools }
+    })
+    return { kind: "window", ...resolved, total: messages.length, start, messages: window }
   })
 
   const putSnapshot = Effect.fn("Archive.putSnapshot")(function* (snapshot: Snapshot, sourceId: number) {
@@ -674,6 +819,10 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
       return manifestTx()
     }),
     search,
+    inspect,
+    expand: Effect.fn("Archive.expand")(function* (f: Expand, callerSourceId: number) {
+      return expandTx(f, callerSourceId)
+    }),
     embedPending,
     issueToken: Effect.fn("Archive.issueToken")(function* (source: string) {
       return issueTokenTx(source)

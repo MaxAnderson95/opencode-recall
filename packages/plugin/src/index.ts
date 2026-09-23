@@ -3,6 +3,8 @@ import { join } from "node:path"
 import { Plugin } from "@opencode/plugin"
 import { Config, Effect, Layer, Logger, ManagedRuntime, Option, Stream } from "effect"
 import { PluginConfig } from "./config.ts"
+import { ExpandTool } from "./expand.ts"
+import { InspectTool } from "./inspect.ts"
 import { SearchTool } from "./search.ts"
 import { Source } from "./source.ts"
 import { Storage } from "./storage.ts"
@@ -68,9 +70,13 @@ export default Plugin.define({
     // Building the runtime starts the uploader and the event subscription, so a failed setup,
     // which returns no cleanup to the host, must release them itself.
     try {
-      const tool = await runtime.runPromise(SearchTool.make())
+      const [search, inspect, expand] = await runtime.runPromise(
+        Effect.all([SearchTool.make(), InspectTool.make(), ExpandTool.make()]),
+      )
       await ctx.tool.transform((tools) => {
-        tools.add(tool)
+        tools.add(search)
+        tools.add(inspect)
+        tools.add(expand)
       })
     } catch (e) {
       await runtime.dispose()
