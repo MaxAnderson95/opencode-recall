@@ -82,3 +82,15 @@ Recovery from a failed migration:
 2. Report the logged error; the migration needs a fix in a new release.
 
 A hub never runs against an archive a newer binary migrated: it logs `archive schema version N is newer than this binary supports` and exits 1. So rolling back past a migration that succeeded means restoring the backup taken before the upgrade, and then accepting the restore's consequences above.
+
+## Memory
+
+The budget is about 1 GB (SPEC §7). It has been measured once, not on the production Linux host: in a linux/arm64 container under OrbStack on an M5 Pro, limited with `--memory 1g`, against a synthetic archive at the measured production scale (4,200 sessions, 75,600 chunks with 384-dimension vectors under the real recipe, a 1.05 GB `archive.db`) and the real model. The load was 400 hybrid searches, four at a time, while 40 twelve-message snapshots were ingested and embedded.
+
+| point | hub process RSS |
+| --- | --- |
+| ready, model loaded, no search yet | 207 MB |
+| peak during the load (`VmHWM`) | 661 MB |
+| after the load | 525 MB |
+
+The container's page cache filled the rest of the 1 GiB limit and was reclaimed as needed; the kernel recorded no OOM event. Re-measure on the production host before treating these as its budget.
