@@ -50,19 +50,23 @@ afterEach(async () => {
 
 const context = { sessionID: "ses_self" } as unknown as ToolContext
 
-const tool = (hubConfig: Option.Option<PluginConfig.Hub>) =>
+const tool = (hubConfig: Option.Option<PluginConfig.Hub> | PluginConfig.Invalid) =>
   Effect.runPromise(
     SearchTool.make().pipe(
       Effect.provide(
         Layer.mergeAll(
-          Layer.succeed(PluginConfig.Service, { hub: Effect.succeed(hubConfig), hubSource: Effect.succeed("test"), summaryModel: Effect.succeed(PluginConfig.DEFAULT_SUMMARY_MODEL) }),
+          Layer.succeed(PluginConfig.Service, {
+            hub: hubConfig instanceof PluginConfig.Invalid ? Effect.fail(hubConfig) : Effect.succeed(hubConfig),
+            hubSource: Effect.succeed("test"),
+            summaryModel: Effect.succeed(PluginConfig.DEFAULT_SUMMARY_MODEL),
+          }),
           Source.fromDatabase(laptop.db),
         ),
       ),
     ),
   )
 
-async function run(input: object, hubConfig: Option.Option<PluginConfig.Hub> = Option.some(config)): Promise<string> {
+async function run(input: object, hubConfig: Option.Option<PluginConfig.Hub> | PluginConfig.Invalid = Option.some(config)): Promise<string> {
   const { content } = await (await tool(hubConfig)).execute(input, context)
   if (typeof content !== "string") throw new Error("expected text content")
   return content
@@ -84,8 +88,11 @@ test("filters reach the hub", async () => {
   expect(await run({ query: "needle", since: "2999-01-01" })).toStartWith('No matches for "needle"')
 })
 
-test("an unconfigured or unreachable hub is reported as not having looked", async () => {
+test("an unconfigured, misconfigured, or unreachable hub is reported as not having looked", async () => {
   expect(await run({ query: "needle" }, Option.none())).toStartWith("recall could not look")
+  expect(await run({ query: "needle" }, new PluginConfig.Invalid({ message: "bad json" }))).toStartWith(
+    "recall could not look: the recall config is invalid (bad json).",
+  )
   await hub.stop()
   expect(await run({ query: "needle" })).toStartWith("recall could not look: the hub request failed")
 })

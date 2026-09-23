@@ -41,10 +41,12 @@ const state: Uploader.State = {
   lastError: Option.some({ message: "upload of ses_x failed, retrying: connection refused", time: Date.parse("2026-09-20T10:05:00") }),
 }
 
-async function run(hubConfig: Option.Option<PluginConfig.Hub> = Option.some(config)): Promise<string> {
+async function run(
+  hubConfig: Option.Option<PluginConfig.Hub> | PluginConfig.Invalid = Option.some(config),
+): Promise<string> {
   const layer = Layer.mergeAll(
     Layer.succeed(PluginConfig.Service, {
-      hub: Effect.succeed(hubConfig),
+      hub: hubConfig instanceof PluginConfig.Invalid ? Effect.fail(hubConfig) : Effect.succeed(hubConfig),
       hubSource: Effect.succeed("hub.url: OPENCODE_RECALL_HUB_URL; hub.token: /cfg/recall.json"),
       summaryModel: Effect.succeed(PluginConfig.DEFAULT_SUMMARY_MODEL),
     }),
@@ -80,4 +82,11 @@ test("an unreachable or unconfigured hub is reported as not having looked, and t
   expect(down).toContain("  upload queue: 2 sessions waiting\n")
   expect(down).toEndWith("\n\nhub\n  unknown: the hub could not be asked, so nothing here means the archive is empty.")
   expect(await run(Option.none())).toStartWith("host\n  hub: recall could not look: no hub is configured.")
+})
+
+test("a malformed config is reported as not having looked, and the host section still reads", async () => {
+  const output = await run(new PluginConfig.Invalid({ message: "recall.json: Unexpected token" }))
+  expect(output).toStartWith("host\n  hub: recall could not look: the recall config is invalid (recall.json: Unexpected token).")
+  expect(output).toContain("  upload queue: 2 sessions waiting\n")
+  expect(output).toEndWith("\n\nhub\n  unknown: the hub could not be asked, so nothing here means the archive is empty.")
 })

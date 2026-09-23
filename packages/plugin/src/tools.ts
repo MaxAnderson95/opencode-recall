@@ -20,7 +20,11 @@ export class CouldNotLook extends Schema.TaggedError<CouldNotLook>()("Tools.Coul
 
 /** Run `call` against the hub as configured right now. */
 export const withHub = Effect.fnUntraced(function* <A>(call: (client: Client) => Effect.Effect<A, HubError | TransportError>) {
-  const hub = yield* Effect.orDie((yield* PluginConfig.Service).hub)
+  const hub = yield* (yield* PluginConfig.Service).hub.pipe(
+    Effect.mapError(
+      (e) => new CouldNotLook({ message: `recall could not look: the recall config is invalid (${e.message}). This is not an empty result.` }),
+    ),
+  )
   if (Option.isNone(hub))
     return yield* new CouldNotLook({
       message:
