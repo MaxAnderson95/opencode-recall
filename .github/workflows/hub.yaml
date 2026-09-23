@@ -4,8 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
-  release:
-    types: [published]
+    tags: ["v*"]
 
 permissions:
   contents: read
@@ -75,19 +74,37 @@ jobs:
           path: opencode-recall-hub-linux-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
+      # OpenCode installs Git plugins with npm, which cannot resolve the workspace, so a release
+      # publishes the bundled package `packages/plugin/build.ts` produces to the `plugin` branch.
+      - name: Build the plugin package
+        if: matrix.arch == 'amd64'
+        env:
+          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.0.0' }}
+        run: |
+          bun=$(grep -oP '^FROM \K\S+(?= AS build)' Dockerfile)
+          docker run --rm --user "$(id -u):$(id -g)" --env HOME=/tmp --env VERSION --volume "$PWD:/src" --workdir /src "$bun" \
+            sh -c 'bun install --frozen-lockfile --filter @opencode-recall/plugin && bun packages/plugin/build.ts "${VERSION#v}" plugin-package/plugin-package'
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: matrix.arch == 'amd64'
+        with:
+          name: plugin-package
+          path: plugin-package
+          if-no-files-found: error
+
       - name: Save the image
-        if: github.event_name == 'release'
+        if: github.ref_type == 'tag'
         run: docker save opencode-recall-hub:ci | gzip > "image-${{ matrix.arch }}.tar.gz"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: github.event_name == 'release'
+        if: github.ref_type == 'tag'
         with:
           name: image-${{ matrix.arch }}
           path: image-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
   publish:
-    if: github.event_name == 'release'
+    if: github.ref_type == 'tag'
     needs: build
     runs-on: ubuntu-24.04
     permissions:
@@ -102,7 +119,7 @@ jobs:
       - name: Push the images the build tested
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/opencode-recall-hub"
           tag="${RELEASE_TAG//\//-}"
@@ -114,8 +131,22 @@ jobs:
           done
           docker buildx imagetools create --tag "$image:$tag" "$image:$tag-amd64" "$image:$tag-arm64"
 
-      - name: Attach the binaries to the release
+      - name: Publish the plugin branch
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        working-directory: artifacts/plugin-package
+        run: |
+          git init --quiet --initial-branch plugin
+          git add .
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --quiet --message "opencode-recall plugin $RELEASE_TAG"
+          git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" plugin
+
+      - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$RELEASE_TAG" artifacts/opencode-recall-hub-linux-*.tar.gz --repo "$GITHUB_REPOSITORY"
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$RELEASE_TAG" \
+            artifacts/opencode-recall-hub-linux-*.tar.gz

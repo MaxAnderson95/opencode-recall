@@ -45,7 +45,13 @@ When the configured model's files are missing, the hub downloads them from Huggi
 - snapshots are accepted and are lexically searchable at once; their chunks wait in the archive and are embedded once the model loads;
 - search answers lexically and names the semantic branch as unavailable, with the reason.
 
-Nothing needs restarting once the files are reachable; the next retry loads them. To use another model with the image, set `OPENCODE_RECALL_MODELS_DIR=/data/models` so its download lands on the volume, then reindex (README).
+Nothing needs restarting once the files are reachable; the next retry loads them. To use another model with the image, set `OPENCODE_RECALL_MODELS_DIR=/data/models` so its download lands on the volume, then reindex (below).
+
+## Changing the embedding recipe
+
+The recipe is `OPENCODE_RECALL_EMBEDDING_MODEL`, `_REVISION` (a Hugging Face commit), `_DTYPE`, `_DIMS`, and `_QUERY_PREFIX`, with `OPENCODE_RECALL_CHUNK_CHARS`, `OPENCODE_RECALL_CHUNK_OVERLAP`, and `OPENCODE_RECALL_TURN_CHARS`, or the `embedding` and `chunking` objects in the `OPENCODE_RECALL_CONFIG` file with those fields in camelCase.
+
+A changed recipe takes effect only through a reindex: stop `serve`, run `opencode-recall-hub reindex` against the same data directory, then start `serve`. With Compose, `docker compose stop` followed by `docker compose run --rm hub reindex`. `reindex` refuses to run while `serve` holds the data directory, and `serve` refuses while `reindex` does. It logs the chunk count and an estimated duration, embeds every held session into a new vector space, and activates it and drops the old vectors in one transaction. A reindex that fails or is killed leaves the old space active; the next `serve` or `reindex` reclaims its partial work. A `serve` whose configured recipe differs from the active space logs an error at startup and keeps serving the active space with that space's model.
 
 ## Backup
 
