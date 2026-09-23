@@ -53,4 +53,13 @@ export const migrations: readonly string[] = [
   ALTER TABLE sessions ADD COLUMN extractor_version INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE sessions ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';
   `,
+  `
+  CREATE TABLE tombstones (
+    session_id TEXT PRIMARY KEY,
+    source_id INTEGER NOT NULL REFERENCES sources(id),
+    revision INTEGER NOT NULL,
+    time_deleted INTEGER NOT NULL,
+    reason TEXT NOT NULL
+  );
+  `,
 ]

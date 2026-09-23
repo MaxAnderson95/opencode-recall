@@ -130,6 +130,68 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     }
   })
 
+  test("a tombstone deletes the session and rejects snapshots active at or before the deletion", () => {
+    const archive = open(path())
+    const laptop = sourceOf(archive)
+    archive.putSnapshot(session("ses_a", ["one", "two"]), laptop)
+    expect(archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 20 }, laptop)).toEqual({ removed: true })
+    expect(archive.status()).toEqual({ sessions: 0 })
+
+    expect(archive.putSnapshot(session("ses_a", ["one", "two"]), laptop)).toBe("tombstoned")
+    // The deletion time decides, not the revision.
+    expect(archive.putSnapshot(session("ses_a", ["one", "two", "x"], { revision: 99, lastActivity: 20 }), laptop)).toBe(
+      "tombstoned",
+    )
+    expect(archive.status()).toEqual({ sessions: 0 })
+  })
+
+  test("a snapshot active after the deletion is archived and clears the tombstone", () => {
+    const archive = open(path())
+    const laptop = sourceOf(archive)
+    archive.putSnapshot(session("ses_a", ["one", "two"], { revision: 9 }), laptop)
+    archive.putTombstone({ sessionId: "ses_a", revision: 10, timeDeleted: 20 }, laptop)
+    // A re-import restarts the counter below the tombstone's revision.
+    expect(archive.putSnapshot(session("ses_a", ["one"], { revision: 2, lastActivity: 30 }), laptop)).toBe("archived")
+    expect(archive.manifest().tombstones).toEqual([])
+    expect(archive.putSnapshot(session("ses_a", ["one"], { revision: 1, lastActivity: 15 }), laptop)).toBe("unchanged")
+  })
+
+  test("a tombstone for a session never archived is still recorded, and the later deletion wins", () => {
+    const archive = open(path())
+    const laptop = sourceOf(archive)
+    expect(archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 50 }, laptop)).toEqual({ removed: false })
+    archive.putTombstone({ sessionId: "ses_a", revision: 2, timeDeleted: 40 }, laptop)
+    expect(archive.manifest().tombstones).toEqual([{ sessionId: "ses_a", timeDeleted: 50 }])
+    expect(archive.putSnapshot(session("ses_a", ["one"], { lastActivity: 45 }), laptop)).toBe("tombstoned")
+  })
+
+  test("a retried deletion older than the held copy's activity leaves the re-import archived", () => {
+    const archive = open(path())
+    const laptop = sourceOf(archive)
+    archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 200 }, laptop)
+    expect(archive.putSnapshot(session("ses_a", ["one"], { lastActivity: 300 }), laptop)).toBe("archived")
+    expect(archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 200 }, laptop)).toEqual({ removed: false })
+    expect(archive.status()).toEqual({ sessions: 1 })
+    expect(archive.manifest().tombstones).toEqual([])
+    expect(archive.putTombstone({ sessionId: "ses_a", revision: 5, timeDeleted: 400 }, laptop)).toEqual({ removed: true })
+  })
+
+  test("the manifest spans every source and lists tombstones", () => {
+    const archive = open(path())
+    const [laptop, desktop] = [sourceOf(archive, "laptop"), sourceOf(archive, "desktop")]
+    archive.putSnapshot(session("ses_a", ["one"]), laptop)
+    archive.putSnapshot(session("ses_b", ["two", "three"], { extractorVersion: 2 }), desktop)
+    archive.putSnapshot(session("ses_c", ["gone"]), desktop)
+    archive.putTombstone({ sessionId: "ses_c", revision: 2, timeDeleted: 99 }, desktop)
+    expect(archive.manifest()).toEqual({
+      sessions: [
+        { sessionId: "ses_a", revision: 1, lastActivity: 11, contentHash: "one", extractorVersion: 1 },
+        { sessionId: "ses_b", revision: 2, lastActivity: 12, contentHash: "two|three", extractorVersion: 2 },
+      ],
+      tombstones: [{ sessionId: "ses_c", timeDeleted: 99 }],
+    })
+  })
+
   test("an issued token authenticates as its source and has the documented shape", () => {
     const archive = open(path())
     const token = archive.issueToken("laptop")

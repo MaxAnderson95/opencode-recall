@@ -19,6 +19,7 @@ const STATUS: Record<ErrorCode, number> = {
   unknown_verb: 404,
   stale_revision: 409,
   hash_divergence: 409,
+  tombstoned: 409,
   payload_too_large: 413,
   rate_limited: 429,
   request_timeout: 408,
@@ -112,6 +113,9 @@ export function createHandler({ archive, log, limits = DEFAULT_LIMITS }: { archi
         case "hash_divergence":
           log("warn", "snapshot rejected", { ...fields, reason: result })
           throw new Rejection(result, "the archive holds different content at this position")
+        case "tombstoned":
+          log("info", "snapshot rejected", { ...fields, reason: result })
+          throw new Rejection(result, "the session was deleted after this snapshot's last activity")
         case "rewound":
           log("warn", "snapshot accepted as a rewind", fields)
           break
@@ -120,6 +124,12 @@ export function createHandler({ archive, log, limits = DEFAULT_LIMITS }: { archi
       }
       return { outcome: result }
     },
+    tombstone: ({ protocolVersion: _, ...tombstone }, source) => {
+      const result = archive.putTombstone(tombstone, source.id)
+      log("info", "session tombstoned", { sessionId: tombstone.sessionId, source: source.name, ...result })
+      return result
+    },
+    manifest: () => archive.manifest(),
     status: () => archive.status(),
   }
 

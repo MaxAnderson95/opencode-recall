@@ -3,7 +3,7 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import { Plugin } from "@opencode/plugin"
 import { configFilePath, loadHubConfig } from "./config.ts"
-import { readPosition, readSnapshot } from "./source.ts"
+import { readPosition, readPositions, readSnapshot } from "./source.ts"
 import { createUploader } from "./uploader.ts"
 
 function sourceDbPath(env: Record<string, string | undefined>): string {
@@ -18,14 +18,23 @@ export default Plugin.define({
     const env = process.env
     const db = new Database(sourceDbPath(env), { readonly: true })
     const uploader = createUploader({
-      source: { position: (id) => readPosition(db, id), snapshot: (id) => readSnapshot(db, id) },
+      source: {
+        position: (id) => readPosition(db, id),
+        positions: () => readPositions(db),
+        snapshot: (id) => readSnapshot(db, id),
+      },
       storage: ctx.storage,
       loadConfig: () => loadHubConfig(env, configFilePath(env)),
     })
     const abort = new AbortController()
+    void uploader.reconcile()
 
     void (async () => {
       for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
+        // Sent at the start of every (re)connection; events may have been missed while it was down.
+        if (event.type === "server.connected") void uploader.reconcile()
+        if (event.type === "session.deleted")
+          uploader.delete(event.data.sessionID, { revision: event.durable.seq, timeDeleted: Math.ceil(event.created) })
         const changed =
           event.type === "session.execution.succeeded" ||
           event.type === "session.execution.failed" ||
