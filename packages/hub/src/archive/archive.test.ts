@@ -18,7 +18,7 @@ import { Effect, Exit, Option, Scope, type Types } from "effect"
 import { Embedder } from "../embedder.ts"
 import { fakeEmbedder } from "../fake-embedder.ts"
 import { DEFAULT_CHUNKING, type ChunkParams } from "./chunks.ts"
-import { Archive, SCHEMA_VERSION } from "./index.ts"
+import { Archive, SCHEMA_VERSION, SOURCE_COUNTS } from "./index.ts"
 import { SEGMENTED, migrations } from "./migrations.ts"
 
 /** The first schema version with vector spaces. */
@@ -604,7 +604,7 @@ describe.each(backends)("archive ($name)", ({ path }) => {
       const fake = fakeEmbedder()
       let gate = Promise.resolve()
       const archive = open(path(), {
-        model: fake.model,
+        ...fake,
         embed: (texts) => Effect.promise(() => gate).pipe(Effect.andThen(fake.embed(texts))),
       })
       const laptop = sourceOf(archive)
@@ -889,6 +889,18 @@ describe.each(backends)("archive ($name)", ({ path }) => {
       matchesConfigured: true,
     })
   })
+})
+
+test("per-source status finds each session's chunks through an index on session and set, never by scanning the set", () => {
+  const db = new Database(":memory:")
+  for (const sql of migrations) db.run(sql)
+  const plan = db.query(`EXPLAIN QUERY PLAN ${SOURCE_COUNTS}`).all({ $setId: 1, $spaceId: 1 }) as { detail: string }[]
+  db.close()
+  const chunkLookups = plan.map((row) => row.detail).filter((detail) => /\bc\b/.test(detail) && detail.includes("chunks"))
+  expect(chunkLookups).toEqual([
+    "SEARCH c USING COVERING INDEX chunks_session_set_idx (session_id=? AND chunk_set_id=?)",
+    "SEARCH c USING COVERING INDEX chunks_session_set_idx (session_id=? AND chunk_set_id=?)",
+  ])
 })
 
 describe("archive (file-backed only)", () => {

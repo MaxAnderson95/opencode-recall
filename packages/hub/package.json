@@ -6,7 +6,8 @@
     "opencode-recall-hub": "./src/main.ts"
   },
   "scripts": {
-    "serve": "bun src/main.ts serve"
+    "serve": "bun src/main.ts serve",
+    "build": "bun build.ts"
   },
   "dependencies": {
     "@huggingface/transformers": "4.3.0",

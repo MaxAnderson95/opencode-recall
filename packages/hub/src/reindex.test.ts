@@ -118,7 +118,7 @@ test("a reindex that stops midway leaves the old space serving, and the next sta
   const fake = fakeEmbedder()
   let calls = 0
   const failing: Embedder.Interface = {
-    model: fake.model,
+    ...fake,
     embed: (texts) => {
       fake.down = ++calls > 1
       return fake.embed(texts)

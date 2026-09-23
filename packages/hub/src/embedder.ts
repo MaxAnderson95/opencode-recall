@@ -1,6 +1,6 @@
 import type { SpaceRecipe } from "@opencode-recall/protocol"
 import type { FeatureExtractionPipeline } from "@huggingface/transformers"
-import { Context, Effect, Layer, Schema, Semaphore } from "effect"
+import { Context, Data, Effect, Layer, Schema, Semaphore } from "effect"
 import hub from "../package.json" with { type: "json" }
 
 /** The recipe fields a model decides; the archive adds the chunking fields. */
@@ -15,10 +15,21 @@ export class Failed extends Schema.TaggedError<Failed>()("Embedder.Failed", {
   cause: Schema.Defect(),
 }) {}
 
+/** Whether the model is in memory: not yet, yes, or its last load failed and why. */
+export type ModelState = Data.TaggedEnum<{
+  Loading: {}
+  Loaded: {}
+  Failed: { readonly message: string }
+}>
+export const ModelState = Data.taggedEnum<ModelState>()
+
 /** Turns text into vectors of the model's dimension. */
 export interface Interface {
   readonly model: EmbeddingModel
   readonly embed: (texts: readonly string[]) => Effect.Effect<Float32Array[], Failed>
+  /** Load the model now rather than on the first `embed`; nothing once it is loaded. */
+  readonly load: Effect.Effect<void, Failed>
+  readonly state: Effect.Effect<ModelState>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode-recall/hub/Embedder") {}
@@ -83,8 +94,8 @@ export const splitRows = (tensor: { readonly data: unknown; readonly dims: reado
 
 /**
  * The chosen model (by default `bge-small-en-v1.5`) on ONNX Runtime, in-process. The model loads
- * on first use, from `cacheDir` or downloaded into it, and a failed load is retried on the next
- * call. Calls run one at a time.
+ * on `load` or first use, from `cacheDir` or downloaded into it, and a failed load is retried on
+ * the next call. Calls run one at a time.
  */
 export const onnx = (cacheDir: string, choice: ModelChoice = BGE_SMALL) =>
   Layer.effect(
@@ -93,19 +104,27 @@ export const onnx = (cacheDir: string, choice: ModelChoice = BGE_SMALL) =>
       const model = modelOf(choice)
       const serial = yield* Semaphore.make(1)
       let loaded: FeatureExtractionPipeline | undefined
+      let state: ModelState = ModelState.Loading()
 
-      const load = Effect.tryPromise({
-        try: async () => {
-          // Imported here so nothing that never embeds loads the native runtime.
-          const { pipeline, env } = await import("@huggingface/transformers")
-          env.cacheDir = cacheDir
-          return pipeline("feature-extraction", model.model, { dtype: model.dtype, revision: model.revision })
-        },
-        catch: failed,
-      })
+      const pipeline = Effect.suspend(() =>
+        loaded
+          ? Effect.succeed(loaded)
+          : Effect.tryPromise({
+              try: async () => {
+                // Imported here so nothing that never embeds loads the native runtime.
+                const { pipeline, env } = await import("@huggingface/transformers")
+                env.cacheDir = cacheDir
+                return pipeline("feature-extraction", model.model, { dtype: model.dtype, revision: model.revision })
+              },
+              catch: failed,
+            }).pipe(
+              Effect.tap((pipe) => Effect.sync(() => ((loaded = pipe), (state = ModelState.Loaded())))),
+              Effect.tapError((e) => Effect.sync(() => (state = ModelState.Failed({ message: e.message })))),
+            ),
+      )
 
       const embed = Effect.fn("Embedder.embed")(function* (texts: readonly string[]) {
-        const pipe = (loaded ??= yield* load)
+        const pipe = yield* pipeline
         const vectors: Float32Array[] = []
         for (let i = 0; i < texts.length; i += BATCH) {
           const batch = texts.slice(i, i + BATCH)
@@ -120,7 +139,12 @@ export const onnx = (cacheDir: string, choice: ModelChoice = BGE_SMALL) =>
         return vectors
       }, serial.withPermit)
 
-      return Service.of({ model, embed })
+      return Service.of({
+        model,
+        embed,
+        load: pipeline.pipe(Effect.asVoid, serial.withPermit, Effect.withSpan("Embedder.load")),
+        state: Effect.sync(() => state),
+      })
     }),
   )
 

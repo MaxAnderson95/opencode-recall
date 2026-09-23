@@ -257,7 +257,7 @@ No `migrate` subcommand: the hub is single-node and single-writer, so `serve` ap
 
 Container specifics: `onnxruntime-node` requires glibc, so a debian-slim base rather than alpine, with separate amd64 and arm64 images. Budget roughly 1 GB of memory: about 280 MB for ONNX, 115 MB for the vector matrix, plus SQLite page cache and request buffers.
 
-Still to define before production use: restore from backup, recovery from a failed migration, behaviour when the model artifact is missing, and health and readiness endpoints.
+The image carries the pinned model outside the data volume, so it embeds without network access. `GET /healthz` is liveness; `GET /readyz` answers 503 until the model is loaded. A missing model artifact that cannot be downloaded leaves the hub serving ingest and lexical search, with readiness at 503 naming the reason and the load retried on the embedding backoff. Backup, restore, and recovery from a failed migration (which rolls back and leaves the archive at its old version) are in `docs/operations.md`.
 
 ## 8. Measurement
 

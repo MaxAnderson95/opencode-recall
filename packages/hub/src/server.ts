@@ -11,6 +11,7 @@ import {
 } from "@opencode-recall/protocol"
 import { Effect, Schema, Semaphore } from "effect"
 import { Archive, type Source } from "./archive/index.ts"
+import { Embedder } from "./embedder.ts"
 
 const STATUS: Record<ErrorCode, number> = {
   invalid_token: 401,
@@ -100,6 +101,11 @@ const messageOf = (e: unknown) => (e instanceof Error ? e.message : String(e))
  * and logger this was built with. Every request is authenticated before anything else is read,
  * and every body is schema-validated before any handler sees it. `onArchived` runs after each
  * snapshot the archive accepts.
+ *
+ * Two probes need no token. `GET /healthz` answers 200 whenever the process answers at all.
+ * `GET /readyz` answers 200 once the embedding model is loaded and 503 until then, naming the
+ * model's state and, if its load failed, why. Both carry the archive's schema version: the hub
+ * listens only after its migrations have committed, so any answer means they have.
  */
 export const makeHandler = Effect.fnUntraced(function* ({
   limits = DEFAULT_LIMITS,
@@ -109,7 +115,24 @@ export const makeHandler = Effect.fnUntraced(function* ({
   onArchived?: Effect.Effect<void>
 } = {}) {
   const archive = yield* Archive.Service
+  const embedder = yield* Embedder.Service
   const ingest = yield* Semaphore.make(limits.concurrentIngest)
+  const schemaVersion = archive.migration.to
+
+  const ready = Effect.map(embedder.state, (state) =>
+    Response.json(
+      {
+        ready: state._tag === "Loaded",
+        schemaVersion,
+        model: Embedder.ModelState.$match(state, {
+          Loading: () => ({ state: "loading" }),
+          Loaded: () => ({ state: "loaded" }),
+          Failed: ({ message }) => ({ state: "failed", error: message }),
+        }),
+      },
+      { status: state._tag === "Loaded" ? 200 : 503 },
+    ),
+  )
 
   const handlers: Handlers = {
     snapshot: Effect.fnUntraced(function* ({ protocolVersion: _, ...snapshot }, source) {
@@ -189,6 +212,8 @@ export const makeHandler = Effect.fnUntraced(function* ({
 
   const handle = Effect.fnUntraced(function* (req: Request) {
     const { pathname } = new URL(req.url)
+    if (req.method === "GET" && pathname === "/healthz") return Response.json({ ok: true, schemaVersion })
+    if (req.method === "GET" && pathname === "/readyz") return yield* ready
 
     const token = req.headers.get("authorization")?.match(/^Bearer (\S+)$/)?.[1]
     const source = token ? yield* archive.authenticate(token) : undefined

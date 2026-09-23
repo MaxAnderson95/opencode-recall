@@ -6,6 +6,7 @@ import { join } from "node:path"
 import { PROTOCOL_VERSION, makeClient, type ErrorBody, type ErrorCode } from "@opencode-recall/protocol"
 import { ConfigProvider, Effect, Layer, Logger, ManagedRuntime, Option } from "effect"
 import { Archive } from "../../hub/src/archive/index.ts"
+import type { Embedder } from "../../hub/src/embedder.ts"
 import { fakeLayer } from "../../hub/src/fake-embedder.ts"
 import { Log } from "../../hub/src/log.ts"
 import { DEFAULT_LIMITS, makeHandler, type Limits } from "../../hub/src/server.ts"
@@ -41,7 +42,7 @@ const failure = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(Effect.
 
 let dir: string
 let configFile: string
-let hubRuntime: ManagedRuntime.ManagedRuntime<Archive.Service, Archive.NewerSchema>
+let hubRuntime: ManagedRuntime.ManagedRuntime<Archive.Service | Embedder.Service, Archive.NewerSchema>
 let archive: Archive.Interface
 let hub: ReturnType<typeof Bun.serve>
 let source: SourceDb
@@ -70,7 +71,7 @@ beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "recall-uploader-"))
   configFile = join(dir, "recall.json")
   hubRuntime = ManagedRuntime.make(
-    Archive.layer(join(dir, "archive.db")).pipe(Layer.provide(fakeLayer()), Layer.provideMerge(Log.layer("error", () => {}))),
+    Archive.layer(join(dir, "archive.db")).pipe(Layer.provideMerge(fakeLayer()), Layer.provideMerge(Log.layer("error", () => {}))),
   )
   archive = await hubRuntime.runPromise(Archive.Service)
   intercept = (req, forward) => forward(req)

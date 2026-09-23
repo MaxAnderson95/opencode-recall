@@ -257,6 +257,16 @@ function migrate(db: Database): Effect.Effect<{ from: number; to: number }, Newe
   })
 }
 
+/** Sessions per source that are archived, searchable, and fully embedded in space `$spaceId`. */
+export const SOURCE_COUNTS = `SELECT coalesce(src.name, '') AS source, count(*) AS archived,
+       coalesce(sum(EXISTS (SELECT 1 FROM messages m JOIN parts p ON p.message_id = m.id JOIN segments seg ON seg.part_id = p.id
+         WHERE m.session_id = s.id)), 0) AS searchable,
+       coalesce(sum(EXISTS (SELECT 1 FROM chunks c WHERE c.session_id = s.id AND c.chunk_set_id = $setId)
+         AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.session_id = s.id AND c.chunk_set_id = $setId
+           AND NOT EXISTS (SELECT 1 FROM vectors v WHERE v.chunk_id = c.id AND v.space_id = $spaceId))), 0) AS embedded
+     FROM sessions s LEFT JOIN sources src ON src.id = s.source_id
+     GROUP BY s.source_id ORDER BY source`
+
 /** At most this many characters (UTF-16 code units) per FTS row. */
 const SEGMENT_CHARS = 8_000
 /** Candidates each branch ranks before fusion. */
@@ -681,16 +691,7 @@ function bind(
   const selectSegmentText = db.prepare("SELECT text FROM segment_text WHERE id = ?")
   const countSessions = db.prepare("SELECT count(*) AS n FROM sessions")
   const countSummaries = db.prepare("SELECT count(*) AS n FROM summaries")
-  const selectSourceCounts = db.prepare(
-    `SELECT coalesce(src.name, '') AS source, count(*) AS archived,
-       coalesce(sum(EXISTS (SELECT 1 FROM messages m JOIN parts p ON p.message_id = m.id JOIN segments seg ON seg.part_id = p.id
-         WHERE m.session_id = s.id)), 0) AS searchable,
-       coalesce(sum(EXISTS (SELECT 1 FROM chunks c WHERE c.session_id = s.id AND c.chunk_set_id = $setId)
-         AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.session_id = s.id AND c.chunk_set_id = $setId
-           AND NOT EXISTS (SELECT 1 FROM vectors v WHERE v.chunk_id = c.id AND v.space_id = $spaceId))), 0) AS embedded
-     FROM sessions s LEFT JOIN sources src ON src.id = s.source_id
-     GROUP BY s.source_id ORDER BY source`,
-  )
+  const selectSourceCounts = db.prepare(SOURCE_COUNTS)
   const upsertDivergence = db.prepare(
     `INSERT INTO divergences (session_id, source_id, content_hash, time_first, time_last)
      VALUES ($sessionId, $sourceId, $contentHash, $time, $time)

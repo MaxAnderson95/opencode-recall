@@ -1,0 +1,121 @@
+name: hub
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the image
+        run: docker build --tag opencode-recall-hub:ci .
+
+      - name: Serve against a mounted data directory
+        run: |
+          protocol=$(grep -oP 'PROTOCOL_VERSION = \K\d+' packages/protocol/src/index.ts)
+          mkdir data
+          docker run --detach --name hub --user "$(id -u):$(id -g)" --publish 127.0.0.1:7438:7438 \
+            --volume "$PWD/data:/data" opencode-recall-hub:ci
+          for _ in $(seq 60); do
+            curl --silent --fail http://127.0.0.1:7438/readyz && break
+            sleep 2
+          done
+          echo
+          curl --silent --show-error --fail http://127.0.0.1:7438/readyz
+          echo
+          token=$(docker exec hub opencode-recall-hub token issue ci)
+          curl --silent --show-error --fail --header "authorization: Bearer $token" \
+            --data "{\"protocolVersion\":$protocol,\"query\":\"container image\",\"limit\":5,\"mode\":\"semantic\"}" \
+            http://127.0.0.1:7438/v1/search | tee search.json
+          echo
+          jq --exit-status 'has("semanticUnavailable") | not' search.json
+          docker exec hub opencode-recall-hub status
+          docker stop hub
+          test "$(docker inspect hub --format '{{.State.ExitCode}}')" = 0
+          test -s data/archive.db
+
+      - name: Show the hub's log
+        if: always()
+        run: docker logs hub || true
+
+      - name: Package the binary
+        run: |
+          container=$(docker create opencode-recall-hub:ci)
+          mkdir release
+          docker cp "$container:/usr/local/bin/opencode-recall-hub" release/
+          docker cp "$container:/usr/local/lib/libonnxruntime.so.1" release/
+          docker rm "$container"
+          mkdir binary-data
+          OPENCODE_RECALL_DATA_DIR=binary-data LD_LIBRARY_PATH=release release/opencode-recall-hub token list
+          tar --create --gzip --file "opencode-recall-hub-linux-${{ matrix.arch }}.tar.gz" --directory release .
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binary-${{ matrix.arch }}
+          path: opencode-recall-hub-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+      - name: Save the image
+        if: github.event_name == 'release'
+        run: docker save opencode-recall-hub:ci | gzip > "image-${{ matrix.arch }}.tar.gz"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name == 'release'
+        with:
+          name: image-${{ matrix.arch }}
+          path: image-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Push the images the build tested
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/opencode-recall-hub"
+          tag="${RELEASE_TAG//\//-}"
+          echo "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          for arch in amd64 arm64; do
+            docker load --input "artifacts/image-$arch.tar.gz"
+            docker tag opencode-recall-hub:ci "$image:$tag-$arch"
+            docker push "$image:$tag-$arch"
+          done
+          docker buildx imagetools create --tag "$image:$tag" "$image:$tag-amd64" "$image:$tag-arm64"
+
+      - name: Attach the binaries to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" artifacts/opencode-recall-hub-linux-*.tar.gz --repo "$GITHUB_REPOSITORY"

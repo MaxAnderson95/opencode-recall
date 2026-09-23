@@ -166,6 +166,13 @@ export const migrations: readonly string[] = [
     time INTEGER NOT NULL
   );
   `,
+  // Without statistics SQLite answered "this session's chunks in this set" from chunks_set_idx,
+  // scanning every chunk of the set once per session: two minutes of status at 75,000 chunks.
+  // An index on both columns wins that choice and serves session-only lookups as its prefix.
+  `
+  CREATE INDEX chunks_session_set_idx ON chunks(session_id, chunk_set_id);
+  DROP INDEX chunks_session_idx;
+  `,
 ]
 
 /** The first schema version with segments; parts archived before it are segmented on migration. */
