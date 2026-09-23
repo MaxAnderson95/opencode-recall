@@ -81,8 +81,8 @@ test("the typed client tombstones a session, lists it in the manifest, and a sta
     sessions: [{ sessionId: "ses_a", revision: 3, lastActivity: 2, contentHash: "hash-1", extractorVersion: 1 }],
     tombstones: [],
   })
-  expect(await run(client.tombstone({ sessionId: "ses_a", revision: 4, timeDeleted: 5 }))).toEqual({ removed: true })
-  expect(await run(client.manifest())).toEqual({ sessions: [], tombstones: [{ sessionId: "ses_a", timeDeleted: 5 }] })
+  expect(await run(client.tombstone({ sessionId: "ses_a", revision: 4, timeDeleted: 5, reason: "deleted" }))).toEqual({ removed: true })
+  expect(await run(client.manifest())).toEqual({ sessions: [], tombstones: [{ sessionId: "ses_a", timeDeleted: 5, excludedByCaller: false }] })
   const error = await failure(client.snapshot(snapshot))
   expect(error).toMatchObject({ code: "tombstoned", status: 409 })
 })

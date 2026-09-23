@@ -65,6 +65,8 @@ async function summarize(
     hub: Effect.succeed(Option.some(hubConfig)),
     hubSource: Effect.succeed("test"),
     summaryModel: Effect.succeed(PluginConfig.DEFAULT_SUMMARY_MODEL),
+    file: "/cfg/recall.json",
+    excludeDirectories: Effect.succeed([]),
   })
   const tool = await Effect.runPromise(SummarizeTool.make(generate).pipe(Effect.provide(layer)))
   const { content } = await tool.execute(input, { ...context, signal })

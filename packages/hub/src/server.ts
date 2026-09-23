@@ -139,11 +139,11 @@ export const makeHandler = Effect.fnUntraced(function* ({
     tombstone: Effect.fnUntraced(function* ({ protocolVersion: _, ...tombstone }, source) {
       const result = yield* archive.putTombstone(tombstone, source.id)
       yield* Effect.logInfo("session tombstoned").pipe(
-        Effect.annotateLogs({ sessionId: tombstone.sessionId, source: source.name, ...result }),
+        Effect.annotateLogs({ sessionId: tombstone.sessionId, source: source.name, reason: tombstone.reason, ...result }),
       )
       return result
     }),
-    manifest: () => archive.manifest(),
+    manifest: (_, source) => archive.manifest(source.id),
     search: ({ protocolVersion: _, ...search }, source) => archive.search(search, source.id),
     inspect: ({ protocolVersion: _, ...inspect }, source) => archive.inspect(inspect, source.id),
     expand: ({ protocolVersion: _, ...expand }, source) => archive.expand(expand, source.id),

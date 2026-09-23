@@ -1,5 +1,5 @@
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { isAbsolute, join, relative, resolve as resolvePath, sep } from "node:path"
 import { Config, Context, Effect, Layer, Option, Schema } from "effect"
 
 export const Hub = Schema.Struct({ url: Schema.String, token: Schema.String })
@@ -23,6 +23,7 @@ export const DEFAULT_SUMMARY_MODEL: SummaryModel = { providerID: "openai", model
 const File = Schema.Struct({
   hub: Schema.optionalKey(Schema.Struct({ url: Schema.optionalKey(Schema.Unknown), token: Schema.optionalKey(Schema.Unknown) })),
   summary: Schema.optionalKey(Schema.Struct({ model: Schema.optionalKey(Schema.Unknown) })),
+  index: Schema.optionalKey(Schema.Struct({ excludeDirectories: Schema.optionalKey(Schema.Unknown) })),
 })
 
 /** `recall.json` could not be read, or its hub values or summary model are malformed. */
@@ -96,13 +97,57 @@ export const loadSummaryModel = Effect.fn("PluginConfig.loadSummaryModel")(funct
   return yield* Schema.decodeUnknownEffect(SummaryModel)(summary.model).pipe(Effect.mapError(invalid))
 })
 
+const expandRoot = (entry: string, home: string): string | undefined => {
+  const trimmed = entry.trim()
+  if (trimmed === "~") return home
+  if (trimmed.startsWith(`~${sep}`)) return resolvePath(home, trimmed.slice(2))
+  return isAbsolute(trimmed) ? resolvePath(trimmed) : undefined
+}
+
+/**
+ * Resolve `index.excludeDirectories` in the file at `path` to absolute roots, expanding a leading
+ * `~` to `home`. The file is the only source: every OpenCode process on the host reads it, so
+ * which process uploads a session cannot change whether it is excluded. An entry that is not an
+ * absolute or `~/` path fails the whole list rather than being skipped, since skipping it would
+ * upload what it was meant to keep on the host.
+ */
+export const loadExcludeDirectories = Effect.fn("PluginConfig.loadExcludeDirectories")(function* (
+  path: string,
+  home: string = homedir(),
+) {
+  const { index } = yield* readFile(path)
+  if (index?.excludeDirectories === undefined) return []
+  const entries = yield* Schema.decodeUnknownEffect(Schema.Array(Schema.String))(index.excludeDirectories).pipe(
+    Effect.mapError((e) => invalid(`index.excludeDirectories: ${e.message}`)),
+  )
+  const roots = new Set<string>()
+  for (const entry of entries) {
+    const root = expandRoot(entry, home)
+    if (root === undefined)
+      return yield* invalid(`index.excludeDirectories entry ${JSON.stringify(entry)} is not an absolute or ~/ path`)
+    roots.add(root)
+  }
+  return [...roots]
+})
+
+/** Whether `directory` is one of `roots` or inside one; a sibling sharing a prefix is not. */
+export const isExcluded = (roots: readonly string[], directory: string) =>
+  roots.some((root) => {
+    const inner = relative(root, resolvePath(directory))
+    return inner === "" || (inner !== ".." && !inner.startsWith(`..${sep}`) && !isAbsolute(inner))
+  })
+
 export interface Interface {
+  /** The host-wide config file, for `recall_status`. */
+  readonly file: string
   /** Read fresh on every run, so an edited file takes effect without restarting OpenCode. */
   readonly hub: Effect.Effect<Option.Option<Hub>, Invalid>
   /** Where the hub URL and token currently come from, for `recall_status`. Read fresh, as `hub` is. */
   readonly hubSource: Effect.Effect<string, Invalid>
   /** Read fresh on every run, as `hub` is. */
   readonly summaryModel: Effect.Effect<SummaryModel, Invalid>
+  /** The resolved `index.excludeDirectories` roots, read fresh on every run; see {@link loadExcludeDirectories}. */
+  readonly excludeDirectories: Effect.Effect<readonly string[], Invalid>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode-recall/plugin/PluginConfig") {}
@@ -110,7 +155,13 @@ export class Service extends Context.Service<Service, Interface>()("@opencode-re
 export const layer = (path: string) =>
   Layer.succeed(
     Service,
-    Service.of({ hub: load(path), hubSource: Effect.map(resolve(path), (r) => r.source), summaryModel: loadSummaryModel(path) }),
+    Service.of({
+      file: path,
+      hub: load(path),
+      hubSource: Effect.map(resolve(path), (r) => r.source),
+      summaryModel: loadSummaryModel(path),
+      excludeDirectories: loadExcludeDirectories(path),
+    }),
   )
 
 export * as PluginConfig from "./config.ts"

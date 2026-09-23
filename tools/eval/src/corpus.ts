@@ -40,7 +40,7 @@ const files = (dir: string) => ({
 const sha256 = (data: string | Uint8Array) => createHash("sha256").update(data).digest("hex")
 
 const fingerprint = (archive: Archive.Interface) =>
-  Effect.all({ manifest: archive.manifest(), status: archive.status() }).pipe(Effect.map((state) => sha256(JSON.stringify(state))))
+  Effect.all({ manifest: archive.manifest(0), status: archive.status() }).pipe(Effect.map((state) => sha256(JSON.stringify(state))))
 
 const under = (roots: string[], directory: string) =>
   roots.some((root) => directory === root || directory.startsWith(root.endsWith("/") ? root : `${root}/`))

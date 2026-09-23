@@ -32,8 +32,11 @@ export function sourceDb() {
 
   return {
     db,
-    addSession(id: string, { title = "Demo", time = 100 }: { title?: string; time?: number } = {}) {
-      db.run("INSERT INTO session_v2 VALUES (?, NULL, 'brave-otter', '/work/demo', ?, ?, ?)", [id, title, time, time])
+    addSession(
+      id: string,
+      { title = "Demo", time = 100, directory = "/work/demo" }: { title?: string; time?: number; directory?: string } = {},
+    ) {
+      db.run("INSERT INTO session_v2 VALUES (?, NULL, 'brave-otter', ?, ?, ?, ?)", [id, directory, title, time, time])
       advance(id)
     },
     addMessage(sessionId: string, type: string, data: object, time: number) {
@@ -50,6 +53,10 @@ export function sourceDb() {
     },
     rename(sessionId: string, title: string, time: number) {
       db.run("UPDATE session_v2 SET title = ?, time_updated = ? WHERE id = ?", [title, time, sessionId])
+      advance(sessionId)
+    },
+    move(sessionId: string, directory: string, time: number) {
+      db.run("UPDATE session_v2 SET directory = ?, time_updated = ? WHERE id = ?", [directory, time, sessionId])
       advance(sessionId)
     },
     /** Delete a session as OpenCode does, taking its event counter with it. */

@@ -32,7 +32,7 @@ const isMessageType = Schema.is(MessageType)
 // Summarizer workers are never uploaded, so they are invisible to everything that reads a session.
 const UPLOADED = `substr(coalesce(s.title, ''), 1, ${WORKER_PREFIX.length}) <> '${WORKER_PREFIX}'`
 
-const POSITIONS = `SELECT s.id AS sessionId,
+const POSITIONS = `SELECT s.id AS sessionId, s.directory,
     coalesce((SELECT seq FROM event_sequence WHERE aggregate_id = s.id), 0) AS revision,
     max(s.time_updated, coalesce((SELECT max(time_created) FROM session_message WHERE session_id = s.id), 0))
       AS lastActivity
@@ -40,14 +40,24 @@ const POSITIONS = `SELECT s.id AS sessionId,
 
 /** The session's current position, or `null` if the database does not hold it or it is never uploaded. */
 export function readPosition(db: Database, sessionId: string): Position | null {
-  const row = db.query(`${POSITIONS} AND s.id = ?`).get(sessionId) as ({ sessionId: string } & Position) | null
+  const row = db.query(`${POSITIONS} AND s.id = ?`).get(sessionId) as PositionRow | null
   return row && { revision: row.revision, lastActivity: row.lastActivity }
 }
 
-/** The current position of every session the database holds. */
-export function readPositions(db: Database): Map<string, Position> {
-  const rows = db.query(POSITIONS).all() as ({ sessionId: string } & Position)[]
-  return new Map(rows.map(({ sessionId, ...position }) => [sessionId, position]))
+type PositionRow = { sessionId: string; directory: string } & Position
+
+/** A session the database holds: where it stands, and the working directory it belongs to. */
+export interface Local {
+  readonly position: Position
+  readonly directory: string
+}
+
+/** Every session the database holds. */
+export function readPositions(db: Database): Map<string, Local> {
+  const rows = db.query(POSITIONS).all() as PositionRow[]
+  return new Map(
+    rows.map(({ sessionId, directory, revision, lastActivity }) => [sessionId, { position: { revision, lastActivity }, directory }]),
+  )
 }
 
 /**
@@ -111,7 +121,7 @@ export function readSession(db: Database, sessionId: string): Session | null {
 export interface Interface {
   readonly position: (sessionId: string) => Effect.Effect<Option.Option<Position>>
   /** Every session the database holds. */
-  readonly positions: () => Effect.Effect<Map<string, Position>>
+  readonly positions: () => Effect.Effect<Map<string, Local>>
   readonly snapshot: (sessionId: string) => Effect.Effect<Option.Option<Snapshot>>
   readonly compactionBoundary: (sessionId: string) => Effect.Effect<number>
 }

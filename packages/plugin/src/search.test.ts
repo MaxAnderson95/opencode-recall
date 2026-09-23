@@ -59,6 +59,8 @@ const tool = (hubConfig: Option.Option<PluginConfig.Hub> | PluginConfig.Invalid)
             hub: hubConfig instanceof PluginConfig.Invalid ? Effect.fail(hubConfig) : Effect.succeed(hubConfig),
             hubSource: Effect.succeed("test"),
             summaryModel: Effect.succeed(PluginConfig.DEFAULT_SUMMARY_MODEL),
+            file: "/cfg/recall.json",
+            excludeDirectories: Effect.succeed([]),
           }),
           Source.fromDatabase(laptop.db),
         ),

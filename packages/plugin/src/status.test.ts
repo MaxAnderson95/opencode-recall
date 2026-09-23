@@ -43,12 +43,15 @@ const state: Uploader.State = {
 
 async function run(
   hubConfig: Option.Option<PluginConfig.Hub> | PluginConfig.Invalid = Option.some(config),
+  excluded: readonly string[] | PluginConfig.Invalid = ["/work/private", "/Users/me/secret"],
 ): Promise<string> {
   const layer = Layer.mergeAll(
     Layer.succeed(PluginConfig.Service, {
       hub: hubConfig instanceof PluginConfig.Invalid ? Effect.fail(hubConfig) : Effect.succeed(hubConfig),
       hubSource: Effect.succeed("hub.url: OPENCODE_RECALL_HUB_URL; hub.token: /cfg/recall.json"),
       summaryModel: Effect.succeed(PluginConfig.DEFAULT_SUMMARY_MODEL),
+      file: "/cfg/recall.json",
+      excludeDirectories: excluded instanceof PluginConfig.Invalid ? Effect.fail(excluded) : Effect.succeed(excluded),
     }),
     Layer.succeed(Uploader.Service, {
       enqueue: () => Effect.void,
@@ -69,7 +72,7 @@ test("reports this host's uploads and the hub's archive in separate sections", a
   expect(output).toContain("  upload queue: 2 sessions waiting\n")
   expect(output).toContain("  backfill: 3 of 5 local sessions answered by the hub at their current position; reconciliation last completed 2026-09-20 10:00\n")
   expect(output).toContain("  last error: 2026-09-20 10:05 upload of ses_x failed, retrying: connection refused\n")
-  expect(output).toContain("  excluded directories: none;")
+  expect(output).toContain("  excluded directories (index.excludeDirectories in /cfg/recall.json): /work/private, /Users/me/secret\n")
   // The hub embeds in the background, so the session may or may not be embedded yet.
   expect(output).toMatch(/\n\nhub\n {2}sessions archived: 1\n {4}from desktop: 1 archived, 1 searchable, [01] embedded\n/)
   expect(output).toContain("  hash_divergence: none")
@@ -89,4 +92,12 @@ test("a malformed config is reported as not having looked, and the host section 
   expect(output).toStartWith("host\n  hub: recall could not look: the recall config is invalid (recall.json: Unexpected token).")
   expect(output).toContain("  upload queue: 2 sessions waiting\n")
   expect(output).toEndWith("\n\nhub\n  unknown: the hub could not be asked, so nothing here means the archive is empty.")
+})
+
+test("an empty exclusion list says none, and an unreadable one says uploads are held", async () => {
+  expect(await run(Option.some(config), [])).toContain("  excluded directories (index.excludeDirectories in /cfg/recall.json): none\n")
+  const invalid = new PluginConfig.Invalid({ message: 'index.excludeDirectories entry "private" is not an absolute or ~/ path' })
+  expect(await run(Option.some(config), invalid)).toContain(
+    '  excluded directories: unreadable, so uploads are held (index.excludeDirectories entry "private" is not an absolute or ~/ path)\n',
+  )
 })

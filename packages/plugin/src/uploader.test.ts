@@ -74,6 +74,7 @@ beforeEach(async () => {
   )
   archive = await hubRuntime.runPromise(Archive.Service)
   intercept = (req, forward) => forward(req)
+  laptopToken = undefined
   outcomes = []
   verbs = []
   await startHub()
@@ -90,10 +91,13 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
-const writeConfig = (hubConfig: { url?: string; token?: string }) =>
-  writeFileSync(configFile, JSON.stringify({ index: { excludeDirectories: [] }, hub: hubConfig }))
+const writeConfig = (hubConfig: { url?: string; token?: string }, excludeDirectories: unknown = []) =>
+  writeFileSync(configFile, JSON.stringify({ index: { excludeDirectories }, hub: hubConfig }))
 
-const configure = () => writeConfig({ url: hub.url.href, token: sync(archive.issueToken("laptop")) })
+/** Point the config at the hub as "laptop", excluding `excludeDirectories`; later calls keep the same token. */
+let laptopToken: string | undefined
+const configure = (excludeDirectories: unknown = []) =>
+  writeConfig({ url: hub.url.href, token: (laptopToken ??= sync(archive.issueToken("laptop"))) }, excludeDirectories)
 
 /** The config file alone decides the hub, whatever this process's environment holds. */
 const noEnvironment = ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} }))
@@ -149,7 +153,7 @@ const loadHubConfig = (env: Record<string, string>, path: string) =>
       Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env }))),
     ),
   )
-const manifest = () => sync(archive.manifest())
+const manifest = () => sync(archive.manifest(0))
 
 test("updating a session uploads a newer revision that replaces the archived copy", async () => {
   configure()
@@ -413,7 +417,7 @@ test("deleting a session tombstones it, and a later upload from before the delet
   source.remove("ses_a")
   await uploader.delete("ses_a", { revision: 3, timeDeleted: 200 })
   await until(() => status().sessions === 0 && pending() === 0)
-  expect(manifest().tombstones).toEqual([{ sessionId: "ses_a", timeDeleted: 200 }])
+  expect(manifest().tombstones).toEqual([{ sessionId: "ses_a", timeDeleted: 200, excludedByCaller: false }])
 
   const error = await failure(clientFor("desktop").snapshot(stale))
   expect(error).toMatchObject({ code: "tombstoned", status: 409 })
@@ -538,7 +542,7 @@ test("a rebuilt host with a new token uploads nothing for sessions the hub holds
 
 test("a session tombstoned on the hub but still present locally is not re-uploaded on every sweep", async () => {
   configure()
-  await Effect.runPromise(clientFor("desktop").tombstone({ sessionId: "ses_a", revision: 9, timeDeleted: 200 }))
+  await Effect.runPromise(clientFor("desktop").tombstone({ sessionId: "ses_a", revision: 9, timeDeleted: 200, reason: "deleted" }))
   const uploader = await start(memoryStorage().storage, { sweepIntervalMs: 10 })
   await uploader.reconcile()
   await uploader.reconcile()
@@ -597,4 +601,168 @@ test("sessions the hub holds that this host no longer reports stay in the archiv
   expect(status()).toMatchObject({ sessions: 2 })
   expect(manifest().tombstones).toEqual([])
   expect(verbs).not.toContain("tombstone")
+})
+
+test("adding a directory to excludeDirectories while running tombstones its sessions and their summaries", async () => {
+  configure()
+  source.addSession("ses_b", { time: 150, directory: "/work/other" })
+  const { storage, pending } = memoryStorage()
+  const uploader = await start(storage, { configPollMs: 10 })
+  await uploader.enqueue("ses_a")
+  await uploader.enqueue("ses_b")
+  await until(() => outcomes.length === 2)
+  const key = { provider: "p", model: "m", focus: "", recipe: 1 }
+  const contentHash = readSnapshot(source.db, "ses_a")!.contentHash
+  sync(archive.putSummary({ ...key, sessionId: "ses_a", contentHash, summary: "s", omitted: 0, clipped: 0 }))
+
+  configure(["/work/demo"])
+  await until(() => status().sessions === 1 && pending() === 0)
+  expect(status().summaries).toBe(0)
+  expect(manifest().sessions.map((s) => s.sessionId)).toEqual(["ses_b"])
+  expect(manifest().tombstones.map((t) => t.sessionId)).toEqual(["ses_a"])
+
+  // Later turns in the excluded session stay on this host.
+  source.addMessage("ses_a", "user", { text: "private" }, 400)
+  await uploader.enqueue("ses_a")
+  await until(() => pending() === 0)
+  await Bun.sleep(50)
+  expect(outcomes).toHaveLength(2)
+  expect(verbs.filter((v) => v === "tombstone")).toHaveLength(1)
+})
+
+test("removing a directory from excludeDirectories uploads its sessions again", async () => {
+  configure(["/work/demo"])
+  await Effect.runPromise(clientFor("desktop").snapshot(readSnapshot(source.db, "ses_a")!))
+  const uploader = await start(memoryStorage().storage, { configPollMs: 10 })
+  await uploader.reconcile()
+  await until(() => status().sessions === 0 && manifest().tombstones.length === 1)
+
+  configure([])
+  await until(() => status().sessions === 1)
+  expect(manifest().tombstones).toEqual([])
+  expect(archivedTexts()).toEqual(["first"])
+})
+
+test("moving a session into an excluded directory tombstones it", async () => {
+  configure(["/work/private"])
+  const uploader = await start()
+  await uploader.enqueue("ses_a")
+  await until(() => outcomes.length === 1)
+
+  source.move("ses_a", "/work/private/app", 300)
+  await uploader.enqueue("ses_a")
+  await until(() => status().sessions === 0 && manifest().tombstones.length === 1)
+  expect(outcomes).toHaveLength(1)
+})
+
+test("a queued upload of a session excluded before it is sent is dropped", async () => {
+  configure()
+  const { storage, pending } = memoryStorage()
+  const uploader = await start(storage, { quietMs: 100 })
+  await uploader.enqueue("ses_a")
+  configure(["/work"])
+
+  await until(() => pending() === 0)
+  await Bun.sleep(50)
+  expect(verbs).not.toContain("snapshot")
+  // The hub never held it, so there is nothing to tombstone.
+  expect(verbs).not.toContain("tombstone")
+})
+
+test("an upload that races a new exclusion is tombstoned once it lands", async () => {
+  configure()
+  intercept = async (req, forward) => {
+    // The exclusion is saved while this upload is in flight.
+    if (new URL(req.url).pathname === "/v1/snapshot") configure(["/work/demo"])
+    return forward(req)
+  }
+  await (await start()).enqueue("ses_a")
+  await until(() => outcomes.length === 1 && status().sessions === 0 && manifest().tombstones.length === 1)
+})
+
+test("two plugin instances on one host enforce the same exclusion list", async () => {
+  configure()
+  const { storage, pending } = memoryStorage()
+  const instances = [await start(storage, { configPollMs: 10 }), await start(storage, { configPollMs: 10 })]
+  for (const instance of instances) await instance.enqueue("ses_a")
+  await until(() => status().sessions === 1 && pending() === 0)
+
+  configure(["/work/demo"])
+  await until(() => status().sessions === 0 && pending() === 0)
+  const uploads = outcomes.length
+  source.addMessage("ses_a", "user", { text: "private" }, 400)
+  for (const instance of instances) await instance.enqueue("ses_a")
+  await until(() => pending() === 0)
+  await Bun.sleep(50)
+  expect(outcomes).toHaveLength(uploads)
+  expect(status().sessions).toBe(0)
+})
+
+test("excluded sessions are not re-uploaded by reconciliation or the sweep", async () => {
+  configure(["/work/demo"])
+  // Another host archived it before this host excluded it.
+  await Effect.runPromise(clientFor("desktop").snapshot(readSnapshot(source.db, "ses_a")!))
+  const uploader = await start(memoryStorage().storage, { sweepIntervalMs: 10 })
+  await uploader.reconcile()
+  await until(() => status().sessions === 0)
+  await uploader.reconcile()
+  await uploader.reconcile()
+  await Bun.sleep(60)
+  expect(outcomes).toEqual(["archived"])
+  expect(verbs.filter((v) => v === "tombstone")).toHaveLength(1)
+})
+
+test("an exclusion list that cannot be applied holds every upload until it is fixed", async () => {
+  configure(["work/relative"])
+  const uploader = await start()
+  await uploader.enqueue("ses_a")
+  await until(async () => (await uploader.pausedBy()) !== null)
+  expect(await uploader.pausedBy()).toContain("index.excludeDirectories")
+  expect(outcomes).toEqual([])
+
+  configure([])
+  await until(() => status().sessions === 1)
+})
+
+test("excludeDirectories resolves ~ and matches a directory and its descendants, not a sibling prefix", async () => {
+  writeFileSync(configFile, JSON.stringify({ index: { excludeDirectories: ["~/Projects/private/", "/srv/secret", "~"] } }))
+  const roots = await Effect.runPromise(PluginConfig.loadExcludeDirectories(configFile, "/Users/test"))
+  expect(roots).toEqual(["/Users/test/Projects/private", "/srv/secret", "/Users/test"])
+  const [privateRoot] = roots
+  expect(PluginConfig.isExcluded([privateRoot!], "/Users/test/Projects/private")).toBe(true)
+  expect(PluginConfig.isExcluded([privateRoot!], "/Users/test/Projects/private/subdir")).toBe(true)
+  expect(PluginConfig.isExcluded([privateRoot!], "/Users/test/Projects/private-old")).toBe(false)
+
+  expect(await Effect.runPromise(PluginConfig.loadExcludeDirectories(join(dir, "absent.json")))).toEqual([])
+  for (const bad of [["Projects/private"], [""], "~/private", [7]]) {
+    writeFileSync(configFile, JSON.stringify({ index: { excludeDirectories: bad } }))
+    expect(await failure(PluginConfig.loadExcludeDirectories(configFile, "/Users/test"))).toBeInstanceOf(PluginConfig.Invalid)
+  }
+})
+
+test("a session moved into an excluded directory without its event is tombstoned by the sweep", async () => {
+  configure(["/work/private"])
+  const uploader = await start(memoryStorage().storage, { sweepIntervalMs: 10 })
+  await uploader.reconcile()
+  await until(() => status().sessions === 1)
+
+  // No enqueue: the `session.moved` event was lost.
+  source.move("ses_a", "/work/private/app", 300)
+  await until(() => status().sessions === 0 && manifest().tombstones.length === 1)
+  await Bun.sleep(60)
+  expect(verbs.filter((v) => v === "tombstone")).toHaveLength(1)
+  expect(outcomes).toEqual(["archived"])
+})
+
+test("a work-list entry that no longer decodes is dropped instead of retried forever", async () => {
+  configure()
+  const { storage, entries } = memoryStorage()
+  // The shape an earlier build wrote, without a reason.
+  await storage.set("deleted/ses_a/200", { revision: 3, timeDeleted: 200 })
+  await storage.set("dirty/ses_b/1-1", { revision: "one" })
+  const uploader = await start(storage)
+  await until(() => entries.size === 0)
+  await Bun.sleep(50)
+  expect(verbs).toEqual([])
+  expect(Option.getOrThrow((await uploader.state()).lastError).message).toStartWith("dropped unreadable work-list entry")
 })
