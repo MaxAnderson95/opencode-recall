@@ -17,7 +17,8 @@ import type {
   SpaceRecipe,
   Tombstone,
 } from "@opencode-recall/protocol"
-import type { Embedder, EmbeddingModel } from "../embedder.ts"
+import { Context, Effect, Layer, Option, Schema, type Scope } from "effect"
+import { Embedder, type EmbeddingModel } from "../embedder.ts"
 import { RENDERING_VERSION, renderChunks, type ChunkSource } from "./chunks.ts"
 import { SEGMENTED, migrations } from "./migrations.ts"
 import { ftsQuery, fuse, makeSnippet, queryTokens, segments } from "./text.ts"
@@ -35,7 +36,19 @@ export type TokenInfo = { id: number; source: string; timeCreated: number }
 /** How `putSnapshot` resolved a snapshot against the copy the archive holds (§5 acceptance). */
 export type PutResult = "archived" | "rewound" | "unchanged" | "stale_revision" | "hash_divergence" | "tombstoned"
 
-export type Archive = {
+/** The archive was migrated by a newer binary; it was left untouched. */
+export class NewerSchema extends Schema.TaggedError<NewerSchema>()("Archive.NewerSchema", {
+  message: Schema.String,
+  found: Schema.Number,
+}) {}
+
+/** The embedder answered with the wrong number of vectors or the wrong dimensions; nothing was stored. */
+export class BadVectors extends Schema.TaggedError<BadVectors>()("Archive.BadVectors", { message: Schema.String }) {}
+
+/** The active space's vectors were made by another model than this hub's embedder runs. */
+class ModelMismatch extends Schema.TaggedError<ModelMismatch>()("Archive.ModelMismatch", { message: Schema.String }) {}
+
+export interface Interface {
   /** Schema versions before and after the migrations applied by this open. */
   readonly migration: { from: number; to: number }
   /**
@@ -46,7 +59,7 @@ export type Archive = {
    * A tombstoned session is `tombstoned` unless the snapshot's last activity is after the deletion
    * time; such a snapshot is archived and clears the tombstone.
    */
-  putSnapshot(snapshot: Snapshot, sourceId: number): PutResult
+  readonly putSnapshot: (snapshot: Snapshot, sourceId: number) => Effect.Effect<PutResult>
   /**
    * Delete the session and its transcript, and record a tombstone so no snapshot active at or
    * before the deletion time can bring it back. Of two tombstones for one session the later
@@ -54,9 +67,9 @@ export type Archive = {
    * no-op, so a retried old deletion cannot remove a later re-import. `removed` is whether a copy
    * was deleted.
    */
-  putTombstone(tombstone: Tombstone, sourceId: number): { removed: boolean }
+  readonly putTombstone: (tombstone: Tombstone, sourceId: number) => Effect.Effect<{ removed: boolean }>
   /** Every held session's position and hash, and every tombstone, across all sources. */
-  manifest(): Manifest
+  readonly manifest: () => Effect.Effect<Manifest>
   /**
    * Sessions across every source ranked by fusing a BM25 branch and a cosine branch over the
    * active space (or by one alone, per `mode`), each with its best hits. Every filter is applied
@@ -67,69 +80,79 @@ export type Archive = {
    * The query is embedded first, in the request. If that fails, or the embedder cannot produce
    * vectors for the active space, the lexical branch still runs and `semanticUnavailable` says why.
    */
-  search(search: Search, callerSourceId: number): Promise<Responses["search"]>
+  readonly search: (search: Search, callerSourceId: number) => Effect.Effect<Responses["search"]>
   /**
    * Embed up to `limit` chunks waiting in the active space's queue, oldest first, and return how
    * many were taken from it (0 once it is empty, or when the embedder does not match the active
-   * space). Rejects, embedding nothing, when the embedder fails; the chunks stay queued.
+   * space). Fails, embedding nothing, when the embedder fails; the chunks stay queued.
    */
-  embedPending(limit: number): Promise<number>
+  readonly embedPending: (limit: number) => Effect.Effect<number, Embedder.Failed | BadVectors>
   /**
    * Mint a token for the named source, creating the source if it is new.
    * The returned value is the only copy; the archive keeps just its hash.
    */
-  issueToken(source: string): string
-  listTokens(): TokenInfo[]
+  readonly issueToken: (source: string) => Effect.Effect<string>
+  readonly listTokens: () => Effect.Effect<TokenInfo[]>
   /** Delete the token so the next request presenting it fails. False if no such token. */
-  revokeToken(id: number): boolean
-  /** The source a presented token maps to, or `null`. Compares against every live token in constant time. */
-  authenticate(token: string): Source | null
-  status(): Responses["status"]
-  close(): void
+  readonly revokeToken: (id: number) => Effect.Effect<boolean>
+  /** The source a presented token maps to. Compares against every live token in constant time. */
+  readonly authenticate: (token: string) => Effect.Effect<Option.Option<Source>>
+  readonly status: () => Effect.Effect<Responses["status"]>
 }
+
+export class Service extends Context.Service<Service, Interface>()("@opencode-recall/hub/Archive") {}
 
 /**
- * Open (creating if needed) and migrate the archive at `path`, or `:memory:`.
- * Throws without touching the database when it was migrated by a newer binary.
+ * Open (creating if needed) and migrate the archive at `path`, or `:memory:`, closing it with the
+ * scope. Fails with {@link NewerSchema}, without touching the database, when it was migrated by a
+ * newer binary.
  *
- * An archive with no active vector space gets one built from `embedder`'s model and this binary's
- * chunking, and every held session is chunked into it. An existing active space is kept even when
- * it differs (see `status().activeSpace.matchesConfigured`); only a reindex replaces it.
+ * An archive with no active vector space gets one built from the embedder's model and this
+ * binary's chunking, and every held session is chunked into it. An existing active space is kept
+ * even when it differs (see `status().activeSpace.matchesConfigured`); only a reindex replaces it.
  */
-export function openArchive(path: string, embedder: Embedder): Archive {
-  const db = new Database(path, { create: true, strict: true })
-  try {
-    db.run("PRAGMA foreign_keys = ON")
-    // `token` subcommands write while `serve` holds the same file.
-    db.run("PRAGMA busy_timeout = 5000")
-    if (path !== ":memory:") db.run("PRAGMA journal_mode = WAL")
-    const migration = migrate(db)
-    return bind(db, migration, embedder)
-  } catch (e) {
-    db.close()
-    throw e
-  }
-}
+export const make = Effect.fn("Archive.make")(function* (
+  path: string,
+): Effect.fn.Return<Interface, NewerSchema, Embedder.Service | Scope.Scope> {
+  const embedder = yield* Embedder.Service
+  const db = yield* Effect.acquireRelease(
+    Effect.sync(() => new Database(path, { create: true, strict: true })),
+    (db) => Effect.sync(() => db.close()),
+  )
+  db.run("PRAGMA foreign_keys = ON")
+  // `token` subcommands write while `serve` holds the same file.
+  db.run("PRAGMA busy_timeout = 5000")
+  if (path !== ":memory:") db.run("PRAGMA journal_mode = WAL")
+  const migration = yield* migrate(db)
+  return bind(db, migration, embedder)
+})
 
-function migrate(db: Database): { from: number; to: number } {
-  return db
-    .transaction(() => {
-      const { user_version: from } = db.query("PRAGMA user_version").get() as { user_version: number }
-      if (from > SCHEMA_VERSION)
-        throw new Error(
-          `archive schema version ${from} is newer than this binary supports (${SCHEMA_VERSION}); refusing to start`,
-        )
-      for (const sql of migrations.slice(from)) db.run(sql)
-      if (from > 0 && from < SEGMENTED) {
-        const segment = segmenter(db)
-        const rows = db.query("SELECT id, text FROM parts WHERE searchable = 1").all() as { id: number; text: string }[]
-        for (const { id, text } of rows) segment(id, text)
-      }
-      // PRAGMA takes no bound parameters; SCHEMA_VERSION is a compile-time integer.
-      db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`)
-      return { from, to: SCHEMA_VERSION }
-    })
-    .immediate()
+/** The archive at `path` as the {@link Service}, closed when the layer is released. */
+export const layer = (path: string) => Layer.effect(Service, make(path))
+
+function migrate(db: Database): Effect.Effect<{ from: number; to: number }, NewerSchema> {
+  return Effect.suspend(() => {
+    const result = db
+      .transaction(() => {
+        const { user_version: from } = db.query("PRAGMA user_version").get() as { user_version: number }
+        if (from > SCHEMA_VERSION)
+          return new NewerSchema({
+            found: from,
+            message: `archive schema version ${from} is newer than this binary supports (${SCHEMA_VERSION}); refusing to start`,
+          })
+        for (const sql of migrations.slice(from)) db.run(sql)
+        if (from > 0 && from < SEGMENTED) {
+          const segment = segmenter(db)
+          const rows = db.query("SELECT id, text FROM parts WHERE searchable = 1").all() as { id: number; text: string }[]
+          for (const { id, text } of rows) segment(id, text)
+        }
+        // PRAGMA takes no bound parameters; SCHEMA_VERSION is a compile-time integer.
+        db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`)
+        return { from, to: SCHEMA_VERSION }
+      })
+      .immediate()
+    return result instanceof NewerSchema ? Effect.fail(result) : Effect.succeed(result)
+  })
 }
 
 /** At most this many characters (UTF-16 code units) per FTS row. */
@@ -243,7 +266,7 @@ type Space = { id: number; setId: number; recipe: SpaceRecipe }
 /** A vector already in the space, carried over to the new chunk with the same text. */
 type Reused = { row: VectorRow; vector: Float32Array }
 
-function bind(db: Database, migration: { from: number; to: number }, embedder: Embedder): Archive {
+function bind(db: Database, migration: { from: number; to: number }, embedder: Embedder.Interface): Interface {
   const segment = segmenter(db)
   const insertChunk = db.prepare(
     `INSERT INTO chunks (chunk_set_id, session_id, message_id, window_index, scope, time_created, hash, text)
@@ -289,7 +312,7 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
   /** A held session's chunking input, read back from its stored messages and text parts. */
   function readChunkSource(sessionId: string, parentId: string | null): ChunkSource {
     type Row = { id: string; type: Message["type"]; timeCreated: number; text: string | null }
-    const messages: ChunkSource["messages"] = []
+    const messages: (Omit<Row, "text"> & { parts: { kind: "text"; text: string }[] })[] = []
     for (const { text, ...message } of selectChunkSource.all(sessionId) as Row[]) {
       if (messages.at(-1)?.id !== message.id) messages.push({ ...message, parts: [] })
       if (text !== null) messages.at(-1)!.parts.push({ kind: "text", text })
@@ -359,28 +382,32 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
     }),
   )
 
-  async function embedPending(limit: number): Promise<number> {
+  const embedPending = Effect.fn("Archive.embedPending")(function* (limit: number) {
     if (!embedderFits) return 0
     type Pending = VectorRow & { text: string }
     const pending = (selectPending.all(space.setId, space.id, limit) as Pending[]).map(({ text, ...row }) => ({ row, text }))
     if (!pending.length) return 0
-    const embedded = await embedder.embed(pending.map((p) => p.text))
+    const embedded = yield* embedder.embed(pending.map((p) => p.text))
     if (embedded.length !== pending.length || embedded.some((v) => v.length !== space.recipe.dims))
-      throw new Error(`embedder returned ${embedded.length} vectors for ${pending.length} chunks, or the wrong dimensions`)
+      return yield* new BadVectors({
+        message: `embedder returned ${embedded.length} vectors for ${pending.length} chunks, or the wrong dimensions`,
+      })
     for (const { row, vector } of storeVectors.immediate(pending.map((p) => p.row), embedded)) matrix?.add(row, vector)
     return pending.length
-  }
+  })
 
-  async function embedQuery(query: string): Promise<Float32Array> {
+  const embedQuery = Effect.fnUntraced(function* (query: string) {
     if (!embedderFits)
-      throw new Error(
-        `the active vector space was embedded by ${space.recipe.model}@${space.recipe.revision}, ` +
+      return yield* new ModelMismatch({
+        message:
+          `the active vector space was embedded by ${space.recipe.model}@${space.recipe.revision}, ` +
           `but this hub embeds with ${embedder.model.model}@${embedder.model.revision}; run reindex`,
-      )
-    const [vector] = await embedder.embed([space.recipe.queryPrefix + query])
-    if (vector?.length !== space.recipe.dims) throw new Error("embedder returned no vector of the space's dimensions")
+      })
+    const [vector] = yield* embedder.embed([space.recipe.queryPrefix + query])
+    if (vector?.length !== space.recipe.dims)
+      return yield* new BadVectors({ message: "embedder returned no vector of the space's dimensions" })
     return vector
-  }
+  })
 
   /** The cosine branch. Every filter is applied before the candidate cut, as the lexical branch does. */
   function semantic(query: Float32Array, f: Search): Candidate[] {
@@ -475,23 +502,23 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
     "SELECT tokens.hash, sources.id, sources.name FROM tokens JOIN sources ON sources.id = tokens.source_id",
   )
 
-  const issueToken = db.transaction((source: string) => {
+  const issueTokenTx = db.transaction((source: string) => {
     const { id } = upsertSource.get(source, Date.now()) as { id: number }
     const token = TOKEN_PREFIX + randomBytes(32).toString("base64url")
     insertToken.run(id, hashToken(token), Date.now())
     return token
   })
 
-  function authenticate(token: string): Source | null {
+  function authenticate(token: string): Option.Option<Source> {
     const presented = hashToken(token)
     const rows = selectTokenHashes.all() as { hash: Uint8Array; id: number; name: string }[]
-    let match: Source | null = null
+    let match: Option.Option<Source> = Option.none()
     // No early exit, so response time does not depend on which row matched.
-    for (const row of rows) if (timingSafeEqual(row.hash, presented)) match = { id: row.id, name: row.name }
+    for (const row of rows) if (timingSafeEqual(row.hash, presented)) match = Option.some({ id: row.id, name: row.name })
     return match
   }
 
-  const putSnapshot = db.transaction((snapshot: Snapshot, sourceId: number): { result: PutResult; reused: Reused[] } => {
+  const putSnapshotTx = db.transaction((snapshot: Snapshot, sourceId: number): { result: PutResult; reused: Reused[] } => {
     const { session } = snapshot
     const tombstone = selectTombstone.get(session.id) as Pick<Tombstone, "timeDeleted"> | null
     // Revisions are not compared: a delete-then-reimport restarts the counter below the tombstone's.
@@ -551,7 +578,7 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
     return { result, reused: writeChunks(space, session.id, session, prior) }
   })
 
-  const putTombstone = db.transaction((tombstone: Tombstone, sourceId: number) => {
+  const putTombstoneTx = db.transaction((tombstone: Tombstone, sourceId: number) => {
     // A copy active after the deletion already superseded it, as it would have cleared the tombstone.
     const held = selectHeld.get(tombstone.sessionId) as Held | null
     if (held && held.lastActivity > tombstone.timeDeleted) return { removed: false }
@@ -599,55 +626,71 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
     })
   })
 
-  async function search(f: Search, callerSourceId: number): Promise<Responses["search"]> {
+  const search = Effect.fn("Archive.search")(function* (f: Search, callerSourceId: number) {
     if (!f.query.trim()) return { sessions: [] }
     const mode = f.mode ?? "hybrid"
-    let query: Float32Array | undefined
-    let semanticUnavailable: string | undefined
-    if (mode !== "lexical")
-      try {
-        query = await embedQuery(f.query)
-      } catch (e) {
-        semanticUnavailable = e instanceof Error ? e.message : String(e)
-      }
+    const embedded = mode === "lexical" ? undefined : yield* Effect.result(embedQuery(f.query))
+    const query = embedded?._tag === "Success" ? embedded.success : undefined
     const sessions = rank(f, mode !== "semantic", query, callerSourceId)
-    return semanticUnavailable === undefined ? { sessions } : { sessions, semanticUnavailable }
-  }
+    return embedded?._tag === "Failure" ? { sessions, semanticUnavailable: embedded.failure.message } : { sessions }
+  })
 
-  return {
-    migration,
+  const putSnapshot = Effect.fn("Archive.putSnapshot")(function* (snapshot: Snapshot, sourceId: number) {
     // Immediate: the read-then-write must not race a `token` subcommand writing the same file.
-    putSnapshot: (snapshot, sourceId) => {
-      const { result, reused } = putSnapshot.immediate(snapshot, sourceId)
-      if (matrix && (result === "archived" || result === "rewound")) {
-        matrix.removeSession(snapshot.session.id)
-        for (const { row, vector } of reused) matrix.add(row, vector)
-      }
-      return result
-    },
-    putTombstone: (tombstone, sourceId) => {
-      const result = putTombstone.immediate(tombstone, sourceId)
-      if (result.removed) matrix?.removeSession(tombstone.sessionId)
-      return result
-    },
-    manifest: db.transaction(() => ({
+    const { result, reused } = putSnapshotTx.immediate(snapshot, sourceId)
+    if (matrix && (result === "archived" || result === "rewound")) {
+      matrix.removeSession(snapshot.session.id)
+      for (const { row, vector } of reused) matrix.add(row, vector)
+    }
+    return result
+  })
+
+  const putTombstone = Effect.fn("Archive.putTombstone")(function* (tombstone: Tombstone, sourceId: number) {
+    const result = putTombstoneTx.immediate(tombstone, sourceId)
+    if (result.removed) matrix?.removeSession(tombstone.sessionId)
+    return result
+  })
+
+  const manifestTx = db.transaction(
+    (): Manifest => ({
       sessions: selectManifestSessions.all() as Manifest["sessions"],
       tombstones: selectManifestTombstones.all() as Manifest["tombstones"],
-    })),
-    search,
-    embedPending,
-    issueToken: (source) => issueToken(source),
-    listTokens: () => selectTokens.all() as TokenInfo[],
-    revokeToken: (id) => deleteToken.run(id).changes > 0,
-    authenticate,
-    status: db.transaction(() => ({
+    }),
+  )
+  const statusTx = db.transaction(
+    (): Responses["status"] => ({
       sessions: (countSessions.get() as { n: number }).n,
       chunks: (countChunks.get(space.setId) as { n: number }).n,
       embeddedChunks: (countVectors.get(space.id) as { n: number }).n,
       activeSpace: { recipe: space.recipe, matchesConfigured },
-    })),
-    close: () => db.close(),
-  }
+    }),
+  )
+
+  return Service.of({
+    migration,
+    putSnapshot,
+    putTombstone,
+    manifest: Effect.fn("Archive.manifest")(function* () {
+      return manifestTx()
+    }),
+    search,
+    embedPending,
+    issueToken: Effect.fn("Archive.issueToken")(function* (source: string) {
+      return issueTokenTx(source)
+    }),
+    listTokens: Effect.fn("Archive.listTokens")(function* () {
+      return selectTokens.all() as TokenInfo[]
+    }),
+    revokeToken: Effect.fn("Archive.revokeToken")(function* (id: number) {
+      return deleteToken.run(id).changes > 0
+    }),
+    authenticate: Effect.fn("Archive.authenticate")(function* (token: string) {
+      return authenticate(token)
+    }),
+    status: Effect.fn("Archive.status")(function* () {
+      return statusTx()
+    }),
+  })
 }
 
 type Held = Pick<Snapshot, "revision" | "lastActivity" | "extractorVersion" | "contentHash">
@@ -666,3 +709,5 @@ function resolve(incoming: Snapshot, held: Held): PutResult {
 }
 
 const hashToken = (token: string): Buffer => createHash("sha256").update(token).digest()
+
+export * as Archive from "./index.ts"

@@ -2,16 +2,18 @@
  * Everything that knows the shape of OpenCode's own database. It is opened
  * read-only and never written.
  */
-import type { Database } from "bun:sqlite"
+import { Database } from "bun:sqlite"
 import { createHash } from "node:crypto"
-import { Message, type Session, type Snapshot } from "@opencode-recall/protocol"
+import { MessageType, type Message, type Session, type Snapshot } from "@opencode-recall/protocol"
+import { Context, Effect, Layer, Option, Schema } from "effect"
 import { WORKER_PREFIX, extractParts } from "./extract.ts"
 
 /** Bump whenever extraction output changes for unchanged input, so the hub accepts re-extracted history. */
 export const EXTRACTOR_VERSION = 2
 
 /** Where a session stands in the §5 order: last activity first, then revision. */
-export type Position = Pick<Snapshot, "lastActivity" | "revision">
+export const Position = Schema.Struct({ lastActivity: Schema.Int, revision: Schema.Int })
+export interface Position extends Schema.Schema.Type<typeof Position> {}
 
 type SessionRow = {
   id: string
@@ -24,6 +26,8 @@ type SessionRow = {
 }
 
 type MessageRow = { id: string; type: string; time_created: number; data: string }
+
+const isMessageType = Schema.is(MessageType)
 
 // Summarizer workers are never uploaded, so they are invisible to everything that reads a session.
 const UPLOADED = `substr(coalesce(s.title, ''), 1, ${WORKER_PREFIX.length}) <> '${WORKER_PREFIX}'`
@@ -86,9 +90,9 @@ export function readSession(db: Database, sessionId: string): Session | null {
     .all(sessionId) as MessageRow[]
 
   const messages = rows.flatMap((m): Message[] => {
-    const type = Message.shape.type.safeParse(m.type)
-    if (!type.success) return []
-    return [{ id: m.id, type: type.data, timeCreated: m.time_created, parts: extractParts(type.data, JSON.parse(m.data)) }]
+    const type = m.type
+    if (!isMessageType(type)) return []
+    return [{ id: m.id, type, timeCreated: m.time_created, parts: extractParts(type, JSON.parse(m.data)) }]
   })
 
   return {
@@ -102,3 +106,37 @@ export function readSession(db: Database, sessionId: string): Session | null {
     messages,
   }
 }
+
+/** The host's OpenCode database, as the uploader and the search tool read it. */
+export interface Interface {
+  readonly position: (sessionId: string) => Effect.Effect<Option.Option<Position>>
+  /** Every session the database holds. */
+  readonly positions: () => Effect.Effect<Map<string, Position>>
+  readonly snapshot: (sessionId: string) => Effect.Effect<Option.Option<Snapshot>>
+  readonly compactionBoundary: (sessionId: string) => Effect.Effect<number>
+}
+
+export class Service extends Context.Service<Service, Interface>()("@opencode-recall/plugin/Source") {}
+
+/** Read `db`, which the caller owns and closes. */
+export const fromDatabase = (db: Database) =>
+  Layer.succeed(
+    Service,
+    Service.of({
+      position: (sessionId) => Effect.sync(() => Option.fromNullishOr(readPosition(db, sessionId))),
+      positions: () => Effect.sync(() => readPositions(db)),
+      snapshot: (sessionId) => Effect.sync(() => Option.fromNullishOr(readSnapshot(db, sessionId))),
+      compactionBoundary: (sessionId) => Effect.sync(() => compactionBoundary(db, sessionId)),
+    }),
+  )
+
+/** Open the database at `path` read-only for the layer's lifetime. */
+export const layer = (path: string) =>
+  Layer.unwrap(
+    Effect.acquireRelease(
+      Effect.sync(() => new Database(path, { readonly: true })),
+      (db) => Effect.sync(() => db.close()),
+    ).pipe(Effect.map(fromDatabase)),
+  )
+
+export * as Source from "./source.ts"

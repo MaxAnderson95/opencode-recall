@@ -1,22 +1,41 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
-import { HubError, PROTOCOL_VERSION, createClient, type Snapshot } from "@opencode-recall/protocol"
-import { openArchive, type Archive } from "./archive/index.ts"
-import { fakeEmbedder } from "./fake-embedder.ts"
-import { createLog } from "./log.ts"
-import { createHandler, type Limits } from "./server.ts"
+import { HubError, PROTOCOL_VERSION, makeClient, type Snapshot } from "@opencode-recall/protocol"
+import { Effect, Exit, Layer, Scope } from "effect"
+import { Archive } from "./archive/index.ts"
+import { fakeEmbedder, fakeLayer } from "./fake-embedder.ts"
+import { Log } from "./log.ts"
+import { makeHandler, type Limits } from "./server.ts"
 
-let archive: Archive
-let handler: ReturnType<typeof createHandler>
+let scope: Scope.Closeable
+let archive: Archive.Interface
+let handler: (req: Request) => Promise<Response>
 let token: string
 let logLines: string[]
 
-beforeEach(() => {
-  archive = openArchive(":memory:", fakeEmbedder())
-  token = archive.issueToken("laptop")
+const sync = Effect.runSync
+const run = Effect.runPromise
+/** The typed failure of `effect`, which must fail. */
+const failure = <A, E>(effect: Effect.Effect<A, E>) => run(Effect.flip(effect))
+
+/** A fresh archive with `embedder`, open until the test ends. */
+const openArchive = (embedder = fakeEmbedder()) =>
+  sync(Archive.make(":memory:").pipe(Effect.provide(fakeLayer(embedder)), Scope.provide(scope)))
+
+/** A handler over `on`, logging to `logLines` at debug, or nowhere. */
+const handlerFor = (
+  on: Archive.Interface,
+  options: Parameters<typeof makeHandler>[0] = {},
+  log: Layer.Layer<never> = Log.layer("error", () => {}),
+) => run(makeHandler(options).pipe(Effect.provideService(Archive.Service, on), Effect.provide(log)))
+
+beforeEach(async () => {
+  scope = sync(Scope.make())
+  archive = openArchive()
+  token = sync(archive.issueToken("laptop"))
   logLines = []
-  handler = createHandler({ archive, log: createLog("debug", (line) => logLines.push(line)) })
+  handler = await handlerFor(archive, {}, Log.layer("debug", (line) => logLines.push(line)))
 })
-afterEach(() => archive.close())
+afterEach(() => sync(Scope.close(scope, Exit.void)))
 
 const post = (verb: string, body: unknown, bearer: string | null = token) =>
   handler(
@@ -46,38 +65,38 @@ const snapshot: Snapshot = {
 const { session } = snapshot
 
 const clientFor = (h: typeof handler) =>
-  createClient({ url: "http://hub/", token, fetch: async (input, init) => h(new Request(input, init)) })
+  makeClient({ url: "http://hub/", token, fetch: async (input, init) => h(new Request(input, init)) })
 
 test("the typed client archives a snapshot and status counts it", async () => {
   const client = clientFor(handler)
-  expect(await client.snapshot(snapshot)).toEqual({ outcome: "archived" })
-  expect(await client.snapshot(snapshot)).toEqual({ outcome: "unchanged" })
-  expect(await client.status()).toMatchObject({ sessions: 1 })
+  expect(await run(client.snapshot(snapshot))).toEqual({ outcome: "archived" })
+  expect(await run(client.snapshot(snapshot))).toEqual({ outcome: "unchanged" })
+  expect(await run(client.status())).toMatchObject({ sessions: 1 })
 })
 
 test("the typed client tombstones a session, lists it in the manifest, and a stale upload is tombstoned", async () => {
   const client = clientFor(handler)
-  await client.snapshot(snapshot)
-  expect(await client.manifest()).toEqual({
+  await run(client.snapshot(snapshot))
+  expect(await run(client.manifest())).toEqual({
     sessions: [{ sessionId: "ses_a", revision: 3, lastActivity: 2, contentHash: "hash-1", extractorVersion: 1 }],
     tombstones: [],
   })
-  expect(await client.tombstone({ sessionId: "ses_a", revision: 4, timeDeleted: 5 })).toEqual({ removed: true })
-  expect(await client.manifest()).toEqual({ sessions: [], tombstones: [{ sessionId: "ses_a", timeDeleted: 5 }] })
-  const error = await client.snapshot(snapshot).catch((e: unknown) => e)
+  expect(await run(client.tombstone({ sessionId: "ses_a", revision: 4, timeDeleted: 5 }))).toEqual({ removed: true })
+  expect(await run(client.manifest())).toEqual({ sessions: [], tombstones: [{ sessionId: "ses_a", timeDeleted: 5 }] })
+  const error = await failure(client.snapshot(snapshot))
   expect(error).toMatchObject({ code: "tombstoned", status: 409 })
 })
 
 test("search finds another host's session through the caller's own token and names its origin", async () => {
   // The desktop uploads once and goes away; only the archive's copy remains.
-  const desktop = createClient({
+  const desktop = makeClient({
     url: "http://hub",
-    token: archive.issueToken("desktop"),
+    token: sync(archive.issueToken("desktop")),
     fetch: async (input, init) => handler(new Request(input, init)),
   })
-  await desktop.snapshot(snapshot)
+  await run(desktop.snapshot(snapshot))
 
-  const { sessions } = await clientFor(handler).search({ query: "hello", limit: 8 })
+  const { sessions } = await run(clientFor(handler).search({ query: "hello", limit: 8 }))
   expect(sessions).toMatchObject([{ sessionId: "ses_a", source: "desktop", ownSource: false, revision: 3 }])
   expect(sessions[0]!.hits[0]!.snippet).toBe("«hello»")
 })
@@ -85,34 +104,33 @@ test("search finds another host's session through the caller's own token and nam
 test("hybrid search over the API names an unavailable semantic branch, and status reports the active space", async () => {
   const embedder = fakeEmbedder()
   embedder.down = true
-  const down = openArchive(":memory:", embedder)
-  const h = createHandler({ archive: down, log: createLog("error", () => {}) })
-  const client = createClient({
+  const down = openArchive(embedder)
+  const h = await handlerFor(down)
+  const client = makeClient({
     url: "http://hub",
-    token: down.issueToken("laptop"),
+    token: sync(down.issueToken("laptop")),
     fetch: async (input, init) => h(new Request(input, init)),
   })
-  await client.snapshot(snapshot)
+  await run(client.snapshot(snapshot))
 
-  const result = await client.search({ query: "hello", limit: 8 })
+  const result = await run(client.search({ query: "hello", limit: 8 }))
   expect(result.semanticUnavailable).toBe("embedding model unavailable")
   expect(result.sessions.map((s) => s.sessionId)).toEqual(["ses_a"])
-  expect(await client.status()).toEqual({
+  expect(await run(client.status())).toEqual({
     sessions: 1,
     chunks: 2,
     embeddedChunks: 0,
     activeSpace: { recipe: expect.objectContaining({ model: "fake/bag-of-words", chunkChars: 1200 }), matchesConfigured: true },
   })
-  down.close()
 })
 
 test("each snapshot the archive accepts is announced, and a no-op is not", async () => {
   let archived = 0
-  const h = createHandler({ archive, log: createLog("error", () => {}), onArchived: () => archived++ })
+  const h = await handlerFor(archive, { onArchived: Effect.sync(() => archived++) })
   const client = clientFor(h)
-  await client.snapshot(snapshot)
-  await client.snapshot(snapshot)
-  await client.snapshot({ ...snapshot, revision: 4, lastActivity: 3, contentHash: "hash-2" })
+  await run(client.snapshot(snapshot))
+  await run(client.snapshot(snapshot))
+  await run(client.snapshot({ ...snapshot, revision: 4, lastActivity: 3, contentHash: "hash-2" }))
   expect(archived).toBe(2)
 })
 
@@ -124,7 +142,7 @@ test("a search with an unknown filter is rejected rather than silently widened",
 
 test("the client sends gzip-encoded bodies with Content-Encoding set", async () => {
   let seen: Request | undefined
-  const client = createClient({
+  const client = makeClient({
     url: "http://hub",
     token,
     fetch: async (input, init) => {
@@ -132,7 +150,7 @@ test("the client sends gzip-encoded bodies with Content-Encoding set", async () 
       return handler(seen.clone())
     },
   })
-  await client.snapshot(snapshot)
+  await run(client.snapshot(snapshot))
   expect(seen!.headers.get("content-encoding")).toBe("gzip")
   const body = new Uint8Array(await seen!.arrayBuffer())
   expect(JSON.parse(new TextDecoder().decode(Bun.gunzipSync(body)))).toMatchObject({ contentHash: "hash-1" })
@@ -143,13 +161,13 @@ test.each([
   ["an equal position with different content", { contentHash: "hash-2" }, "hash_divergence"],
 ] as const)("a snapshot at %s is rejected as %s", async (_, fields, code) => {
   const client = clientFor(handler)
-  await client.snapshot(snapshot)
-  const error = await client.snapshot({ ...snapshot, ...fields }).catch((e: unknown) => e)
+  await run(client.snapshot(snapshot))
+  const error = await failure(client.snapshot({ ...snapshot, ...fields }))
   expect(error).toMatchObject({ code, status: 409 })
 })
 
 const small: Limits = { compressedBytes: 1_000, decompressedBytes: 4_000, concurrentIngest: 1 }
-const limitedHandler = (limits: Limits = small) => createHandler({ archive, log: () => {}, limits })
+const limitedHandler = (limits: Limits = small) => handlerFor(archive, { limits })
 const withText = (text: string): Snapshot => ({
   ...snapshot,
   session: { ...session, messages: [{ ...session.messages[0]!, parts: [{ kind: "text", text }] }] },
@@ -159,13 +177,13 @@ test.each([
   ["too large once decoded, though small on the wire", withText("a".repeat(10_000))],
   ["too large on the wire", withText(crypto.getRandomValues(new Uint8Array(2_000)).toBase64())],
 ])("a body %s is rejected as payload_too_large and nothing is archived", async (_, big) => {
-  const error = await clientFor(limitedHandler()).snapshot(big).catch((e: unknown) => e)
+  const error = await failure(clientFor(await limitedHandler()).snapshot(big))
   expect(error).toMatchObject({ code: "payload_too_large", status: 413 })
-  expect(archive.status()).toMatchObject({ sessions: 0 })
+  expect(sync(archive.status())).toMatchObject({ sessions: 0 })
 })
 
 test("a declared Content-Length over the wire cap is rejected before the body is read", async () => {
-  const res = await limitedHandler()(
+  const res = await (await limitedHandler())(
     new Request("http://hub/v1/snapshot", {
       method: "POST",
       headers: { authorization: `Bearer ${token}`, "content-length": String(small.compressedBytes + 1) },
@@ -189,7 +207,7 @@ test("an unsupported Content-Encoding or a corrupt gzip body is an invalid reque
 })
 
 test("a snapshot beyond the concurrent ingestion bound is answered with rate_limited", async () => {
-  const h = limitedHandler()
+  const h = await limitedHandler()
   let release!: () => void
   const held = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -202,13 +220,13 @@ test("a snapshot beyond the concurrent ingestion bound is answered with rate_lim
   const first = h(
     new Request("http://hub/v1/snapshot", { method: "POST", headers: { authorization: `Bearer ${token}` }, body: held }),
   )
-  const error = await clientFor(h).snapshot(snapshot).catch((e: unknown) => e)
+  const error = await failure(clientFor(h).snapshot(snapshot))
   expect(error).toMatchObject({ code: "rate_limited", status: 429 })
-  expect(await clientFor(h).status()).toMatchObject({ sessions: 0 })
+  expect(await run(clientFor(h).status())).toMatchObject({ sessions: 0 })
 
   release()
   expect((await first).status).toBe(200)
-  expect(await clientFor(h).snapshot(snapshot)).toEqual({ outcome: "unchanged" })
+  expect(await run(clientFor(h).snapshot(snapshot))).toEqual({ outcome: "unchanged" })
 })
 
 test("an unsupported protocol version is rejected with both versions named", async () => {
@@ -218,7 +236,7 @@ test("an unsupported protocol version is rejected with both versions named", asy
   expect(error.code).toBe("protocol_version")
   expect(error.message).toContain(`version ${PROTOCOL_VERSION + 1}`)
   expect(error.message).toContain(`version ${PROTOCOL_VERSION}`)
-  expect(archive.status()).toMatchObject({ sessions: 0 })
+  expect(sync(archive.status())).toMatchObject({ sessions: 0 })
 })
 
 test("a snapshot with tool parts from a protocol 1 client is refused rather than stripped", async () => {
@@ -230,7 +248,7 @@ test("a snapshot with tool parts from a protocol 1 client is refused rather than
   })
   expect(res.status).toBe(400)
   expect(((await res.json()) as { error: { code: string } }).error.code).toBe("protocol_version")
-  expect(archive.status()).toMatchObject({ sessions: 0 })
+  expect(sync(archive.status())).toMatchObject({ sessions: 0 })
 })
 
 test.each([
@@ -259,7 +277,7 @@ test.each([
   const res = await post("snapshot", body)
   expect(res.status).toBe(400)
   expect(((await res.json()) as { error: { code: string } }).error.code).toBe("invalid_request")
-  expect(archive.status()).toMatchObject({ sessions: 0 })
+  expect(sync(archive.status())).toMatchObject({ sessions: 0 })
 })
 
 test("a body that is not JSON is rejected", async () => {
@@ -275,7 +293,7 @@ test("an unknown verb is rejected", async () => {
 })
 
 test("the client raises the hub's rejection as a HubError carrying its code", async () => {
-  const client = createClient({
+  const client = makeClient({
     url: "http://hub",
     token,
     fetch: async (input, init) => {
@@ -283,7 +301,7 @@ test("the client raises the hub's rejection as a HubError carrying its code", as
       return handler(new Request(input, { ...init, body: Bun.gzipSync(JSON.stringify({ ...body, protocolVersion: 0 })) }))
     },
   })
-  const error = await client.status().catch((e: unknown) => e)
+  const error = await failure(client.status())
   expect(error).toBeInstanceOf(HubError)
   expect(error).toMatchObject({ code: "protocol_version", status: 400 })
 })
@@ -295,8 +313,8 @@ test.each([
   ["413", 413, () => new Response("too big", { status: 413 }), "payload_too_large"],
   ["429", 429, () => new Response("slow down", { status: 429 }), "rate_limited"],
 ])("the client falls back to the HTTP status when a proxy answers with %s", async (_, status, respond, code) => {
-  const client = createClient({ url: "http://hub", token, fetch: async () => respond() })
-  const error = await client.status().catch((e: unknown) => e)
+  const client = makeClient({ url: "http://hub", token, fetch: async () => respond() })
+  const error = await failure(client.status())
   expect(error).toBeInstanceOf(HubError)
   expect(error).toMatchObject({ code, message: `HTTP ${status}`, status })
 })
@@ -311,7 +329,7 @@ test.each([
   const res = await post("snapshot", { protocolVersion: PROTOCOL_VERSION, ...snapshot }, bearer)
   expect(res.status).toBe(401)
   expect(await errorCode(res)).toBe("invalid_token")
-  expect(archive.status()).toMatchObject({ sessions: 0 })
+  expect(sync(archive.status())).toMatchObject({ sessions: 0 })
 })
 
 test("authentication is checked before the protocol version", async () => {
@@ -321,14 +339,14 @@ test("authentication is checked before the protocol version", async () => {
 
 test("a revoked token fails on the very next request", async () => {
   expect((await post("status", { protocolVersion: PROTOCOL_VERSION })).status).toBe(200)
-  archive.revokeToken(archive.listTokens()[0]!.id)
+  sync(archive.revokeToken(sync(archive.listTokens())[0]!.id))
   const res = await post("status", { protocolVersion: PROTOCOL_VERSION })
   expect(res.status).toBe(401)
   expect(await errorCode(res)).toBe("invalid_token")
 })
 
 test("the auth-rejection log line contains no token material", async () => {
-  archive.revokeToken(archive.listTokens()[0]!.id)
+  sync(archive.revokeToken(sync(archive.listTokens())[0]!.id))
   await post("status", { protocolVersion: PROTOCOL_VERSION })
   const rejection = logLines.map((l) => JSON.parse(l)).find((l) => l.msg === "auth rejected")
   expect(rejection).toMatchObject({ level: "warn", reason: "unknown token" })

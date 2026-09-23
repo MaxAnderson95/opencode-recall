@@ -3,12 +3,9 @@ import { Database } from "bun:sqlite"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { createClient } from "@opencode-recall/protocol"
-import { openArchive } from "../../hub/src/archive/index.ts"
-import { fakeEmbedder } from "../../hub/src/fake-embedder.ts"
-import { createLog } from "../../hub/src/log.ts"
-import { serve } from "../../hub/src/serve.ts"
-import { sourceDb, type SourceDb } from "./fixture.ts"
+import { makeClient } from "@opencode-recall/protocol"
+import { Effect } from "effect"
+import { sourceDb, startHub, type SourceDb } from "./fixture.ts"
 import { EXTRACTOR_VERSION, readPosition, readPositions, readSession, readSnapshot } from "./source.ts"
 
 function demo(): SourceDb {
@@ -33,20 +30,12 @@ function demo(): SourceDb {
 }
 
 let dataDir: string
-let hub: ReturnType<typeof serve>
+let hub: Awaited<ReturnType<typeof startHub>>
 let source: SourceDb
 
-/** Issue a token the way `opencode-recall-hub token issue` does, through its own connection. */
-function issueToken(name: string): string {
-  const admin = openArchive(join(dataDir, "archive.db"), fakeEmbedder())
-  const token = admin.issueToken(name)
-  admin.close()
-  return token
-}
-
-beforeEach(() => {
+beforeEach(async () => {
   dataDir = mkdtempSync(join(tmpdir(), "recall-plugin-"))
-  hub = serve({ dataDir, listen: "127.0.0.1:0", logLevel: "error" }, createLog("error", () => {}), fakeEmbedder())
+  hub = await startHub(dataDir)
   source = demo()
 })
 
@@ -178,9 +167,9 @@ test("the content hash changes with content and not with a re-read", () => {
 })
 
 test("an uploaded session is stored by the hub as sessions, messages, and parts rows", async () => {
-  const client = createClient({ url: hub.url.href, token: issueToken("laptop") })
-  expect(await client.snapshot(readSnapshot(source.db, "ses_a")!)).toEqual({ outcome: "archived" })
-  expect(await client.status()).toMatchObject({ sessions: 1 })
+  const client = makeClient({ url: hub.url.href, token: hub.issueToken("laptop") })
+  expect(await Effect.runPromise(client.snapshot(readSnapshot(source.db, "ses_a")!))).toEqual({ outcome: "archived" })
+  expect(await Effect.runPromise(client.status())).toMatchObject({ sessions: 1 })
 
   const archive = new Database(join(dataDir, "archive.db"), { readonly: true })
   expect(archive.query("SELECT id, title, revision, last_activity FROM sessions").all()).toEqual([
@@ -204,10 +193,10 @@ test("an uploaded session is stored by the hub as sessions, messages, and parts 
 })
 
 test("uploads under two tokens for one source are attributed to that one source", async () => {
-  const [first, second] = [issueToken("laptop"), issueToken("laptop")]
-  await createClient({ url: hub.url.href, token: first }).snapshot(readSnapshot(source.db, "ses_a")!)
+  const [first, second] = [hub.issueToken("laptop"), hub.issueToken("laptop")]
+  await Effect.runPromise(makeClient({ url: hub.url.href, token: first }).snapshot(readSnapshot(source.db, "ses_a")!))
   source.addSession("ses_b", { title: "Other", time: 300 })
-  await createClient({ url: hub.url.href, token: second }).snapshot(readSnapshot(source.db, "ses_b")!)
+  await Effect.runPromise(makeClient({ url: hub.url.href, token: second }).snapshot(readSnapshot(source.db, "ses_b")!))
 
   const archive = new Database(join(dataDir, "archive.db"), { readonly: true })
   expect(

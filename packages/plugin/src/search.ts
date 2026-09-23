@@ -3,22 +3,23 @@
  * the single-machine recall plugin's result format.
  */
 import { homedir } from "node:os"
-import type { Info } from "@opencode/plugin/promise/tool"
-import { HubError, createClient, type Search, type SearchHit, type SearchResult } from "@opencode-recall/protocol"
-import { z } from "zod"
-import type { HubConfig } from "./config.ts"
+import type { Info, ToolContext } from "@opencode/plugin/promise/tool"
+import { Search, makeClient, type SearchHit, type SearchResult } from "@opencode-recall/protocol"
+import { Effect, Option, Result, Schema } from "effect"
+import { PluginConfig } from "./config.ts"
+import { Source } from "./source.ts"
 
 // The runtime forwards the JSON Schema below to the model without validating against it.
-const Args = z.object({
-  query: z.string(),
-  scope: z.enum(["all", "user-messages"]).optional(),
-  mode: z.enum(["hybrid", "lexical", "semantic"]).optional(),
-  directory: z.string().optional(),
-  source: z.string().optional(),
-  since: z.string().optional(),
-  until: z.string().optional(),
-  include_tools: z.boolean().optional(),
-  limit: z.number().optional(),
+const Args = Schema.Struct({
+  query: Schema.String,
+  scope: Schema.optionalKey(Search.fields.scope.schema),
+  mode: Schema.optionalKey(Search.fields.mode.schema),
+  directory: Schema.optionalKey(Schema.String),
+  source: Schema.optionalKey(Schema.String),
+  since: Schema.optionalKey(Schema.String),
+  until: Schema.optionalKey(Schema.String),
+  include_tools: Schema.optionalKey(Schema.Boolean),
+  limit: Schema.optionalKey(Schema.Number),
 })
 
 const INPUT = {
@@ -87,7 +88,7 @@ function via(hit: SearchHit, session: SearchResult, scope: Search["scope"]): str
 }
 
 /** The ranked sessions as the model reads them. */
-function render(sessions: SearchResult[], scope: Search["scope"], callerSessionId: string): string {
+function render(sessions: readonly SearchResult[], scope: Search["scope"], callerSessionId: string): string {
   const lines = sessions.flatMap((s, i) => {
     const origin = `from ${s.source || "an unknown host"}${s.ownSource ? " (this host)" : ""}, archived revision ${s.revision}`
     const self = s.sessionId === callerSessionId ? " ← THIS session, before its last compaction" : ""
@@ -100,64 +101,70 @@ function render(sessions: SearchResult[], scope: Search["scope"], callerSessionI
   return lines.join("\n")
 }
 
-type Options = {
-  /** Re-read on every call, so a fixed config is picked up without a restart. */
-  loadConfig: () => Promise<HubConfig | null>
-  /** Time of the session's last compaction in the local database, or 0 if it never compacted. */
-  compactionBoundary: (sessionId: string) => number
-  fetch?: (url: string, init: RequestInit) => Promise<Response>
-}
+const DESCRIPTION =
+  "Search ALL past OpenCode conversations from every host sharing this recall hub (every project, full history) with hybrid lexical (FTS5/BM25 over messages, reasoning, and tool outputs) + semantic (embedding) search. Use when the user references a previous discussion ('do you remember', 'we discussed', 'in another session'), or when past decisions, fixes, commands, or error messages would help. Also searches THIS session's history from before its last compaction, useful for recovering details lost to context compaction. Results name the host each session came from and its archived revision; the newest turn of a session may not be archived yet."
 
-export function searchTool({ loadConfig, compactionBoundary, fetch }: Options): Info<typeof INPUT> {
-  return {
+/**
+ * The tool as OpenCode registers it. Each call runs as an Effect with the services it was built
+ * with, re-reading the hub config so a fixed config is picked up without a restart.
+ */
+export const make = Effect.fnUntraced(function* () {
+  const config = yield* PluginConfig.Service
+  const source = yield* Source.Service
+
+  const execute = Effect.fn("recall_search")(function* (input: unknown, ctx: Pick<ToolContext, "sessionID">) {
+    const args = Schema.decodeUnknownResult(Args)(input)
+    if (Result.isFailure(args)) return { content: `Invalid recall_search arguments: ${args.failure.message}` }
+    const { query } = args.success
+    const hub = yield* Effect.orDie(config.hub)
+    if (Option.isNone(hub))
+      return {
+        content:
+          "recall could not look: no hub is configured. Set OPENCODE_RECALL_HUB_URL and OPENCODE_RECALL_TOKEN, or hub.url and hub.token in recall.json. This is not an empty result.",
+      }
+
+    const mode = args.success.mode ?? "hybrid"
+    const search: Search = {
+      query,
+      mode,
+      scope: args.success.scope,
+      since: parseWhen(args.success.since),
+      until: parseWhen(args.success.until),
+      directory: args.success.directory,
+      source: args.success.source,
+      includeTools: args.success.include_tools,
+      limit: clampInt(args.success.limit, 1, 25, 8),
+      // Computed here: the hub's copy of this session trails its newest turn.
+      exclude: { sessionId: ctx.sessionID, before: yield* source.compactionBoundary(ctx.sessionID) },
+    }
+    const answer = yield* Effect.result(makeClient(hub.value).search(search))
+    if (Result.isFailure(answer)) {
+      const e = answer.failure
+      const reason = e._tag === "HubError" ? `${e.code}: ${e.message}` : e.message
+      return { content: `recall could not look: the hub request failed (${reason}). This is not an empty result.` }
+    }
+    const { sessions, semanticUnavailable } = answer.success
+    if (semanticUnavailable !== undefined && mode === "semantic")
+      return {
+        content: `recall could not look: semantic search is unavailable (${semanticUnavailable}). Retry with mode=lexical or hybrid. This is not an empty result.`,
+      }
+    const note = semanticUnavailable === undefined ? "" : `semantic search is unavailable (${semanticUnavailable}); these results are lexical only.\n`
+    if (!sessions.length)
+      return {
+        content: `${note}No matches for "${query}" (${mode}, scope=${search.scope ?? "all"}). Try mode=semantic for fuzzy recall, fewer or different keywords, or drop filters.`,
+      }
+    return { content: note + render(sessions, search.scope, ctx.sessionID), metadata: { title: `recall: ${query}` } }
+  })
+
+  const context = yield* Effect.context<never>()
+  const info: Info<typeof INPUT> = {
     name: "recall_search",
-    description:
-      "Search ALL past OpenCode conversations from every host sharing this recall hub (every project, full history) with hybrid lexical (FTS5/BM25 over messages, reasoning, and tool outputs) + semantic (embedding) search. Use when the user references a previous discussion ('do you remember', 'we discussed', 'in another session'), or when past decisions, fixes, commands, or error messages would help. Also searches THIS session's history from before its last compaction, useful for recovering details lost to context compaction. Results name the host each session came from and its archived revision; the newest turn of a session may not be archived yet.",
+    description: DESCRIPTION,
     input: INPUT,
     options: { codemode: false },
-    async execute(input, ctx) {
-      const args = Args.safeParse(input)
-      if (!args.success) return { content: `Invalid recall_search arguments: ${z.prettifyError(args.error)}` }
-      const { query } = args.data
-      const config = await loadConfig()
-      if (!config)
-        return {
-          content:
-            "recall could not look: no hub is configured. Set OPENCODE_RECALL_HUB_URL and OPENCODE_RECALL_TOKEN, or hub.url and hub.token in recall.json. This is not an empty result.",
-        }
-
-      const mode = args.data.mode ?? "hybrid"
-      const search: Search = {
-        query,
-        mode,
-        scope: args.data.scope,
-        since: parseWhen(args.data.since),
-        until: parseWhen(args.data.until),
-        directory: args.data.directory,
-        source: args.data.source,
-        includeTools: args.data.include_tools,
-        limit: clampInt(args.data.limit, 1, 25, 8),
-        // Computed here: the hub's copy of this session trails its newest turn.
-        exclude: { sessionId: ctx.sessionID, before: compactionBoundary(ctx.sessionID) },
-      }
-      let sessions: SearchResult[]
-      let semanticUnavailable: string | undefined
-      try {
-        ;({ sessions, semanticUnavailable } = await createClient({ ...config, fetch }).search(search))
-      } catch (e) {
-        const reason = e instanceof HubError ? `${e.code}: ${e.message}` : e instanceof Error ? e.message : String(e)
-        return { content: `recall could not look: the hub request failed (${reason}). This is not an empty result.` }
-      }
-      if (semanticUnavailable !== undefined && mode === "semantic")
-        return {
-          content: `recall could not look: semantic search is unavailable (${semanticUnavailable}). Retry with mode=lexical or hybrid. This is not an empty result.`,
-        }
-      const note = semanticUnavailable === undefined ? "" : `semantic search is unavailable (${semanticUnavailable}); these results are lexical only.\n`
-      if (!sessions.length)
-        return {
-          content: `${note}No matches for "${query}" (${mode}, scope=${search.scope ?? "all"}). Try mode=semantic for fuzzy recall, fewer or different keywords, or drop filters.`,
-        }
-      return { content: note + render(sessions, search.scope, ctx.sessionID), metadata: { title: `recall: ${query}` } }
-    },
+    execute: (input, ctx) => Effect.runPromiseWith(context)(execute(input, ctx)),
   }
-}
+  return info
+})
+
+export * as SearchTool from "./search.ts"

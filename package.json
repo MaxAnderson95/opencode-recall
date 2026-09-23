@@ -2,7 +2,10 @@
   "name": "opencode-recall",
   "private": true,
   "type": "module",
-  "workspaces": ["packages/*"],
+  "workspaces": [
+    "packages/*",
+    "tools/*"
+  ],
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit -p ."

@@ -2,10 +2,12 @@ import { mkdirSync } from "node:fs"
 import path from "node:path"
 import { Database } from "bun:sqlite"
 
-import { config, paths } from "./config.ts"
+import { Effect } from "effect"
+import { paths as evalPaths } from "./config.ts"
 import type { Label } from "./score.ts"
 
-const db = new Database(config.opencodeDb, { readonly: true })
+const paths = await Effect.runPromise(evalPaths)
+const db = new Database(paths.opencodeDb, { readonly: true })
 
 type Row = { session_id: string; seq: number; time_created: number; data: string }
 

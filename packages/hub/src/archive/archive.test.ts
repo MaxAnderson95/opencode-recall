@@ -4,16 +4,17 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { Message, Part, Search, Snapshot } from "@opencode-recall/protocol"
-import type { Embedder } from "../embedder.ts"
+import { Effect, Exit, Option, Scope, type Types } from "effect"
+import { Embedder } from "../embedder.ts"
 import { fakeEmbedder } from "../fake-embedder.ts"
-import { SCHEMA_VERSION, openArchive, type Archive } from "./index.ts"
+import { Archive, SCHEMA_VERSION } from "./index.ts"
 import { SEGMENTED, migrations } from "./migrations.ts"
 
 /** The first schema version with vector spaces. */
 const SPACES = 7
 
 const dirs: string[] = []
-const archives: Archive[] = []
+const scopes: Scope.Closeable[] = []
 
 function tempPath(): string {
   const dir = mkdtempSync(join(tmpdir(), "recall-archive-"))
@@ -21,19 +22,47 @@ function tempPath(): string {
   return join(dir, "archive.db")
 }
 
-function open(path: string, embedder: Embedder = fakeEmbedder()): Archive {
-  const archive = openArchive(path, embedder)
-  archives.push(archive)
-  return archive
+/**
+ * The archive with each operation run to completion: synchronously where it never waits, as a
+ * promise where it may wait on the embedder, so assertions read like the rules they check.
+ */
+function handle(archive: Archive.Interface, scope: Scope.Closeable) {
+  return {
+    migration: archive.migration,
+    putSnapshot: (snapshot: Snapshot, sourceId: number) => Effect.runSync(archive.putSnapshot(snapshot, sourceId)),
+    putTombstone: (...args: Parameters<Archive.Interface["putTombstone"]>) => Effect.runSync(archive.putTombstone(...args)),
+    manifest: () => Effect.runSync(archive.manifest()),
+    search: (search: Search, callerSourceId: number) => Effect.runPromise(archive.search(search, callerSourceId)),
+    embedPending: (limit: number) => Effect.runPromise(archive.embedPending(limit)),
+    issueToken: (source: string) => Effect.runSync(archive.issueToken(source)),
+    listTokens: () => Effect.runSync(archive.listTokens()),
+    revokeToken: (id: number) => Effect.runSync(archive.revokeToken(id)),
+    authenticate: (token: string) => Option.getOrNull(Effect.runSync(archive.authenticate(token))),
+    status: () => Effect.runSync(archive.status()),
+    close: () => Effect.runSync(Scope.close(scope, Exit.void)),
+  }
+}
+type Handle = ReturnType<typeof handle>
+
+/** Open the archive at `path` with `embedder`; it is closed after the test unless closed before. */
+function open(path: string, embedder: Embedder.Interface = fakeEmbedder()): Handle {
+  const scope = Effect.runSync(Scope.make())
+  scopes.push(scope)
+  const archive = Effect.runSync(
+    Archive.make(path).pipe(Effect.provideService(Embedder.Service, embedder), Scope.provide(scope)),
+  )
+  return handle(archive, scope)
 }
 
 afterEach(() => {
-  for (const a of archives.splice(0)) a.close()
+  for (const scope of scopes.splice(0)) Effect.runSync(Scope.close(scope, Exit.void))
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true })
 })
 
+type Draft = Types.DeepMutable<Snapshot>
+
 /** A snapshot whose position defaults to one past its last message and whose hash names its texts. */
-function session(id: string, texts: string[], fields: Partial<Omit<Snapshot, "session">> = {}): Snapshot {
+function session(id: string, texts: string[], fields: Partial<Omit<Snapshot, "session">> = {}): Draft {
   return {
     session: {
       id,
@@ -61,7 +90,7 @@ function session(id: string, texts: string[], fields: Partial<Omit<Snapshot, "se
 type Shape = { directory?: string; type?: Message["type"]; part?: Part; time?: number }
 
 /** A one-message session whose message is shaped by `shape`, for search tests. */
-function single(id: string, text: string, { directory = "/work", type = "user", part, time = 10 }: Shape = {}): Snapshot {
+function single(id: string, text: string, { directory = "/work", type = "user", part, time = 10 }: Shape = {}): Draft {
   const snapshot = session(id, [text])
   snapshot.session.directory = directory
   snapshot.session.messages[0] = { id: `${id}_msg_0`, type, timeCreated: time, parts: [part ?? { kind: "text", text }] }
@@ -69,13 +98,13 @@ function single(id: string, text: string, { directory = "/work", type = "user", 
 }
 
 /** Lexical unless `filters` says otherwise, so ranking tests are not perturbed by the fake embedder. */
-const search = async (archive: Archive, query: string, filters: Partial<Search> = {}, caller = 0) =>
+const search = async (archive: Handle, query: string, filters: Partial<Search> = {}, caller = 0) =>
   (await archive.search({ query, limit: 25, mode: "lexical", ...filters }, caller)).sessions
 
-const ids = (results: { sessionId: string }[]) => results.map((r) => r.sessionId).sort()
+const ids = (results: readonly { sessionId: string }[]) => results.map((r) => r.sessionId).sort()
 
 /** The id of the source `name`, issuing it a token (and creating it) if needed. */
-const sourceOf = (archive: Archive, name = "laptop") => archive.authenticate(archive.issueToken(name))!.id
+const sourceOf = (archive: Handle, name = "laptop") => archive.authenticate(archive.issueToken(name))!.id
 
 const backends = [
   { name: ":memory:", path: () => ":memory:" },
@@ -479,7 +508,10 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     async (how) => {
       const fake = fakeEmbedder()
       let gate = Promise.resolve()
-      const archive = open(path(), { model: fake.model, embed: async (texts) => (await gate, fake.embed(texts)) })
+      const archive = open(path(), {
+        model: fake.model,
+        embed: (texts) => Effect.promise(() => gate).pipe(Effect.andThen(fake.embed(texts))),
+      })
       const laptop = sourceOf(archive)
       archive.putSnapshot(single("ses_a", "zebra stripes"), laptop)
       // Load the matrix, so a stale vector would also reach it.
@@ -730,7 +762,7 @@ describe("archive (file-backed only)", () => {
     const token = serving.issueToken("laptop")
     expect(serving.authenticate(token)).not.toBeNull()
 
-    const admin = openArchive(path, fakeEmbedder())
+    const admin = open(path)
     admin.revokeToken(admin.listTokens()[0]!.id)
     admin.close()
     expect(serving.authenticate(token)).toBeNull()
@@ -740,7 +772,7 @@ describe("archive (file-backed only)", () => {
     const path = tempPath()
     const down = fakeEmbedder()
     down.down = true
-    const first = openArchive(path, down)
+    const first = open(path, down)
     first.putSnapshot(single("ses_a", "the needle"), sourceOf(first))
     await expect(first.embedPending(32)).rejects.toThrow()
     first.close()
@@ -754,7 +786,7 @@ describe("archive (file-backed only)", () => {
 
   test("the active space is kept when the hub's embedder differs, and the semantic branch says to reindex", async () => {
     const path = tempPath()
-    const first = openArchive(path, fakeEmbedder())
+    const first = open(path)
     first.putSnapshot(single("ses_a", "the needle"), sourceOf(first))
     first.close()
 
@@ -809,7 +841,7 @@ describe("archive (file-backed only)", () => {
 
   test("reopening an up-to-date archive applies no migrations and keeps its data", async () => {
     const path = tempPath()
-    const first = openArchive(path, fakeEmbedder())
+    const first = open(path)
     first.putSnapshot(session("ses_a", ["hello"]), sourceOf(first))
     first.close()
 
@@ -824,7 +856,11 @@ describe("archive (file-backed only)", () => {
     db.run(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`)
     db.close()
 
-    expect(() => openArchive(path, fakeEmbedder())).toThrow(
+    const refused = Effect.runSync(
+      Effect.scoped(Archive.make(path)).pipe(Effect.provideService(Embedder.Service, fakeEmbedder()), Effect.flip),
+    )
+    expect(refused).toBeInstanceOf(Archive.NewerSchema)
+    expect(refused.message).toContain(
       `archive schema version ${SCHEMA_VERSION + 1} is newer than this binary supports (${SCHEMA_VERSION})`,
     )
     const after = new Database(path, { readonly: true })

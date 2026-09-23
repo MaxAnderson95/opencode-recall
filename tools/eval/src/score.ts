@@ -1,4 +1,5 @@
 /** Labels, ranking them through the Archive, and session-level metrics. */
+import { Effect } from "effect"
 import type { Search } from "../../../packages/protocol/src/index.ts"
 import type { Archive } from "../../../packages/hub/src/archive/index.ts"
 
@@ -32,16 +33,16 @@ function searchFor(l: Label, mode: Mode): Search {
 }
 
 /** Zero-based rank of the first relevant session for each label, or -1 when none is in the top 10. */
-export async function rankAll(archive: Archive, labels: Label[], mode: Mode): Promise<number[]> {
+export const rankAll = Effect.fn("Eval.rankAll")(function* (archive: Archive.Interface, labels: Label[], mode: Mode) {
   const ranks: number[] = []
   for (const l of labels) {
-    const { sessions, semanticUnavailable } = await archive.search(searchFor(l, mode), 0)
-    if (semanticUnavailable !== undefined) throw new Error(`semantic branch unavailable: ${semanticUnavailable}`)
+    const { sessions, semanticUnavailable } = yield* archive.search(searchFor(l, mode), 0)
+    if (semanticUnavailable !== undefined) return yield* Effect.die(new Error(`semantic branch unavailable: ${semanticUnavailable}`))
     const relevant = new Set(l.relevant)
     ranks.push(sessions.findIndex((s) => relevant.has(s.sessionId)))
   }
   return ranks
-}
+})
 
 /**
  * `hitK` is the share of labels with any relevant session in the top K. It is a hit rate, not

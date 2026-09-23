@@ -1,4 +1,12 @@
 import { Database } from "bun:sqlite"
+import { join } from "node:path"
+import { Effect, Layer, ManagedRuntime } from "effect"
+import { Archive } from "../../hub/src/archive/index.ts"
+import { HubConfig } from "../../hub/src/config.ts"
+import type { Embedder } from "../../hub/src/embedder.ts"
+import { fakeEmbedder, fakeLayer } from "../../hub/src/fake-embedder.ts"
+import { Log } from "../../hub/src/log.ts"
+import { Hub } from "../../hub/src/serve.ts"
 
 /**
  * An in-memory stand-in for OpenCode 2.0.14's database, holding only the columns the plugin reads.
@@ -55,3 +63,25 @@ export function sourceDb() {
 }
 
 export type SourceDb = ReturnType<typeof sourceDb>
+
+/**
+ * A hub serving `dataDir` on a free port with `embedder`, as `serve` runs it. `issueToken` goes
+ * through its own connection, as `opencode-recall-hub token issue` does.
+ */
+export async function startHub(dataDir: string, embedder: Embedder.Interface = fakeEmbedder()) {
+  const settings = { dataDir, listen: "127.0.0.1:0", logLevel: "error" } as const
+  const runtime = ManagedRuntime.make(
+    Hub.layer(fakeLayer(embedder)).pipe(
+      Layer.provide(Layer.succeed(HubConfig.Service, settings)),
+      Layer.provide(Log.layer("error", () => {})),
+    ),
+  )
+  const { url } = await runtime.runPromise(Hub.Listening)
+  const issueToken = (name: string) =>
+    Effect.runSync(
+      Effect.scoped(Effect.flatMap(Archive.make(join(dataDir, "archive.db")), (admin) => admin.issueToken(name))).pipe(
+        Effect.provide(fakeLayer()),
+      ),
+    )
+  return { url, issueToken, stop: () => runtime.dispose() }
+}

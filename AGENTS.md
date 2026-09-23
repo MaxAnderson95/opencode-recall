@@ -15,3 +15,7 @@ Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-
 ### Domain docs
 
 Single-context: `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+## Code
+
+All packages and `tools/eval` are written in Effect v4 with Effect Schema; load the `effect` skill before changing them. The decision and how effects run at the `Bun.serve` and OpenCode plugin boundaries are in `docs/adr/0001-effect-v4-and-effect-schema.md`.

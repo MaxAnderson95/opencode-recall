@@ -1,4 +1,5 @@
-import type { Embedder, EmbeddingModel } from "./embedder.ts"
+import { Effect, Layer } from "effect"
+import { Embedder, type EmbeddingModel } from "./embedder.ts"
 
 const DIMS = 64
 
@@ -8,36 +9,43 @@ const bucket = (word: string) => {
   return (h >>> 0) % DIMS
 }
 
+export type FakeEmbedder = Embedder.Interface & { down: boolean; calls: string[][] }
+
 /**
  * A deterministic stand-in for the ONNX model, for tests: a normalized bag of hashed four-letter
  * word stems. Texts sharing stems score higher, so "deploying" finds "deployment", which BM25 over
- * unstemmed tokens does not. Set `down` to make every call reject as a failed model would.
+ * unstemmed tokens does not. Set `down` to make every call fail as a failed model would.
  */
-export function fakeEmbedder(model: Partial<EmbeddingModel> = {}): Embedder & { down: boolean; calls: string[][] } {
-  const fake = {
+export function fakeEmbedder(model: Partial<EmbeddingModel> = {}): FakeEmbedder {
+  const fake: FakeEmbedder = {
     down: false,
-    calls: [] as string[][],
+    calls: [],
     model: {
       model: "fake/bag-of-words",
       revision: "1",
       dtype: "fp32",
       dims: DIMS,
       runtime: "fake",
-      pooling: "mean" as const,
+      pooling: "mean",
       normalize: true,
       queryPrefix: "query: ",
       ...model,
     },
-    async embed(texts: string[]) {
-      fake.calls.push(texts)
-      if (fake.down) throw new Error("embedding model unavailable")
-      return texts.map((text) => {
-        const v = new Float32Array(DIMS)
-        for (const word of text.toLowerCase().match(/[a-z0-9]+/g) ?? []) v[bucket(word.slice(0, 4))]! += 1
-        const norm = Math.hypot(...v) || 1
-        return v.map((x) => x / norm)
-      })
-    },
+    embed: (texts) =>
+      Effect.suspend(() => {
+        fake.calls.push([...texts])
+        if (fake.down) return Effect.fail(new Embedder.Failed({ message: "embedding model unavailable", cause: null }))
+        return Effect.succeed(
+          texts.map((text) => {
+            const v = new Float32Array(DIMS)
+            for (const word of text.toLowerCase().match(/[a-z0-9]+/g) ?? []) v[bucket(word.slice(0, 4))]! += 1
+            const norm = Math.hypot(...v) || 1
+            return v.map((x) => x / norm)
+          }),
+        )
+      }),
   }
   return fake
 }
+
+export const fakeLayer = (fake: Embedder.Interface = fakeEmbedder()) => Layer.succeed(Embedder.Service, fake)
