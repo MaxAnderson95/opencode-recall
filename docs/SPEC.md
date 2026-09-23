@@ -89,9 +89,9 @@ Searchability is a property, not a condition on existence. Parts excluded from s
 
 **`segments`**: `(part_id, start, length)`, one per FTS row, at most 8,000 characters each. Long parts are split rather than truncated so nothing becomes unsearchable and BM25 length normalization stays meaningful.
 
-**`fts`**: FTS5 external-content index whose content object is a **view** doing `substr(parts.text, start + 1, length)` over `segments` joined to `parts`. External content over offsets requires a view; naming a table here would be read as "store the segment text", which defeats the purpose.
+**`fts`**: FTS5 external-content index whose content object is a **view** doing `CAST(substr(CAST(parts.text AS BLOB), start + 1, length) AS TEXT)` over `segments` joined to `parts`. External content over offsets requires a view; naming a table here would be read as "store the segment text", which defeats the purpose.
 
-Two consequences an implementer must honour. Offsets are **SQLite `substr` character positions**, which are not JavaScript UTF-16 code-unit offsets; the extractor must emit one convention and the schema must state which. And FTS5 deletes re-tokenize current content to locate postings, so **FTS rows must be deleted before their `parts` and `segments` rows** inside the per-session replace transaction, or the index silently rots.
+Two consequences an implementer must honour. Offsets are **zero-based UTF-8 byte positions** in the part text, which are not JavaScript UTF-16 code-unit offsets; the segmenter must emit one convention and the schema must state which. The view slices the text as a BLOB because SQLite's text `substr` stops at an embedded NUL, which tool output such as `find -print0` contains, and SQLite has no NUL-safe character slice; everything after the NUL would otherwise go unindexed. And FTS5 deletes re-tokenize current content to locate postings, so **FTS rows must be deleted before their `parts` and `segments` rows** inside the per-session replace transaction, or the index silently rots.
 
 **`chunks`**: the **exact embedding-input text**, stored, plus provenance (session, anchor message, window index, scope), time, and the chunk content hash. Chunks belong to a chunk set, which belongs to a vector space.
 
