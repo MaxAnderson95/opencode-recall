@@ -109,7 +109,8 @@ function bind(db: Database, migration: { from: number; to: number }): Archive {
      VALUES ($id, $sessionId, $ordinal, $type, $timeCreated)`,
   )
   const insertPart = db.prepare(
-    `INSERT INTO parts (message_id, ordinal, kind, text) VALUES ($messageId, $ordinal, $kind, $text)`,
+    `INSERT INTO parts (message_id, ordinal, kind, text, tool_name, tool_title, status, error, searchable)
+     VALUES ($messageId, $ordinal, $kind, $text, $toolName, $toolTitle, $status, $error, $searchable)`,
   )
   const countSessions = db.prepare("SELECT count(*) AS n FROM sessions")
   const selectTombstone = db.prepare("SELECT time_deleted AS timeDeleted FROM tombstones WHERE session_id = ?")
@@ -193,9 +194,20 @@ function bind(db: Database, migration: { from: number; to: number }): Archive {
         type: message.type,
         timeCreated: message.timeCreated,
       })
-      message.parts.forEach((part, partOrdinal) =>
-        insertPart.run({ messageId: message.id, ordinal: partOrdinal, kind: part.kind, text: part.text }),
-      )
+      message.parts.forEach((part, partOrdinal) => {
+        const tool = part.kind === "tool" ? part : undefined
+        insertPart.run({
+          messageId: message.id,
+          ordinal: partOrdinal,
+          kind: part.kind,
+          text: part.text,
+          toolName: tool?.tool ?? null,
+          toolTitle: tool?.title ?? null,
+          status: tool?.status ?? null,
+          error: tool?.error ?? null,
+          searchable: tool?.searchable ?? true,
+        })
+      })
     })
     return result
   })

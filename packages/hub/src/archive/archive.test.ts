@@ -254,6 +254,26 @@ describe("archive (file-backed only)", () => {
     db.close()
   })
 
+  test("tool parts keep their name, title, status, error text, and searchability", () => {
+    const path = tempPath()
+    const archive = open(path)
+    const snapshot = session("ses_a", ["one"])
+    snapshot.session.messages[0]!.parts = [
+      { kind: "tool", tool: "bash", title: "git push", status: "error", error: "rejected", text: "bash git push\nrejected", searchable: true },
+      { kind: "tool", tool: "bash", title: "sleep 9", status: "running", text: "", searchable: false },
+      { kind: "tool", tool: "recall_search", title: "x", status: "completed", text: "recall_search x\nhits", searchable: false },
+    ]
+    archive.putSnapshot(snapshot, sourceOf(archive))
+
+    const db = new Database(path, { readonly: true })
+    expect(db.query("SELECT tool_name, tool_title, status, error, text, searchable FROM parts ORDER BY ordinal").all()).toEqual([
+      { tool_name: "bash", tool_title: "git push", status: "error", error: "rejected", text: "bash git push\nrejected", searchable: 1 },
+      { tool_name: "bash", tool_title: "sleep 9", status: "running", error: null, text: "", searchable: 0 },
+      { tool_name: "recall_search", tool_title: "x", status: "completed", error: null, text: "recall_search x\nhits", searchable: 0 },
+    ])
+    db.close()
+  })
+
   test("source_id moves to the source of each accepted snapshot, but not on a no-op", () => {
     const path = tempPath()
     const archive = open(path)

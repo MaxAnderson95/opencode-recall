@@ -62,4 +62,12 @@ export const migrations: readonly string[] = [
     reason TEXT NOT NULL
   );
   `,
+  // Every part archived before this is a text part, which is always searchable.
+  `
+  ALTER TABLE parts ADD COLUMN tool_name TEXT;
+  ALTER TABLE parts ADD COLUMN tool_title TEXT;
+  ALTER TABLE parts ADD COLUMN status TEXT;
+  ALTER TABLE parts ADD COLUMN error TEXT;
+  ALTER TABLE parts ADD COLUMN searchable INTEGER NOT NULL DEFAULT 1;
+  `,
 ]

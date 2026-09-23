@@ -166,6 +166,18 @@ test("an unsupported protocol version is rejected with both versions named", asy
   expect(archive.status()).toEqual({ sessions: 0 })
 })
 
+test("a snapshot with tool parts from a protocol 1 client is refused rather than stripped", async () => {
+  const toolPart = { kind: "tool", tool: "recall_search", title: "x", status: "completed", text: "hits", searchable: false }
+  const res = await post("snapshot", {
+    ...snapshot,
+    protocolVersion: 1,
+    session: { ...session, messages: [{ ...session.messages[0], parts: [toolPart] }] },
+  })
+  expect(res.status).toBe(400)
+  expect(((await res.json()) as { error: { code: string } }).error.code).toBe("protocol_version")
+  expect(archive.status()).toEqual({ sessions: 0 })
+})
+
 test.each([
   ["missing protocol version", { session }],
   ["missing session", { protocolVersion: PROTOCOL_VERSION }],
@@ -177,6 +189,15 @@ test.each([
       protocolVersion: PROTOCOL_VERSION,
       ...snapshot,
       session: { ...session, messages: [{ ...session.messages[0], parts: [{ kind: "file", text: "x" }] }] },
+    },
+  ],
+  ["unknown top-level field", { protocolVersion: PROTOCOL_VERSION, ...snapshot, extra: 1 }],
+  [
+    "unknown part field",
+    {
+      protocolVersion: PROTOCOL_VERSION,
+      ...snapshot,
+      session: { ...session, messages: [{ ...session.messages[0], parts: [{ kind: "text", text: "x", extra: 1 }] }] },
     },
   ],
 ])("a malformed snapshot (%s) is rejected before reaching the archive", async (_, body) => {

@@ -8,7 +8,7 @@ import { openArchive, type Archive } from "../../hub/src/archive/index.ts"
 import { DEFAULT_LIMITS, createHandler, type Limits } from "../../hub/src/server.ts"
 import { loadHubConfig } from "./config.ts"
 import { sourceDb, type SourceDb } from "./fixture.ts"
-import { readPosition, readPositions, readSnapshot } from "./source.ts"
+import { EXTRACTOR_VERSION, readPosition, readPositions, readSnapshot } from "./source.ts"
 import { createUploader, type Storage, type Uploader } from "./uploader.ts"
 
 type Json = Parameters<Storage["set"]>[1]
@@ -506,6 +506,39 @@ test("a session tombstoned on the hub but still present locally is not re-upload
   await Bun.sleep(60)
   expect(outcomes).toEqual([])
   expect(archive.manifest().tombstones).toHaveLength(1)
+})
+
+test("a session archived by an older extractor is re-uploaded at the same position and accepted", async () => {
+  configure()
+  const current = readSnapshot(source.db, "ses_a")!
+  // What the previous extractor produced for this unchanged session: other content, same position.
+  await clientFor("laptop").snapshot({ ...current, contentHash: "older", extractorVersion: EXTRACTOR_VERSION - 1 })
+
+  await start().reconcile()
+  await until(() => outcomes.length === 2)
+  expect(outcomes).toEqual(["archived", "archived"])
+  expect(archive.manifest().sessions).toEqual([
+    {
+      sessionId: "ses_a",
+      revision: current.revision,
+      lastActivity: current.lastActivity,
+      contentHash: current.contentHash,
+      extractorVersion: EXTRACTOR_VERSION,
+    },
+  ])
+})
+
+test("summarizer worker sessions are never uploaded", async () => {
+  configure()
+  source.addSession("ses_w", { title: "recall-summarizer worker: anthropic/claude", time: 150 })
+  source.addMessage("ses_w", "user", { text: "summarize" }, 151)
+  const uploader = start(memoryStorage().storage, { sweepIntervalMs: 10 })
+  uploader.enqueue("ses_w")
+  await uploader.reconcile()
+  await until(() => outcomes.length === 1)
+  await Bun.sleep(60)
+  expect(archive.manifest().sessions.map((s) => s.sessionId)).toEqual(["ses_a"])
+  expect(outcomes).toHaveLength(1)
 })
 
 test("sessions the hub holds that this host no longer reports stay in the archive", async () => {
