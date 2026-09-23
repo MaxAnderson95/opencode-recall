@@ -739,3 +739,30 @@ test("excludeDirectories resolves ~ and matches a directory and its descendants,
     expect(await failure(PluginConfig.loadExcludeDirectories(configFile, "/Users/test"))).toBeInstanceOf(PluginConfig.Invalid)
   }
 })
+
+test("a session moved into an excluded directory without its event is tombstoned by the sweep", async () => {
+  configure(["/work/private"])
+  const uploader = await start(memoryStorage().storage, { sweepIntervalMs: 10 })
+  await uploader.reconcile()
+  await until(() => status().sessions === 1)
+
+  // No enqueue: the `session.moved` event was lost.
+  source.move("ses_a", "/work/private/app", 300)
+  await until(() => status().sessions === 0 && manifest().tombstones.length === 1)
+  await Bun.sleep(60)
+  expect(verbs.filter((v) => v === "tombstone")).toHaveLength(1)
+  expect(outcomes).toEqual(["archived"])
+})
+
+test("a work-list entry that no longer decodes is dropped instead of retried forever", async () => {
+  configure()
+  const { storage, entries } = memoryStorage()
+  // The shape an earlier build wrote, without a reason.
+  await storage.set("deleted/ses_a/200", { revision: 3, timeDeleted: 200 })
+  await storage.set("dirty/ses_b/1-1", { revision: "one" })
+  const uploader = await start(storage)
+  await until(() => entries.size === 0)
+  await Bun.sleep(50)
+  expect(verbs).toEqual([])
+  expect(Option.getOrThrow((await uploader.state()).lastError).message).toStartWith("dropped unreadable work-list entry")
+})

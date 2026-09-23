@@ -196,11 +196,29 @@ export const layer = ({
 
       const background = <A, E>(effect: Effect.Effect<A, E>) => Effect.asVoid(Effect.forkIn(effect, scope))
 
+      /**
+       * Every entry under `prefix` that decodes as `schema`. One that does not, such as a shape an
+       * earlier build wrote, is removed with a warning: no retry can make it decode, and keeping it
+       * would fail every pass that reads its session.
+       */
+      const scanKept = Effect.fnUntraced(function* <A>(prefix: string, schema: Schema.Codec<A>) {
+        const kept: { key: string; value: A }[] = []
+        for (const { key, value } of yield* storage.scan(prefix, Schema.Unknown)) {
+          const decoded = Schema.decodeUnknownOption(schema)(value)
+          if (Option.isSome(decoded)) kept.push({ key, value: decoded.value })
+          else {
+            yield* warn(`dropped unreadable work-list entry ${key}: ${JSON.stringify(value)}`)
+            yield* storage.remove(key)
+          }
+        }
+        return kept
+      })
+
       const entries = (sessionId: string) =>
-        storage.scan(sessionPrefix(sessionId), Position).pipe(Effect.map((found) => found.map(({ key, value }) => ({ key, position: value }))))
+        scanKept(sessionPrefix(sessionId), Position).pipe(Effect.map((found) => found.map(({ key, value }) => ({ key, position: value }))))
 
       const acknowledged = Effect.map(
-        storage.scan(ACKED, Position),
+        scanKept(ACKED, Position),
         (found) => new Map(found.map(({ key, value }) => [key.slice(ACKED.length), value])),
       )
 
@@ -312,7 +330,7 @@ export const layer = ({
       })
 
       const send = Effect.fnUntraced(function* (client: Client, sessionId: string) {
-        const deletions = yield* storage.scan(deletedPrefix(sessionId), Queued)
+        const deletions = yield* scanKept(deletedPrefix(sessionId), Queued)
         if (deletions.length > 0) return yield* sendTombstone(client, sessionId, deletions)
 
         const pending = yield* entries(sessionId)
@@ -385,13 +403,21 @@ export const layer = ({
         for (const id of yield* queuedSessions) due.add(id)
       })
 
-      /** Queue every local session whose position is later than the last one the hub answered. No network. */
+      /**
+       * Queue every local session whose position is later than the last one the hub answered, and a
+       * tombstone for every excluded session the hub answered since its last tombstone, which is how
+       * a lost `session.moved` into an excluded directory is caught. No network.
+       */
       const sweep = Effect.gen(function* () {
         const acked = yield* acknowledged
         const roots = yield* config.excludeDirectories
+        const tombstoning = new Set((yield* storage.scan(DELETED, Schema.Unknown)).map(({ key }) => key.split("/")[1]))
         for (const [sessionId, { position, directory }] of yield* source.positions()) {
-          if (PluginConfig.isExcluded(roots, directory)) continue
           const held = acked.get(sessionId)
+          if (PluginConfig.isExcluded(roots, directory)) {
+            if (held && !tombstoning.has(sessionId)) yield* exclude(sessionId, position.revision)
+            continue
+          }
           if (!held || later(position, held) > 0) yield* markDirty(sessionId, position)
         }
       })
