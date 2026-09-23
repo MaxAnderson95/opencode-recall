@@ -324,19 +324,16 @@ export const layer = ({
         yield* markDeleted(sessionId, { revision, timeDeleted, reason: "excluded" })
       })
 
-      /** Hold `request` until `uploadIntervalMs` has passed since the previous one ended. */
-      const paced = <A, E>(request: Effect.Effect<A, E>) =>
-        Effect.gen(function* () {
-          const wait = nextRequestAt - (yield* Clock.currentTimeMillis)
-          if (wait > 0) yield* Effect.sleep(wait)
-          return yield* request
-        }).pipe(
-          Effect.ensuring(Effect.flatMap(Clock.currentTimeMillis, (now) => Effect.sync(() => (nextRequestAt = now + uploadIntervalMs)))),
-        )
+      /** Hold the pass until `uploadIntervalMs` has passed since the previous request ended. */
+      const awaitTurn = Effect.gen(function* () {
+        const wait = nextRequestAt - (yield* Clock.currentTimeMillis)
+        if (wait > 0) yield* Effect.sleep(wait)
+      })
 
       /** Send one request, turning its failure into what the work list should do next. */
       const attempt = (sessionId: string, request: Effect.Effect<unknown, HubError | TransportError>) =>
-        paced(request).pipe(
+        request.pipe(
+          Effect.ensuring(Effect.flatMap(Clock.currentTimeMillis, (now) => Effect.sync(() => (nextRequestAt = now + uploadIntervalMs)))),
           Effect.as("done" as const),
           Effect.catch((e) => {
             const kind = classify(e)
@@ -414,9 +411,12 @@ export const layer = ({
         if (Option.isNone(hub)) return yield* pause("hub URL or token is not configured")
         const client = makeClient(hub.value)
 
-        // Sessions that come due during the pass are visited too.
-        for (let next = newestDue(); next !== undefined; next = newestDue()) {
-          const sessionId = next
+        // Sessions that come due during the pass are visited too. The wait comes before a session is
+        // chosen and read, so the newest one is sent and exclusions saved during the wait apply to it.
+        while (due.size > 0) {
+          yield* awaitTurn
+          const sessionId = newestDue()
+          if (sessionId === undefined) return
           due.delete(sessionId)
           const retry = (reason: string) =>
             warn(`upload of ${sessionId} failed, retrying: ${reason}`).pipe(

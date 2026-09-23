@@ -588,6 +588,24 @@ test("uploads are spaced by the upload interval", async () => {
   expect(gaps.every((gap) => gap >= 39)).toBe(true)
 })
 
+test("a session excluded while its upload waits out the upload interval is not sent", async () => {
+  configure()
+  source.addSession("ses_private", { time: 50, directory: "/work/private" })
+  source.addMessage("ses_private", "user", { text: "private" }, 50)
+  intercept = async (req, forward) => {
+    // The exclusion is saved partway through the interval that follows the first upload.
+    if (new URL(req.url).pathname === "/v1/snapshot") setTimeout(() => configure(["/work/private"]), 30)
+    return forward(req)
+  }
+  const { storage, pending } = memoryStorage()
+  await (await start(storage, { uploadIntervalMs: 100 })).reconcile()
+  await until(() => outcomes.length > 0 && pending() === 0)
+  await Bun.sleep(150)
+  expect(outcomes).toEqual(["archived"])
+  // The hub never held it, so there is nothing to tombstone.
+  expect(verbs).not.toContain("tombstone")
+})
+
 test("an interrupted backfill resumes without re-uploading the sessions it completed", async () => {
   configure()
   addHistory(["ses_b", "ses_c", "ses_d", "ses_e"])
