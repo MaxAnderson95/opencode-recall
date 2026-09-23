@@ -137,6 +137,10 @@ test("hybrid search over the API names an unavailable semantic branch, and statu
     chunks: 2,
     embeddedChunks: 0,
     activeSpace: { recipe: expect.objectContaining({ model: "fake/bag-of-words", chunkChars: 1200 }), matchesConfigured: true },
+    sources: [{ source: "laptop", archived: 1, searchable: 1, embedded: 0 }],
+    summaries: 0,
+    divergences: [],
+    rewinds: { total: 0, recent: [] },
   })
 })
 

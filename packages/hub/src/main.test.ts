@@ -3,7 +3,10 @@ import { Database } from "bun:sqlite"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { SCHEMA_VERSION } from "./archive/index.ts"
+import { divergenceRemedy, type Snapshot } from "@opencode-recall/protocol"
+import { Effect, Option } from "effect"
+import { Archive, SCHEMA_VERSION } from "./archive/index.ts"
+import { fakeLayer } from "./fake-embedder.ts"
 
 const dirs: string[] = []
 afterEach(() => {
@@ -60,4 +63,34 @@ test("token issue prints the token once, list shows it by source without its val
   expect((await hub(dataDir, "token", "list")).stdout.split("\n").slice(1).map((l) => l.split("\t")[0])).toEqual(["2"])
   expect((await hub(dataDir, "token", "revoke", "1")).code).toBe(1)
   expect((await hub(dataDir, "token", "bogus")).code).toBe(2)
+})
+
+test("status prints the hub's view, naming a divergent session with its remedy", async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), "recall-hub-"))
+  dirs.push(dataDir)
+  Effect.runSync(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const archive = yield* Archive.make(join(dataDir, "archive.db"))
+        const sourceId = (name: string) =>
+          Effect.map(Effect.flatMap(archive.issueToken(name), archive.authenticate), (s) => Option.getOrThrow(s).id)
+        const snapshot = (contentHash: string): Snapshot => ({
+          session: { id: "ses_a", slug: "s", title: "Shared work", directory: "/w", parentId: null, timeCreated: 1, timeUpdated: 2, messages: [] },
+          revision: 1,
+          lastActivity: 2,
+          contentHash,
+          extractorVersion: 1,
+        })
+        yield* archive.putSnapshot(snapshot("one"), yield* sourceId("laptop"))
+        yield* archive.putSnapshot(snapshot("two"), yield* sourceId("desktop"))
+      }),
+    ).pipe(Effect.provide(fakeLayer())),
+  )
+
+  const status = await hub(dataDir, "status")
+  expect(status.code).toBe(0)
+  expect(status.stdout).toContain("sessions archived: 1\n  from laptop: 1 archived, 0 searchable, 0 embedded")
+  expect(status.stdout).toContain('hash_divergence: 1 session where two hosts hold different copies\n  ses_a "Shared work": archived copy from laptop; desktop\'s copy refused')
+  expect(status.stdout).toContain(`remedy: ${divergenceRemedy({ heldFrom: "laptop", refusedFrom: "desktop" })}`)
+  expect((await hub(dataDir, "status", "extra")).code).toBe(2)
 })

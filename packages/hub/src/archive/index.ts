@@ -68,6 +68,10 @@ export interface Interface {
    *
    * A tombstoned session is `tombstoned` unless the snapshot's last activity is after the deletion
    * time; such a snapshot is archived and clears the tombstone.
+   *
+   * A `rewound` acceptance is recorded, and a `hash_divergence` is kept as a condition of the
+   * session until a copy of it is accepted, it is deleted, or the refused source sends the held
+   * content; see `status`.
    */
   readonly putSnapshot: (snapshot: Snapshot, sourceId: number) => Effect.Effect<PutResult>
   /**
@@ -131,6 +135,7 @@ export interface Interface {
   readonly revokeToken: (id: number) => Effect.Effect<boolean>
   /** The source a presented token maps to. Compares against every live token in constant time. */
   readonly authenticate: (token: string) => Effect.Effect<Option.Option<Source>>
+  /** Counts, the active space, and the recorded rewinds and standing divergences, in one read. */
   readonly status: () => Effect.Effect<Responses["status"]>
 }
 
@@ -199,6 +204,7 @@ const INSPECT_SEMANTIC_MIN = 0.55
 const OUTLINE_CHARS = 120
 const TOOL_TITLE_CHARS = 80
 const TOOL_ERROR_CHARS = 200
+const RECENT_REWINDS = 5
 
 /** The space this binary builds for `model`. Key order is fixed, since the JSON is the identity. */
 function recipeFor(model: EmbeddingModel): SpaceRecipe {
@@ -543,6 +549,39 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
   )
   const selectSegmentText = db.prepare("SELECT text FROM segment_text WHERE id = ?")
   const countSessions = db.prepare("SELECT count(*) AS n FROM sessions")
+  const countSummaries = db.prepare("SELECT count(*) AS n FROM summaries")
+  const selectSourceCounts = db.prepare(
+    `SELECT coalesce(src.name, '') AS source, count(*) AS archived,
+       coalesce(sum(EXISTS (SELECT 1 FROM messages m JOIN parts p ON p.message_id = m.id JOIN segments seg ON seg.part_id = p.id
+         WHERE m.session_id = s.id)), 0) AS searchable,
+       coalesce(sum(EXISTS (SELECT 1 FROM chunks c WHERE c.session_id = s.id AND c.chunk_set_id = $setId)
+         AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.session_id = s.id AND c.chunk_set_id = $setId
+           AND NOT EXISTS (SELECT 1 FROM vectors v WHERE v.chunk_id = c.id AND v.space_id = $spaceId))), 0) AS embedded
+     FROM sessions s LEFT JOIN sources src ON src.id = s.source_id
+     GROUP BY s.source_id ORDER BY source`,
+  )
+  const upsertDivergence = db.prepare(
+    `INSERT INTO divergences (session_id, source_id, content_hash, time_first, time_last)
+     VALUES ($sessionId, $sourceId, $contentHash, $time, $time)
+     ON CONFLICT DO UPDATE SET content_hash = excluded.content_hash, time_last = excluded.time_last`,
+  )
+  const deleteDivergence = db.prepare("DELETE FROM divergences WHERE session_id = ? AND source_id = ?")
+  const selectDivergences = db.prepare(
+    `SELECT d.session_id AS sessionId, s.title, coalesce(held.name, '') AS heldFrom, refused.name AS refusedFrom,
+       d.time_first AS timeFirst, d.time_last AS timeLast
+     FROM divergences d JOIN sessions s ON s.id = d.session_id
+     LEFT JOIN sources held ON held.id = s.source_id JOIN sources refused ON refused.id = d.source_id
+     ORDER BY d.time_first, d.session_id`,
+  )
+  const insertRewind = db.prepare(
+    `INSERT INTO rewinds (session_id, source_id, from_revision, to_revision, time)
+     VALUES ($sessionId, $sourceId, $from, $to, $time)`,
+  )
+  const countRewinds = db.prepare("SELECT count(*) AS n FROM rewinds")
+  const selectRecentRewinds = db.prepare(
+    `SELECT r.session_id AS sessionId, src.name AS source, r.from_revision AS fromRevision, r.to_revision AS toRevision, r.time
+     FROM rewinds r JOIN sources src ON src.id = r.source_id ORDER BY r.id DESC LIMIT ${RECENT_REWINDS}`,
+  )
   const selectTombstone = db.prepare("SELECT time_deleted AS timeDeleted FROM tombstones WHERE session_id = ?")
   const deleteTombstone = db.prepare("DELETE FROM tombstones WHERE session_id = ?")
   const upsertTombstone = db.prepare(
@@ -597,8 +636,14 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
     if (tombstone && snapshot.lastActivity <= tombstone.timeDeleted) return { result: "tombstoned", reused: [] }
     const held = selectHeld.get(session.id) as Held | null
     const result = held ? resolve(snapshot, held) : "archived"
+    if (result === "hash_divergence")
+      upsertDivergence.run({ sessionId: session.id, sourceId, contentHash: snapshot.contentHash, time: Date.now() })
+    // This source now holds the archived content, so it no longer diverges.
+    if (result === "unchanged") deleteDivergence.run(session.id, sourceId)
     if (result !== "archived" && result !== "rewound") return { result, reused: [] }
 
+    if (result === "rewound" && held)
+      insertRewind.run({ sessionId: session.id, sourceId, from: held.revision, to: snapshot.revision, time: Date.now() })
     if (tombstone) deleteTombstone.run(session.id)
     // A growing session re-renders mostly the same chunks; their vectors survive the replace.
     const prior = new Map(
@@ -908,6 +953,13 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
       chunks: (countChunks.get(space.setId) as { n: number }).n,
       embeddedChunks: (countVectors.get(space.id) as { n: number }).n,
       activeSpace: { recipe: space.recipe, matchesConfigured },
+      sources: selectSourceCounts.all({ setId: space.setId, spaceId: space.id }) as Responses["status"]["sources"],
+      summaries: (countSummaries.get() as { n: number }).n,
+      divergences: selectDivergences.all() as Responses["status"]["divergences"],
+      rewinds: {
+        total: (countRewinds.get() as { n: number }).n,
+        recent: selectRecentRewinds.all() as Responses["status"]["rewinds"]["recent"],
+      },
     }),
   )
 

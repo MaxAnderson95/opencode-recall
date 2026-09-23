@@ -55,7 +55,7 @@ const tool = (hubConfig: Option.Option<PluginConfig.Hub>) =>
     SearchTool.make().pipe(
       Effect.provide(
         Layer.mergeAll(
-          Layer.succeed(PluginConfig.Service, { hub: Effect.succeed(hubConfig), summaryModel: Effect.succeed(PluginConfig.DEFAULT_SUMMARY_MODEL) }),
+          Layer.succeed(PluginConfig.Service, { hub: Effect.succeed(hubConfig), hubSource: Effect.succeed("test"), summaryModel: Effect.succeed(PluginConfig.DEFAULT_SUMMARY_MODEL) }),
           Source.fromDatabase(laptop.db),
         ),
       ),

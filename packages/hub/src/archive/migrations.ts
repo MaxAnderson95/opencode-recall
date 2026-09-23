@@ -145,6 +145,27 @@ export const migrations: readonly string[] = [
     PRIMARY KEY (session_id, content_hash, provider, model, variant, focus, recipe)
   ) WITHOUT ROWID;
   `,
+  // A divergence is one source's copy refused at the held copy's position with other content. The
+  // cascade clears it once any copy is accepted or the session is deleted, since either replaces
+  // the copy it diverged from. Rewinds are a history of acceptances, so they outlive the row.
+  `
+  CREATE TABLE divergences (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    source_id INTEGER NOT NULL REFERENCES sources(id),
+    content_hash TEXT NOT NULL,
+    time_first INTEGER NOT NULL,
+    time_last INTEGER NOT NULL,
+    PRIMARY KEY (session_id, source_id)
+  ) WITHOUT ROWID;
+  CREATE TABLE rewinds (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    source_id INTEGER NOT NULL REFERENCES sources(id),
+    from_revision INTEGER NOT NULL,
+    to_revision INTEGER NOT NULL,
+    time INTEGER NOT NULL
+  );
+  `,
 ]
 
 /** The first schema version with segments; parts archived before it are segmented on migration. */

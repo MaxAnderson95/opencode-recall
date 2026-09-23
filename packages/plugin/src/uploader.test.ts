@@ -116,7 +116,8 @@ async function start(
     enqueue: (sessionId: string) => run((u) => u.enqueue(sessionId)),
     delete: (sessionId: string, deletion: Uploader.Deletion) => run((u) => u.delete(sessionId, deletion)),
     reconcile: () => run((u) => u.reconcile),
-    pausedBy: () => run((u) => u.pausedBy.pipe(Effect.map(Option.getOrNull))),
+    pausedBy: () => run((u) => u.state.pipe(Effect.map((s) => Option.getOrNull(s.pausedBy)), Effect.orDie)),
+    state: () => run((u) => Effect.orDie(u.state)),
     stop: () => runtime.dispose(),
   }
   uploaders.push(uploader)
@@ -339,10 +340,14 @@ test("invalid_token pauses the queue without losing work, and a fixed config fil
   await Bun.sleep(30)
   expect(status()).toMatchObject({ sessions: 0 })
   expect([...entries.keys()].map((key) => key.split("/")[1]).sort()).toEqual(["ses_a", "ses_b"])
+  expect(await uploader.state()).toMatchObject({ queued: 2, local: 2, answered: 0 })
+  expect(Option.getOrThrow((await uploader.state()).lastError).message).toStartWith("uploads paused until configuration is fixed: invalid_token")
 
   configure()
   await until(() => status().sessions === 2)
   expect(await uploader.pausedBy()).toBeNull()
+  await until(async () => (await uploader.state()).answered === 2)
+  expect(await uploader.state()).toMatchObject({ queued: 0, local: 2 })
 })
 
 test("a missing token pauses the queue until the config provides one", async () => {
@@ -522,9 +527,13 @@ test("a rebuilt host with a new token uploads nothing for sessions the hub holds
   writeConfig({ url: hub.url.href, token: sync(archive.issueToken("laptop-rebuilt")) })
   source.db.run("UPDATE event_sequence SET seq = seq + 5 WHERE aggregate_id = 'ses_b'")
   const rebuilt = await start(memoryStorage().storage, { sweepIntervalMs: 10 })
+  expect(Option.isNone((await rebuilt.state()).lastReconciled)).toBe(true)
   await rebuilt.reconcile()
   await Bun.sleep(60)
   expect(outcomes).toHaveLength(2)
+  // Backfill needs nothing: the manifest already answers every local session.
+  expect(await rebuilt.state()).toMatchObject({ queued: 0, local: 2, answered: 2, reconciling: false })
+  expect(Option.isSome((await rebuilt.state()).lastReconciled)).toBe(true)
 })
 
 test("a session tombstoned on the hub but still present locally is not re-uploaded on every sweep", async () => {

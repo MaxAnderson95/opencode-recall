@@ -193,6 +193,60 @@ describe.each(backends)("archive ($name)", ({ path }) => {
       expect(archive.putSnapshot(preRewind, desktop)).toBe("stale_revision")
       expect(archive.putSnapshot(rewound, laptop)).toBe("unchanged")
     }
+    expect(archive.status().rewinds).toEqual({
+      total: 1,
+      recent: [{ sessionId: "ses_a", source: "laptop", fromRevision: 9, toRevision: 6, time: expect.any(Number) }],
+    })
+  })
+
+  test("a hash_divergence stays in status until a copy is accepted or the refused host sends the held content", async () => {
+    const archive = open(path())
+    const [laptop, desktop] = [sourceOf(archive, "laptop"), sourceOf(archive, "desktop")]
+    const held = session("ses_a", ["one", "two"])
+    const other = session("ses_a", ["one", "deux"], { revision: held.revision, lastActivity: held.lastActivity })
+    archive.putSnapshot(held, laptop)
+    expect(archive.status().divergences).toEqual([])
+
+    expect(archive.putSnapshot(other, desktop)).toBe("hash_divergence")
+    expect(archive.putSnapshot(other, desktop)).toBe("hash_divergence")
+    const [divergence] = archive.status().divergences
+    expect(divergence).toMatchObject({ sessionId: "ses_a", title: "title", heldFrom: "laptop", refusedFrom: "desktop" })
+    expect(divergence!.timeLast).toBeGreaterThanOrEqual(divergence!.timeFirst)
+    // Another host's no-op says nothing about the refused copy.
+    expect(archive.putSnapshot(held, laptop)).toBe("unchanged")
+    expect(archive.status().divergences).toHaveLength(1)
+
+    expect(archive.putSnapshot(held, desktop)).toBe("unchanged")
+    expect(archive.status().divergences).toEqual([])
+
+    archive.putSnapshot(other, desktop)
+    // The remedy: a rename on the host whose copy is kept moves its activity past the held position.
+    const renamed = { ...other, revision: other.revision + 1, lastActivity: other.lastActivity + 1, contentHash: "renamed" }
+    expect(archive.putSnapshot(renamed, desktop)).toBe("archived")
+    expect(archive.status().divergences).toEqual([])
+
+    archive.putSnapshot(held, laptop)
+    archive.putTombstone({ sessionId: "ses_a", revision: 9, timeDeleted: 99 }, laptop)
+    expect(archive.status().divergences).toEqual([])
+  })
+
+  test("status counts sessions per source as archived, searchable, and embedded, and counts cached summaries", async () => {
+    const archive = open(path())
+    const [laptop, desktop] = [sourceOf(archive, "laptop"), sourceOf(archive, "desktop")]
+    archive.putSnapshot(session("ses_a", ["one"]), laptop)
+    archive.putSnapshot(session("ses_b", ["two"]), laptop)
+    const toolOnly = single("ses_c", "", { part: { kind: "tool", tool: "bash", title: "ls", status: "running", text: "", searchable: false } })
+    archive.putSnapshot({ ...toolOnly, contentHash: "tool-only" }, desktop)
+    expect(archive.status().sources).toEqual([
+      { source: "desktop", archived: 1, searchable: 0, embedded: 0 },
+      { source: "laptop", archived: 2, searchable: 2, embedded: 0 },
+    ])
+    while (await archive.embedPending(1));
+    expect(archive.status().sources).toContainEqual({ source: "laptop", archived: 2, searchable: 2, embedded: 2 })
+
+    const key = { provider: "p", model: "m", focus: "", recipe: 1 }
+    archive.putSummary({ ...key, sessionId: "ses_a", contentHash: "one", summary: "s", omitted: 0, clipped: 0 })
+    expect(archive.status().summaries).toBe(1)
   })
 
   test("a tombstone deletes the session and rejects snapshots active at or before the deletion", async () => {
@@ -812,6 +866,20 @@ describe.each(backends)("archive ($name)", ({ path }) => {
 })
 
 describe("archive (file-backed only)", () => {
+  test("a divergence and a rewind are still reported after the archive is reopened", async () => {
+    const path = tempPath()
+    const archive = open(path)
+    const [laptop, desktop] = [sourceOf(archive, "laptop"), sourceOf(archive, "desktop")]
+    archive.putSnapshot(session("ses_a", ["one", "two"], { revision: 9 }), laptop)
+    archive.putSnapshot(session("ses_a", ["one"], { revision: 3, lastActivity: 20 }), laptop)
+    archive.putSnapshot(session("ses_a", ["uno"], { revision: 3, lastActivity: 20 }), desktop)
+    archive.close()
+
+    const reopened = open(path).status()
+    expect(reopened.divergences).toMatchObject([{ sessionId: "ses_a", heldFrom: "laptop", refusedFrom: "desktop" }])
+    expect(reopened.rewinds).toMatchObject({ total: 1, recent: [{ fromRevision: 9, toRevision: 3 }] })
+  })
+
   test("stores sessions, messages, and parts rows, and a replace leaves no stale rows", async () => {
     const path = tempPath()
     const archive = open(path)

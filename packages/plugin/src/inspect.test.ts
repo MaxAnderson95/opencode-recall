@@ -53,7 +53,7 @@ afterEach(async () => {
 const context = { sessionID: "ses_self" } as unknown as ToolContext
 
 const layer = (hubConfig: Option.Option<PluginConfig.Hub>) =>
-  Layer.mergeAll(Layer.succeed(PluginConfig.Service, { hub: Effect.succeed(hubConfig), summaryModel: Effect.succeed(PluginConfig.DEFAULT_SUMMARY_MODEL) }), Source.fromDatabase(laptop.db))
+  Layer.mergeAll(Layer.succeed(PluginConfig.Service, { hub: Effect.succeed(hubConfig), hubSource: Effect.succeed("test"), summaryModel: Effect.succeed(PluginConfig.DEFAULT_SUMMARY_MODEL) }), Source.fromDatabase(laptop.db))
 
 type Tool = Effect.Success<ReturnType<typeof InspectTool.make>> | Effect.Success<ReturnType<typeof ExpandTool.make>>
 
