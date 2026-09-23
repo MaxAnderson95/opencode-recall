@@ -29,8 +29,19 @@ export const Session = z.object({
   messages: z.array(Message),
 })
 
+/** One session as the host read it, with the §5 position fields read in the same transaction. */
+export const Snapshot = z.object({
+  session: Session,
+  /** `event_sequence.seq` for the session. */
+  revision: z.number().int().nonnegative(),
+  /** The later of the newest message's creation time and the session's `time_updated`. */
+  lastActivity: z.number().int(),
+  contentHash: z.string().min(1),
+  extractorVersion: z.number().int().positive(),
+})
+
 export const requests = {
-  snapshot: z.object({ protocolVersion: version, session: Session }),
+  snapshot: z.object({ protocolVersion: version, ...Snapshot.shape }),
   status: z.object({ protocolVersion: version }),
 }
 
@@ -44,15 +55,37 @@ export type Verb = keyof typeof requests
 export type Part = z.infer<typeof Part>
 export type Message = z.infer<typeof Message>
 export type Session = z.infer<typeof Session>
+export type Snapshot = z.infer<typeof Snapshot>
 export type Request<V extends Verb> = z.infer<(typeof requests)[V]>
 
 export type Responses = {
-  snapshot: { outcome: "archived" }
+  /**
+   * `unchanged`: the hub already holds this content, so nothing was written.
+   * `rewound`: accepted at a later position whose revision is not higher than the one held.
+   */
+  snapshot: { outcome: "archived" | "rewound" | "unchanged" }
   status: { sessions: number }
 }
 
-export type ErrorCode = "invalid_token" | "protocol_version" | "invalid_request" | "unknown_verb" | "internal"
+export type ErrorCode =
+  | "invalid_token"
+  | "protocol_version"
+  | "invalid_request"
+  | "unknown_verb"
+  | "stale_revision"
+  | "hash_divergence"
+  | "payload_too_large"
+  | "rate_limited"
+  | "request_timeout"
+  | "internal"
 export type ErrorBody = { error: { code: ErrorCode; message: string } }
+
+/** Codes a proxy in front of the hub can produce without the hub's error envelope. */
+const CODE_BY_STATUS: Partial<Record<number, ErrorCode>> = {
+  408: "request_timeout",
+  413: "payload_too_large",
+  429: "rate_limited",
+}
 
 export class HubError extends Error {
   constructor(
@@ -72,24 +105,28 @@ export type ClientOptions = {
   fetch?: (url: string, init: RequestInit) => Promise<Response>
 }
 
-/** Typed client for the hub's `POST /v1/<verb>` API. Non-2xx responses throw {@link HubError}. */
+/**
+ * Typed client for the hub's `POST /v1/<verb>` API. Bodies are gzip-encoded, since Bun's
+ * `fetch` never compresses a request on its own. Non-2xx responses throw {@link HubError}.
+ */
 export function createClient({ url, token, fetch: fetcher = fetch }: ClientOptions) {
   const base = url.replace(/\/+$/, "")
 
   async function call<V extends Verb>(verb: V, input: Omit<Request<V>, "protocolVersion">): Promise<Responses[V]> {
     const res = await fetcher(`${base}/v1/${verb}`, {
       method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-      body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, ...input }),
+      headers: { "content-type": "application/json", "content-encoding": "gzip", authorization: `Bearer ${token}` },
+      body: Bun.gzipSync(JSON.stringify({ protocolVersion: PROTOCOL_VERSION, ...input })),
     })
     if (res.ok) return (await res.json()) as Responses[V]
     // A proxy in front of the hub can answer with any body, so the envelope is not assumed.
     const body = (await res.json().catch(() => null)) as Partial<ErrorBody> | null
-    throw new HubError(body?.error?.code ?? "internal", body?.error?.message ?? `HTTP ${res.status}`, res.status)
+    const code = body?.error?.code ?? CODE_BY_STATUS[res.status] ?? "internal"
+    throw new HubError(code, body?.error?.message ?? `HTTP ${res.status}`, res.status)
   }
 
   return {
-    snapshot: (session: Session) => call("snapshot", { session }),
+    snapshot: (snapshot: Snapshot) => call("snapshot", snapshot),
     status: () => call("status", {}),
   }
 }

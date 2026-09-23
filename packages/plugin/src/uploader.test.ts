@@ -1,71 +1,94 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
+import { Database } from "bun:sqlite"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { PROTOCOL_VERSION, type Client, type ErrorBody, type Session } from "@opencode-recall/protocol"
-import { openArchive } from "../../hub/src/archive/index.ts"
-import { createLog } from "../../hub/src/log.ts"
-import { serve } from "../../hub/src/serve.ts"
+import { PROTOCOL_VERSION, type ErrorBody, type ErrorCode } from "@opencode-recall/protocol"
+import { openArchive, type Archive } from "../../hub/src/archive/index.ts"
+import { DEFAULT_LIMITS, createHandler, type Limits } from "../../hub/src/server.ts"
 import { loadHubConfig } from "./config.ts"
-import { createUploader, type Uploader } from "./uploader.ts"
+import { sourceDb, type SourceDb } from "./fixture.ts"
+import { readPosition, readSnapshot } from "./source.ts"
+import { createUploader, type Storage, type Uploader } from "./uploader.ts"
+
+type Json = Parameters<Storage["set"]>[1]
+
+/** `ctx.storage` as OpenCode implements it: prefix scan over keys with the namespace stripped. */
+function memoryStorage() {
+  const entries = new Map<string, Json>()
+  const storage: Storage = {
+    set: async (key, value) => void entries.set(key, value),
+    remove: async (key) => void entries.delete(key),
+    scan: async ({ prefix }) => ({
+      entries: [...entries].filter(([key]) => key.startsWith(prefix)).map(([key, value]) => ({ key, value })),
+    }),
+  }
+  return { storage, entries }
+}
+
+type Intercept = (req: Request, forward: (req: Request) => Promise<Response>) => Promise<Response>
 
 let dir: string
 let configFile: string
-let hub: ReturnType<typeof serve>
-let uploader: Uploader | undefined
+let archive: Archive
+let hub: ReturnType<typeof Bun.serve>
+let source: SourceDb
+let intercept: Intercept
+/** The outcome or error code of every snapshot request that reached the hub. */
+let outcomes: string[]
+const uploaders: Uploader[] = []
+
+function startHub(limits: Limits = DEFAULT_LIMITS) {
+  const handler = createHandler({ archive, log: () => {}, limits })
+  const forward = async (req: Request) => {
+    const res = await handler(req)
+    if (new URL(req.url).pathname === "/v1/snapshot") {
+      const body = (await res.clone().json()) as { outcome?: string } & Partial<ErrorBody>
+      outcomes.push(body.outcome ?? body.error!.code)
+    }
+    return res
+  }
+  hub = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: (req) => intercept(req, forward) })
+}
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "recall-uploader-"))
   configFile = join(dir, "recall.json")
-  hub = serve({ dataDir: join(dir, "hub"), listen: "127.0.0.1:0", logLevel: "error" }, createLog("error", () => {}))
+  archive = openArchive(join(dir, "archive.db"))
+  intercept = (req, forward) => forward(req)
+  outcomes = []
+  startHub()
+  source = sourceDb()
+  source.addSession("ses_a")
+  source.addMessage("ses_a", "user", { text: "first" }, 101)
 })
 
 afterEach(async () => {
-  uploader?.stop()
-  await hub.stop()
+  for (const u of uploaders.splice(0)) u.stop()
+  await hub.stop(true)
+  archive.close()
+  source.close()
   rmSync(dir, { recursive: true, force: true })
 })
 
 const writeConfig = (hubConfig: { url?: string; token?: string }) =>
   writeFileSync(configFile, JSON.stringify({ index: { excludeDirectories: [] }, hub: hubConfig }))
 
-function issueToken(): string {
-  const admin = openArchive(join(dir, "hub", "archive.db"))
-  const token = admin.issueToken("laptop")
-  admin.close()
-  return token
-}
+const configure = () => writeConfig({ url: hub.url.href, token: archive.issueToken("laptop") })
 
-function archivedCount(): number {
-  const admin = openArchive(join(dir, "hub", "archive.db"))
-  const { sessions } = admin.status()
-  admin.close()
-  return sessions
-}
-
-const session = (id: string): Session => ({
-  id,
-  slug: "slug",
-  title: "title",
-  directory: "/work",
-  parentId: null,
-  timeCreated: 1,
-  timeUpdated: 2,
-  messages: [],
-})
-
-function start() {
-  const uploads: string[] = []
-  uploader = createUploader({
-    upload: async (client: Client, sessionId) => {
-      uploads.push(sessionId)
-      await client.snapshot(session(sessionId))
-    },
+function start(storage: Storage = memoryStorage().storage, timing: { quietMs?: number; retryMs?: number } = {}) {
+  const uploader = createUploader({
+    source: { position: (id) => readPosition(source.db, id), snapshot: (id) => readSnapshot(source.db, id) },
+    storage,
     loadConfig: () => loadHubConfig({}, configFile),
+    quietMs: 5,
+    retryMs: 10,
     probeIntervalMs: 5,
     log: () => {},
+    ...timing,
   })
-  return { uploader, uploads }
+  uploaders.push(uploader)
+  return uploader
 }
 
 async function until(condition: () => boolean) {
@@ -73,62 +96,241 @@ async function until(condition: () => boolean) {
   expect(condition()).toBe(true)
 }
 
+function archivedTexts(): string[] {
+  const db = new Database(join(dir, "archive.db"), { readonly: true })
+  const rows = db
+    .query("SELECT parts.text FROM parts JOIN messages ON messages.id = message_id ORDER BY messages.ordinal")
+    .all() as { text: string }[]
+  db.close()
+  return rows.map((row) => row.text)
+}
+
+test("updating a session uploads a newer revision that replaces the archived copy", async () => {
+  configure()
+  const { storage, entries } = memoryStorage()
+  const uploader = start(storage)
+  uploader.enqueue("ses_a")
+  await until(() => outcomes.length === 1)
+
+  source.addMessage("ses_a", "user", { text: "second" }, 102)
+  uploader.enqueue("ses_a")
+  await until(() => outcomes.length === 2)
+  expect(outcomes).toEqual(["archived", "archived"])
+  expect(archivedTexts()).toEqual(["first", "second"])
+  await until(() => entries.size === 0)
+})
+
+test("a lost acknowledgement is retried and the retry is a no-op", async () => {
+  configure()
+  let dropped = false
+  intercept = async (req, forward) => {
+    const res = await forward(req)
+    if (dropped || new URL(req.url).pathname !== "/v1/snapshot") return res
+    dropped = true
+    return new Response("upstream reset", { status: 502 })
+  }
+  const { storage, entries } = memoryStorage()
+  start(storage).enqueue("ses_a")
+
+  await until(() => outcomes.length === 2)
+  expect(outcomes).toEqual(["archived", "unchanged"])
+  await until(() => entries.size === 0)
+  expect(archive.status()).toEqual({ sessions: 1 })
+})
+
+test("a change made while an upload is in flight is still uploaded afterwards", async () => {
+  configure()
+  let release!: () => void
+  const held = new Promise<void>((resolve) => (release = resolve))
+  let first = true
+  intercept = async (req, forward) => {
+    const res = await forward(req)
+    if (first && new URL(req.url).pathname === "/v1/snapshot") {
+      first = false
+      await held
+    }
+    return res
+  }
+  const { storage, entries } = memoryStorage()
+  const uploader = start(storage)
+  uploader.enqueue("ses_a")
+  await until(() => outcomes.length === 1)
+
+  source.addMessage("ses_a", "user", { text: "mid-flight" }, 102)
+  uploader.enqueue("ses_a")
+  await Bun.sleep(20)
+  release()
+
+  await until(() => outcomes.length === 2)
+  expect(archivedTexts()).toEqual(["first", "mid-flight"])
+  await until(() => entries.size === 0)
+})
+
+test("two plugin instances uploading the same session converge on one correct copy", async () => {
+  configure()
+  const { storage, entries } = memoryStorage()
+  // Every instance receives every event, so both see each change.
+  const instances = [start(storage), start(storage)]
+  for (const text of ["two", "three", "four"]) {
+    source.addMessage("ses_a", "user", { text }, 100 + text.length)
+    for (const instance of instances) instance.enqueue("ses_a")
+    await Bun.sleep(15)
+  }
+
+  await until(() => entries.size === 0)
+  await Bun.sleep(30)
+  expect(archivedTexts()).toEqual(["first", "two", "three", "four"])
+  expect(outcomes.every((o) => o === "archived" || o === "unchanged")).toBe(true)
+  expect(archive.status()).toEqual({ sessions: 1 })
+})
+
+test("an old acknowledgement never removes another instance's newer work", async () => {
+  configure()
+  const { storage, entries } = memoryStorage()
+  // Instance A's acknowledgement stops after it has read the work list and before it removes anything.
+  let reachedRemove!: () => void
+  const removing = new Promise<void>((resolve) => (reachedRemove = resolve))
+  let release!: () => void
+  const released = new Promise<void>((resolve) => (release = resolve))
+  const held: Storage = {
+    ...storage,
+    remove: async (key) => {
+      reachedRemove()
+      await released
+      return storage.remove(key)
+    },
+  }
+  // B is already running with an empty work list; it only sees the second change.
+  const b = start(storage, { quietMs: 100 })
+  const a = start(held)
+  a.enqueue("ses_a")
+  await removing
+
+  // A shuts down with its acknowledgement in flight while B records a newer change.
+  a.stop()
+  source.addMessage("ses_a", "user", { text: "second" }, 102)
+  b.enqueue("ses_a")
+  await until(() => [...entries.values()].some((entry) => (entry as { revision: number }).revision === 3))
+  release()
+
+  await until(() => outcomes.length === 2)
+  expect(archivedTexts()).toEqual(["first", "second"])
+  await until(() => entries.size === 0)
+})
+
+test("a burst of child-turn events produces one upload after the quiet period", async () => {
+  configure()
+  const uploader = start(memoryStorage().storage, { quietMs: 50 })
+  for (let turn = 0; turn < 20; turn++) {
+    source.addMessage("ses_a", "assistant", { content: [{ type: "text", text: `child ${turn}` }] }, 200 + turn)
+    uploader.enqueue("ses_a")
+    await Bun.sleep(1)
+  }
+  await until(() => outcomes.length === 1)
+  await Bun.sleep(100)
+  expect(outcomes).toEqual(["archived"])
+  expect(archivedTexts()).toHaveLength(21)
+})
+
+test("an entry left in the work list by an earlier run is uploaded at startup", async () => {
+  configure()
+  const { storage, entries } = memoryStorage()
+  await storage.set("dirty/ses_a/101-2", readPosition(source.db, "ses_a")!)
+  start(storage)
+  await until(() => outcomes.length === 1 && entries.size === 0)
+  expect(archivedTexts()).toEqual(["first"])
+})
+
+test("an oversize snapshot is rejected as payload_too_large and not retried", async () => {
+  await hub.stop(true)
+  startHub({ ...DEFAULT_LIMITS, decompressedBytes: 2_000 })
+  configure()
+  source.addMessage("ses_a", "user", { text: "x".repeat(5_000) }, 102)
+  const { storage, entries } = memoryStorage()
+  start(storage).enqueue("ses_a")
+
+  await until(() => entries.size === 0)
+  await Bun.sleep(50)
+  expect(outcomes).toEqual(["payload_too_large"])
+  expect(archive.status()).toEqual({ sessions: 0 })
+})
+
+test.each<[ErrorCode | number, "retried" | "dropped"]>([
+  ["rate_limited", "retried"],
+  ["request_timeout", "retried"],
+  [503, "retried"],
+  ["stale_revision", "dropped"],
+  ["hash_divergence", "dropped"],
+  ["payload_too_large", "dropped"],
+  ["invalid_request", "dropped"],
+])("a %s answer is %s", async (answer, expected) => {
+  configure()
+  let requests = 0
+  intercept = async (req, forward) => {
+    if (new URL(req.url).pathname !== "/v1/snapshot" || requests++ > 0) return forward(req)
+    if (typeof answer === "number") return new Response("unavailable", { status: answer })
+    const status = { rate_limited: 429, request_timeout: 408, payload_too_large: 413, invalid_request: 400 }[answer as string] ?? 409
+    return Response.json({ error: { code: answer, message: "stub" } } satisfies ErrorBody, { status })
+  }
+  const { storage, entries } = memoryStorage()
+  start(storage).enqueue("ses_a")
+
+  await until(() => entries.size === 0)
+  await Bun.sleep(50)
+  expect(requests).toBe(expected === "retried" ? 2 : 1)
+  expect(archive.status()).toEqual({ sessions: expected === "retried" ? 1 : 0 })
+})
+
 test("invalid_token pauses the queue without losing work, and a fixed config file resumes it", async () => {
   writeConfig({ url: hub.url.href, token: "opencode-recall_revoked" })
-  const { uploader, uploads } = start()
+  source.addSession("ses_b")
+  const { storage, entries } = memoryStorage()
+  const uploader = start(storage)
 
   uploader.enqueue("ses_a")
   await until(() => uploader.pausedBy !== null)
   expect(uploader.pausedBy).toStartWith("invalid_token")
   uploader.enqueue("ses_b")
   await Bun.sleep(30)
-  expect(uploads).toEqual(["ses_a"])
-  expect(archivedCount()).toBe(0)
+  expect(archive.status()).toEqual({ sessions: 0 })
+  expect([...entries.keys()].map((key) => key.split("/")[1]).sort()).toEqual(["ses_a", "ses_b"])
 
-  writeConfig({ url: hub.url.href, token: issueToken() })
-  await until(() => archivedCount() === 2)
+  configure()
+  await until(() => archive.status().sessions === 2)
   expect(uploader.pausedBy).toBeNull()
 })
 
 test("a missing token pauses the queue until the config provides one", async () => {
   writeConfig({ url: hub.url.href })
-  const { uploader, uploads } = start()
+  const uploader = start()
 
   uploader.enqueue("ses_a")
   await until(() => uploader.pausedBy !== null)
-  expect(uploads).toEqual([])
+  expect(outcomes).toEqual([])
 
-  writeConfig({ url: hub.url.href, token: issueToken() })
-  await until(() => archivedCount() === 1)
+  configure()
+  await until(() => archive.status().sessions === 1)
 })
 
 test("protocol_version pauses the queue and it resumes once the hub accepts the client", async () => {
   let hubVersion = PROTOCOL_VERSION + 1
-  const stub = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    fetch: async (req) => {
-      if (hubVersion !== PROTOCOL_VERSION) {
-        const error = { code: "protocol_version", message: `this hub serves version ${hubVersion}` } as const
-        return Response.json({ error } satisfies ErrorBody, { status: 400 })
-      }
-      return Response.json(new URL(req.url).pathname.endsWith("/status") ? { sessions: 0 } : { outcome: "archived" })
-    },
-  })
-  try {
-    writeConfig({ url: stub.url.href, token: "opencode-recall_any" })
-    const { uploader, uploads } = start()
-
-    uploader.enqueue("ses_a")
-    await until(() => uploader.pausedBy !== null)
-    expect(uploader.pausedBy).toStartWith("protocol_version")
-
-    hubVersion = PROTOCOL_VERSION
-    await until(() => uploader.pausedBy === null && uploads.length === 2)
-    expect(uploads).toEqual(["ses_a", "ses_a"])
-  } finally {
-    await stub.stop()
+  let snapshots = 0
+  intercept = async (req, forward) => {
+    if (new URL(req.url).pathname === "/v1/snapshot") snapshots++
+    if (hubVersion === PROTOCOL_VERSION) return forward(req)
+    const error = { code: "protocol_version", message: `this hub serves version ${hubVersion}` } as const
+    return Response.json({ error } satisfies ErrorBody, { status: 400 })
   }
+  configure()
+  const uploader = start()
+
+  uploader.enqueue("ses_a")
+  await until(() => uploader.pausedBy !== null)
+  expect(uploader.pausedBy).toStartWith("protocol_version")
+
+  hubVersion = PROTOCOL_VERSION
+  await until(() => uploader.pausedBy === null && archive.status().sessions === 1)
+  expect(snapshots).toBe(2)
 })
 
 test("the environment overrides the config file's hub URL and token", async () => {
