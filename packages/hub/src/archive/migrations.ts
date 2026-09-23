@@ -70,4 +70,24 @@ export const migrations: readonly string[] = [
   ALTER TABLE parts ADD COLUMN error TEXT;
   ALTER TABLE parts ADD COLUMN searchable INTEGER NOT NULL DEFAULT 1;
   `,
+  // Offsets are zero-based UTF-8 byte positions in the part text, not UTF-16 units, sliced from the
+  // text cast to a BLOB: SQLite's text `substr` stops at an embedded NUL, and tool output can hold one.
+  // The FTS index keeps no text: its content is the view, so FTS rows must be deleted while their
+  // segments and parts still exist, or the delete cannot find the postings to remove.
+  `
+  CREATE TABLE segments (
+    id INTEGER PRIMARY KEY,
+    part_id INTEGER NOT NULL REFERENCES parts(id) ON DELETE CASCADE,
+    start INTEGER NOT NULL,
+    length INTEGER NOT NULL
+  );
+  CREATE INDEX segments_part_idx ON segments(part_id);
+  CREATE VIEW segment_text AS
+    SELECT segments.id AS id, CAST(substr(CAST(parts.text AS BLOB), segments.start + 1, segments.length) AS TEXT) AS text
+    FROM segments JOIN parts ON parts.id = segments.part_id;
+  CREATE VIRTUAL TABLE fts USING fts5(text, content='segment_text', content_rowid='id');
+  `,
 ]
+
+/** The first schema version with segments; parts archived before it are segmented on migration. */
+export const SEGMENTED = 6

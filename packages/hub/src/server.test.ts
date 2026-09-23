@@ -67,6 +67,26 @@ test("the typed client tombstones a session, lists it in the manifest, and a sta
   expect(error).toMatchObject({ code: "tombstoned", status: 409 })
 })
 
+test("search finds another host's session through the caller's own token and names its origin", async () => {
+  // The desktop uploads once and goes away; only the archive's copy remains.
+  const desktop = createClient({
+    url: "http://hub",
+    token: archive.issueToken("desktop"),
+    fetch: async (input, init) => handler(new Request(input, init)),
+  })
+  await desktop.snapshot(snapshot)
+
+  const { sessions } = await clientFor(handler).search({ query: "hello", limit: 8 })
+  expect(sessions).toMatchObject([{ sessionId: "ses_a", source: "desktop", ownSource: false, revision: 3 }])
+  expect(sessions[0]!.hits[0]!.snippet).toBe("«hello»")
+})
+
+test("a search with an unknown filter is rejected rather than silently widened", async () => {
+  const res = await post("search", { protocolVersion: PROTOCOL_VERSION, query: "x", limit: 8, project: "y" })
+  expect(res.status).toBe(400)
+  expect(await res.json()).toMatchObject({ error: { code: "invalid_request" } })
+})
+
 test("the client sends gzip-encoded bodies with Content-Encoding set", async () => {
   let seen: Request | undefined
   const client = createClient({
