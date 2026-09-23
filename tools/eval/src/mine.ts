@@ -3,6 +3,7 @@ import path from "node:path"
 import { Database } from "bun:sqlite"
 
 import { config, paths } from "./config.ts"
+import type { Label } from "./score.ts"
 
 const db = new Database(config.opencodeDb, { readonly: true })
 
@@ -55,25 +56,16 @@ for (const c of calls) {
   grouped.set(c.session_id, arr)
 }
 
-type Label = {
-  query: string
-  filters: { directory?: string; since?: string; until?: string; mode?: string; scope?: string }
-  relevant: string[]
-  from_session: string
-  time: number
-}
 const labels: Label[] = []
 
 for (const [, seqCalls] of grouped) {
   seqCalls.sort((a, b) => a.seq - b.seq)
-  for (let i = 0; i < seqCalls.length; i++) {
-    const c = seqCalls[i]
+  for (const [i, c] of seqCalls.entries()) {
     if (c.tool !== "recall_search") continue
     const query = typeof c.input.query === "string" ? c.input.query.trim() : ""
     if (!query) continue
     const relevant = new Set<string>()
-    for (let j = i + 1; j < seqCalls.length; j++) {
-      const n = seqCalls[j]
+    for (const n of seqCalls.slice(i + 1)) {
       if (n.tool === "recall_search") break
       const sid = n.input.session_id
       if (typeof sid === "string" && sid.startsWith("ses_")) relevant.add(sid)
@@ -101,13 +93,12 @@ console.log(`  with >1 clicked session: ${multi}`)
 const filtered = labels.filter((l) => l.filters.directory || l.filters.since || l.filters.until).length
 console.log(`  carrying a directory/date filter: ${filtered}`)
 
-// Only keep labels whose clicked sessions are actually in the recall index, or the label is unscoreable.
-const idx = new Database(config.indexDb, { readonly: true })
-const known = new Set(idx.query<{ session_id: string }, []>("select distinct session_id from chunks").all().map((r) => r.session_id))
+// Only keep labels whose clicked sessions a frozen corpus can hold (v2 sessions), or the label is unscoreable.
+const known = new Set(db.query<{ id: string }, []>("select id from session_v2").all().map((r) => r.id))
 const scoreable = labels
   .map((l) => ({ ...l, relevant: l.relevant.filter((s) => known.has(s)) }))
   .filter((l) => l.relevant.length > 0)
-console.log(`scoreable against the current index: ${scoreable.length}`)
+console.log(`scoreable against OpenCode's v2 sessions: ${scoreable.length}`)
 
 mkdirSync(path.dirname(paths.labels), { recursive: true })
 await Bun.write(paths.labels, JSON.stringify(scoreable, null, 1))

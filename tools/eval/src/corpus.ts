@@ -1,94 +1,151 @@
-/** The indexed corpus, and the query embedder that must match how it was built. */
-import { indexDb, settings } from "./retrieval.ts"
+/**
+ * A frozen corpus: a hub archive built once from OpenCode's database, the labels it is scored
+ * against, and a record of both. Scoring opens the archive through the hub's own Archive module,
+ * so the eval measures production retrieval rather than a copy of it.
+ *
+ * The record pins everything that decides a score: the labels' bytes, every archived session's
+ * content hash, the chunk and vector counts, and the vector space recipe. Opening refuses a corpus
+ * that no longer matches it, so one corpus scored twice gives identical numbers.
+ */
+import { Database } from "bun:sqlite"
+import { createHash } from "node:crypto"
+import { existsSync, mkdirSync, unlinkSync } from "node:fs"
+import path from "node:path"
+import { SCHEMA_VERSION, openArchive, type Archive } from "../../../packages/hub/src/archive/index.ts"
+import { onnxEmbedder, type Embedder } from "../../../packages/hub/src/embedder.ts"
+import { readPositions, readSnapshot } from "../../../packages/plugin/src/source.ts"
+import type { Label } from "./score.ts"
 
-export type Corpus = {
-  n: number
-  dims: number
-  /** Vectors in chunk-id order, matching the production matrix layout. */
-  mat: Float32Array
-  ids: Float64Array
-  times: Float64Array
-  sessions: string[]
-  messages: string[]
-  scopes: string[]
-  texts: string[]
+type Ingested = {
+  /** Messages created after this are left out: the time of the newest labelled search. */
+  cutoff: number
+  /** Sessions under these directories are left out, as the host's `index.excludeDirectories` would. */
+  excludeDirectories: string[]
+  labelsSha256: string
 }
 
-export function loadCorpus(): Corpus {
-  const dims = settings.embed.dims
-  const count = (indexDb.query("select count(*) c from chunks").get() as { c: number }).c
-  const out: Corpus = {
-    n: 0,
-    dims,
-    mat: new Float32Array(count * dims),
-    ids: new Float64Array(count),
-    times: new Float64Array(count),
-    sessions: new Array(count),
-    messages: new Array(count),
-    scopes: new Array(count),
-    texts: new Array(count),
-  }
-  const page = indexDb.prepare(
-    "select id, session_id, message_id, time, scope, text, emb from chunks where id > ? order by id limit 4000",
-  )
-  let i = 0
-  let last = 0
-  for (;;) {
-    const rows = page.all(last) as {
-      id: number
-      session_id: string
-      message_id: string
-      time: number
-      scope: string
-      text: string
-      emb: Uint8Array
-    }[]
-    if (!rows.length) break
-    for (const r of rows) {
-      last = r.id
-      out.ids[i] = r.id
-      out.times[i] = r.time
-      out.sessions[i] = r.session_id
-      out.messages[i] = r.message_id
-      out.scopes[i] = r.scope
-      out.texts[i] = r.text
-      const v =
-        r.emb.byteOffset % 4 === 0 && r.emb.byteLength === dims * 4
-          ? new Float32Array(r.emb.buffer, r.emb.byteOffset, dims)
-          : new Float32Array(r.emb.slice().buffer, 0, dims)
-      out.mat.set(v, i * dims)
-      i++
-    }
-  }
-  out.n = i
-  return out
-}
+type Frozen = Ingested & { fingerprint: string; frozenAt: string }
+
+const files = (dir: string) => ({
+  archive: path.join(dir, "archive.db"),
+  labels: path.join(dir, "labels.json"),
+  record: path.join(dir, "freeze.json"),
+  /** Present only between the end of ingest and the end of embedding. */
+  ingested: path.join(dir, "ingested.json"),
+})
+
+const sha256 = (data: string | Uint8Array) => createHash("sha256").update(data).digest("hex")
+
+const fingerprint = (archive: Archive) => sha256(JSON.stringify({ manifest: archive.manifest(), status: archive.status() }))
+
+const under = (roots: string[], directory: string) =>
+  roots.some((root) => directory === root || directory.startsWith(root.endsWith("/") ? root : `${root}/`))
 
 /**
- * Query vectors built the way production builds them. The prefix matters:
- * bge-family models are trained with it and omitting it measurably lowers
- * retrieval, which is easy to get wrong and hard to notice.
+ * Build a corpus in `dir` from every session in `opencodeDb` and the labels at `labelsPath`, then
+ * embed all of it. Slow: every chunk goes through the model. Rerunning after an interruption
+ * during embedding resumes it; any other existing `dir` is refused. A corpus is sealed only once
+ * every chunk is embedded in a space `embedder` matches, so resuming with a different model
+ * throws and stays resumable with the original one.
  */
-export async function embedQueries(texts: string[]): Promise<Float32Array[]> {
-  const { pipeline, env } = await import("@huggingface/transformers")
-  env.cacheDir = `${process.env.HOME}/.local/share/opencode-recall/models`
-  const pipe = (await pipeline("feature-extraction", settings.embed.model, { dtype: "q8" })) as any
-  const dims = settings.embed.dims
-  const out: Float32Array[] = []
-  for (let i = 0; i < texts.length; i += 16) {
-    const batch = texts.slice(i, i + 16).map((t) => settings.embed.queryPrefix + t)
-    const tensor = await pipe(batch, { pooling: "mean", normalize: true })
-    const d = tensor.data as Float32Array
-    for (let j = 0; j < batch.length; j++) out.push(d.slice(j * dims, (j + 1) * dims))
-    tensor.dispose?.()
+export async function freezeCorpus(opts: {
+  dir: string
+  opencodeDb: string
+  labelsPath: string
+  embedder: Embedder
+  excludeDirectories: string[]
+}): Promise<void> {
+  const f = files(opts.dir)
+  if (existsSync(f.record)) throw new Error(`${opts.dir} is already frozen; a frozen corpus is never rebuilt in place`)
+  const resuming = existsSync(f.ingested)
+  if (existsSync(opts.dir) && !resuming)
+    throw new Error(`${opts.dir} exists but was not interrupted after ingest; delete it and freeze again`)
+
+  if (!resuming) {
+    const labelBytes = await Bun.file(opts.labelsPath).bytes()
+    const labels: Label[] = JSON.parse(new TextDecoder().decode(labelBytes))
+    mkdirSync(opts.dir, { recursive: true })
+    await Bun.write(f.labels, labelBytes)
+    const ingested: Ingested = {
+      cutoff: Math.max(...labels.map((l) => l.time)),
+      excludeDirectories: opts.excludeDirectories,
+      labelsSha256: sha256(labelBytes),
+    }
+    ingest(f.archive, opts, ingested)
+    await Bun.write(f.ingested, JSON.stringify(ingested, null, 2) + "\n")
   }
-  return out
+  const ingested: Ingested = await Bun.file(f.ingested).json()
+
+  const archive = openArchive(f.archive, opts.embedder)
+  try {
+    const { chunks, embeddedChunks } = archive.status()
+    const started = Date.now()
+    let embedded = 0
+    for (let n; (n = await archive.embedPending(512)); ) {
+      embedded += n
+      const rate = embedded / ((Date.now() - started) / 1000)
+      process.stdout.write(`\r  embedded ${embeddedChunks + embedded}/${chunks} chunks, ${rate.toFixed(0)}/s   `)
+    }
+    console.log()
+    // `embedPending` also returns 0 when the embedder cannot embed into the active space.
+    const done = archive.status()
+    if (!done.activeSpace.matchesConfigured || done.embeddedChunks !== done.chunks)
+      throw new Error(
+        `${done.embeddedChunks}/${done.chunks} chunks embedded, and this embedder ` +
+          `${done.activeSpace.matchesConfigured ? "matches" : "does not match"} the corpus's vector space; ` +
+          "rerun freeze with the embedder it was started with",
+      )
+    const record: Frozen = { ...ingested, fingerprint: fingerprint(archive), frozenAt: new Date().toISOString() }
+    await Bun.write(f.record, JSON.stringify(record, null, 2) + "\n")
+    unlinkSync(f.ingested)
+  } finally {
+    archive.close()
+  }
 }
 
-export function normalize(v: Float32Array): Float32Array {
-  let s = 0
-  for (const x of v) s += x * x
-  const inv = 1 / (Math.sqrt(s) || 1)
-  for (let i = 0; i < v.length; i++) v[i] *= inv
-  return v
+/** Archive every session the cutoff and exclusions keep, leaving their chunks queued for embedding. */
+function ingest(path: string, opts: { opencodeDb: string; embedder: Embedder }, { cutoff, excludeDirectories }: Ingested) {
+  const archive = openArchive(path, opts.embedder)
+  const source = new Database(opts.opencodeDb, { readonly: true })
+  try {
+    const sourceId = archive.authenticate(archive.issueToken("eval"))!.id
+    const ids = [...readPositions(source).keys()]
+    let archived = 0
+    for (const id of ids) {
+      const snapshot = readSnapshot(source, id)
+      if (!snapshot || snapshot.session.timeCreated > cutoff) continue
+      if (under(excludeDirectories, snapshot.session.directory)) continue
+      const session = { ...snapshot.session, messages: snapshot.session.messages.filter((m) => m.timeCreated <= cutoff) }
+      const contentHash = sha256(JSON.stringify(session))
+      archive.putSnapshot({ ...snapshot, session, contentHash, lastActivity: Math.min(snapshot.lastActivity, cutoff) }, sourceId)
+      if (++archived % 250 === 0) process.stdout.write(`\r  archived ${archived} sessions`)
+    }
+    console.log(`\r  archived ${archived} of ${ids.length} sessions`)
+  } finally {
+    source.close()
+    archive.close()
+  }
+}
+
+/** Open a frozen corpus for scoring. Throws if it has changed since it was frozen. */
+export async function openCorpus(dir: string, modelDir: string): Promise<{ archive: Archive; labels: Label[] }> {
+  const f = files(dir)
+  if (!existsSync(f.record)) throw new Error(`${dir} is not a frozen corpus: run \`bun run freeze\``)
+  const record: Frozen = await Bun.file(f.record).json()
+  const labelBytes = await Bun.file(f.labels).bytes()
+  if (sha256(labelBytes) !== record.labelsSha256) throw new Error(`${f.labels} changed since the corpus was frozen`)
+
+  // Opening migrates, which would rewrite a corpus frozen by another schema before refusing it.
+  const peek = new Database(f.archive, { readonly: true })
+  const { user_version } = peek.query("PRAGMA user_version").get() as { user_version: number }
+  peek.close()
+  if (user_version !== SCHEMA_VERSION)
+    throw new Error(`corpus was frozen at archive schema ${user_version}, this hub is at ${SCHEMA_VERSION}; freeze a new one`)
+
+  const archive = openArchive(f.archive, onnxEmbedder(modelDir))
+  if (fingerprint(archive) !== record.fingerprint) {
+    archive.close()
+    throw new Error(`${f.archive} no longer matches the corpus frozen at ${record.frozenAt}`)
+  }
+  return { archive, labels: JSON.parse(new TextDecoder().decode(labelBytes)) }
 }
