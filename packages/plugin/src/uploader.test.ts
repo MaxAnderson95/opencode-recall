@@ -109,7 +109,7 @@ async function start(
   db: SourceDb = source,
 ) {
   const runtime = ManagedRuntime.make(
-    Uploader.layer({ quietMs: 5, retryMs: 10, probeIntervalMs: 5, ...timing }).pipe(
+    Uploader.layer({ quietMs: 5, retryMs: 10, probeIntervalMs: 5, uploadIntervalMs: 0, ...timing }).pipe(
       Layer.provide(Layer.mergeAll(Source.fromDatabase(db.db), Storage.fromDomain(storage), PluginConfig.layer(configFile))),
       Layer.provideMerge(Layer.mergeAll(Logger.layer([]), noEnvironment)),
     ),
@@ -538,6 +538,91 @@ test("a rebuilt host with a new token uploads nothing for sessions the hub holds
   // Backfill needs nothing: the manifest already answers every local session.
   expect(await rebuilt.state()).toMatchObject({ queued: 0, local: 2, answered: 2, reconciling: false })
   expect(Option.isSome((await rebuilt.state()).lastReconciled)).toBe(true)
+})
+
+/** The session id of a snapshot request, read from its gzip-encoded body. */
+const uploadedSession = async (req: Request) =>
+  (JSON.parse(new TextDecoder().decode(Bun.gunzipSync(new Uint8Array(await req.clone().arrayBuffer())))) as { session: { id: string } })
+    .session.id
+
+/** Local sessions with last activity 300, 250, ... below `ses_a`'s 101, one per id. */
+function addHistory(ids: string[]) {
+  ids.forEach((id, i) => {
+    source.addSession(id, { time: 300 - i * 50 })
+    source.addMessage(id, "user", { text: id }, 300 - i * 50)
+  })
+}
+
+test("a backfill into an empty hub uploads every eligible session, newest first", async () => {
+  configure(["/work/private"])
+  source.addSession("ses_old", { time: 50 })
+  addHistory(["ses_b", "ses_c"])
+  source.addSession("ses_private", { time: 400, directory: "/work/private" })
+  const order: string[] = []
+  intercept = async (req, forward) => {
+    if (new URL(req.url).pathname === "/v1/snapshot") order.push(await uploadedSession(req))
+    return forward(req)
+  }
+  const uploader = await start()
+  await uploader.reconcile()
+  await until(() => outcomes.length === 4)
+  expect(order).toEqual(["ses_b", "ses_c", "ses_a", "ses_old"])
+  expect(outcomes.every((o) => o === "archived")).toBe(true)
+  await until(async () => (await uploader.state()).queued === 0)
+  // The excluded session is not eligible, so the backfill is complete without it.
+  expect(await uploader.state()).toMatchObject({ local: 4, answered: 4 })
+})
+
+test("uploads are spaced by the upload interval", async () => {
+  configure()
+  addHistory(["ses_b", "ses_c", "ses_d"])
+  const started: number[] = []
+  intercept = async (req, forward) => {
+    if (new URL(req.url).pathname === "/v1/snapshot") started.push(performance.now())
+    return forward(req)
+  }
+  await (await start(memoryStorage().storage, { uploadIntervalMs: 40 })).reconcile()
+  await until(() => outcomes.length === 4)
+  const gaps = started.slice(1).map((t, i) => t - (started[i] ?? t))
+  // Timers may fire a millisecond early.
+  expect(gaps.every((gap) => gap >= 39)).toBe(true)
+})
+
+test("a session excluded while its upload waits out the upload interval is not sent", async () => {
+  configure()
+  source.addSession("ses_private", { time: 50, directory: "/work/private" })
+  source.addMessage("ses_private", "user", { text: "private" }, 50)
+  intercept = async (req, forward) => {
+    // The exclusion is saved partway through the interval that follows the first upload.
+    if (new URL(req.url).pathname === "/v1/snapshot") setTimeout(() => configure(["/work/private"]), 30)
+    return forward(req)
+  }
+  const { storage, pending } = memoryStorage()
+  await (await start(storage, { uploadIntervalMs: 100 })).reconcile()
+  await until(() => outcomes.length > 0 && pending() === 0)
+  await Bun.sleep(150)
+  expect(outcomes).toEqual(["archived"])
+  // The hub never held it, so there is nothing to tombstone.
+  expect(verbs).not.toContain("tombstone")
+})
+
+test("an interrupted backfill resumes without re-uploading the sessions it completed", async () => {
+  configure()
+  addHistory(["ses_b", "ses_c", "ses_d", "ses_e"])
+  const { storage, pending } = memoryStorage()
+  const first = await start(storage, { uploadIntervalMs: 50 })
+  await first.reconcile()
+  // Stopped between two uploads, after two have been acknowledged.
+  await until(() => pending() === 3)
+  await first.stop()
+  expect(outcomes).toHaveLength(2)
+
+  const second = await start(storage)
+  await second.reconcile()
+  await until(() => status().sessions === 5 && pending() === 0)
+  await Bun.sleep(30)
+  expect(outcomes).toEqual(Array(5).fill("archived"))
+  expect(await second.state()).toMatchObject({ local: 5, answered: 5 })
 })
 
 test("a session tombstoned on the hub but still present locally is not re-uploaded on every sweep", async () => {

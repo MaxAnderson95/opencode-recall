@@ -221,7 +221,9 @@ The deletion time depends on the reason. For an upstream deletion it is the `ses
 
 **Hub-has-but-host-lacks.** Absence is never deletion. OpenCode may have removed a session while the plugin was down, the host may be new, or a restored database may be older. The host never infers a deletion from absence; only an observed `session.deleted` produces a tombstone. Sessions the hub holds from a host that no longer reports them stay in the archive.
 
-**Backfill** runs newest-first and throttled, resuming from the manifest diff.
+**Backfill** is ordinary reconciliation against a hub that lacks the host's history, so it needs no mode of its own. It runs newest first: the uploader sends whichever due session has the latest recorded activity, so recent history is searchable first and a live turn is never queued behind old sessions. Tombstones take their deletion time as their activity, which puts purges ahead of old history. It is throttled: each plugin instance has one request in flight and waits 500 ms after each snapshot or tombstone request before sending the next, so one instance sends at most two a second. That is about the rate the hub embeds at (45 chunks/s over roughly 17 chunks per session) and keeps snapshot building from monopolising OpenCode's event loop. Every `opencode serve` process on a host drains the same work list, so the bound is per process, and duplicates cost no-ops. It resumes from the manifest diff: an interrupted run leaves every unacknowledged session in the work list and every acknowledged one checkpointed, so a restart sends only what is left. `recall_status` reports progress as how many local sessions outside excluded directories the hub has answered at their current position.
+
+Backfill does not yield to interactive searches. A search can come from any OpenCode process on any host while every process on every host may be uploading, so no one process can make room for it, and pausing the uploads of the process that searched would leave the others running. The throttle bounds ingest load on the hub for every caller instead.
 
 ## 6. Plugin
 
@@ -328,6 +330,5 @@ Carried deliberately, so they are found on purpose rather than in production.
 
 - A rewind whose only change updates an existing message (a turn completing after the restore) has no newer last activity, so it is rejected until the session gets a new message or a metadata change. A higher revision alone does not help, because last activity leads the comparison.
 - Rewind and tombstone acceptance compare message creation times written by host clocks. Within one host that is one clock; across hosts holding copies of one session, clock skew decides which copy counts as newer.
-- Throttling the backfill to "yield to interactive searches" is not implementable across processes as stated. Either define it concretely (pause uploads for N seconds after any `recall_*` call in the same process) or drop the claim.
 - No timing in this document has been measured on the Linux host.
 - `docs/agents/domain.md` expects a `CONTEXT.md` and `docs/adr/`; neither exists, and this spec plus the resolved issues serve as both. A later session looking for a glossary will not find one.

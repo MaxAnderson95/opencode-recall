@@ -69,6 +69,10 @@ const deletedPrefix = (sessionId: string) => `${DELETED}${sessionId}/`
 
 const later = (a: Position, b: Position) => a.lastActivity - b.lastActivity || a.revision - b.revision
 
+/** Sessions in the order a backfill sends them, so their quiet periods also end newest first. */
+const newestFirst = (sessions: ReadonlyMap<string, Source.Local>) =>
+  [...sessions].sort(([, a], [, b]) => later(b.position, a.position))
+
 /** An observed `session.deleted`. */
 export const Deletion = Schema.Struct({ revision: Tombstone.fields.revision, timeDeleted: Tombstone.fields.timeDeleted })
 export interface Deletion extends Schema.Schema.Type<typeof Deletion> {}
@@ -101,7 +105,7 @@ export interface Interface {
 export interface State {
   /** Sessions with an upload or a deletion waiting. */
   readonly queued: number
-  /** Sessions this host holds, and how many of them the hub has answered at their current position. */
+  /** Sessions this host holds outside excluded directories, and how many of them the hub has answered at their current position. */
   readonly local: number
   readonly answered: number
   /** Whether a manifest diff is running, and when one last completed in this process. */
@@ -126,6 +130,8 @@ export type Timing = {
   sweepIntervalMs?: number
   /** How often the config file is re-read for a changed `excludeDirectories`. */
   configPollMs?: number
+  /** Least time between the end of one hub request and the start of the next. */
+  uploadIntervalMs?: number
 }
 
 const defectMessage = (defect: unknown) => (defect instanceof Error ? defect.message : String(defect))
@@ -144,6 +150,13 @@ const defectMessage = (defect: unknown) => (defect instanceof Error ? defect.mes
  * tombstoned. The config file is polled; a changed list reconciles against the manifest, which
  * tombstones every newly excluded session the hub holds and re-uploads every one no longer excluded.
  *
+ * Due sessions are sent newest first, by the latest activity recorded with their work, so a
+ * backfill of thousands of sessions reaches recent history first and a live turn is never queued
+ * behind old ones. Requests are spaced by `uploadIntervalMs`, which bounds this instance to one
+ * request in flight and at most two a second by default: about the rate the hub embeds at (45
+ * chunks/s over roughly 17 chunks a session), and slow enough that building snapshots does not
+ * monopolise OpenCode's event loop.
+ *
  * A missing config, `invalid_token`, or `protocol_version` pauses the queue with its work intact;
  * while paused it periodically re-reads config and calls `status`, and resumes once that succeeds.
  *
@@ -156,6 +169,7 @@ export const layer = ({
   probeIntervalMs = 30_000,
   sweepIntervalMs = 300_000,
   configPollMs = 5_000,
+  uploadIntervalMs = 500,
 }: Timing = {}) =>
   Layer.effect(
     Service,
@@ -166,6 +180,20 @@ export const layer = ({
       const scope = yield* Effect.scope
 
       const due = new Set<string>()
+      /** The latest activity recorded with each session's work, which orders `due` newest first. One number per session. */
+      const activity = new Map<string, number>()
+      const noteActivity = (sessionId: string, time: number) =>
+        activity.set(sessionId, Math.max(time, activity.get(sessionId) ?? time))
+      const newestDue = () => {
+        let newest: string | undefined
+        let latest = -Infinity
+        for (const sessionId of due) {
+          const time = activity.get(sessionId) ?? 0
+          if (time > latest) [newest, latest] = [sessionId, time]
+        }
+        return newest
+      }
+      let nextRequestAt = 0
       const timers = yield* FiberMap.make<string>()
       const probing = yield* FiberHandle.make()
       const reconcileRetry = yield* FiberHandle.make()
@@ -235,7 +263,17 @@ export const layer = ({
         )
 
       const markDirty = (sessionId: string, position: Position) =>
-        storage.set(entryKey(sessionId, position), position).pipe(Effect.andThen(schedule(sessionId, quietMs)))
+        storage.set(entryKey(sessionId, position), position).pipe(
+          Effect.andThen(Effect.sync(() => noteActivity(sessionId, position.lastActivity))),
+          Effect.andThen(schedule(sessionId, quietMs)),
+        )
+
+      /** Queue a tombstone, which the next pass sends in place of any upload still queued for the session. */
+      const markDeleted = (sessionId: string, queued: Queued) =>
+        storage.set(`${deletedPrefix(sessionId)}${queued.timeDeleted}`, queued).pipe(
+          Effect.andThen(Effect.sync(() => noteActivity(sessionId, queued.timeDeleted))),
+          Effect.andThen(schedule(sessionId, quietMs)),
+        )
 
       /** Keep the latest answered position; a racing instance writing an older one costs one no-op upload. */
       const recordAcked = Effect.fnUntraced(function* (sessionId: string, position: Position, held?: Position) {
@@ -283,13 +321,19 @@ export const layer = ({
       /** Queue a tombstone for a session excluded by configuration, timed by this host's clock. */
       const exclude = Effect.fnUntraced(function* (sessionId: string, revision: number) {
         const timeDeleted = yield* Clock.currentTimeMillis
-        yield* storage.set(`${deletedPrefix(sessionId)}${timeDeleted}`, { revision, timeDeleted, reason: "excluded" })
-        yield* schedule(sessionId, quietMs)
+        yield* markDeleted(sessionId, { revision, timeDeleted, reason: "excluded" })
+      })
+
+      /** Hold the pass until `uploadIntervalMs` has passed since the previous request ended. */
+      const awaitTurn = Effect.gen(function* () {
+        const wait = nextRequestAt - (yield* Clock.currentTimeMillis)
+        if (wait > 0) yield* Effect.sleep(wait)
       })
 
       /** Send one request, turning its failure into what the work list should do next. */
       const attempt = (sessionId: string, request: Effect.Effect<unknown, HubError | TransportError>) =>
         request.pipe(
+          Effect.ensuring(Effect.flatMap(Clock.currentTimeMillis, (now) => Effect.sync(() => (nextRequestAt = now + uploadIntervalMs)))),
           Effect.as("done" as const),
           Effect.catch((e) => {
             const kind = classify(e)
@@ -367,9 +411,12 @@ export const layer = ({
         if (Option.isNone(hub)) return yield* pause("hub URL or token is not configured")
         const client = makeClient(hub.value)
 
-        // Sessions that come due during the pass are visited too.
-        for (let next = first(due); next !== undefined; next = first(due)) {
-          const sessionId = next
+        // Sessions that come due during the pass are visited too. The wait comes before a session is
+        // chosen and read, so the newest one is sent and exclusions saved during the wait apply to it.
+        while (due.size > 0) {
+          yield* awaitTurn
+          const sessionId = newestDue()
+          if (sessionId === undefined) return
           due.delete(sessionId)
           const retry = (reason: string) =>
             warn(`upload of ${sessionId} failed, retrying: ${reason}`).pipe(
@@ -400,7 +447,15 @@ export const layer = ({
 
       /** Find work left by a previous run or another instance. */
       const resume = Effect.gen(function* () {
-        for (const id of yield* queuedSessions) due.add(id)
+        const found = [
+          ...(yield* scanKept(DIRTY, Position)).map(({ key, value }) => ({ key, time: value.lastActivity })),
+          ...(yield* scanKept(DELETED, Queued)).map(({ key, value }) => ({ key, time: value.timeDeleted })),
+        ]
+        for (const { key, time } of found) {
+          const sessionId = key.slice(key.indexOf("/") + 1, key.lastIndexOf("/"))
+          noteActivity(sessionId, time)
+          due.add(sessionId)
+        }
       })
 
       /**
@@ -412,7 +467,7 @@ export const layer = ({
         const acked = yield* acknowledged
         const roots = yield* config.excludeDirectories
         const tombstoning = new Set((yield* storage.scan(DELETED, Schema.Unknown)).map(({ key }) => key.split("/")[1]))
-        for (const [sessionId, { position, directory }] of yield* source.positions()) {
+        for (const [sessionId, { position, directory }] of newestFirst(yield* source.positions())) {
           const held = acked.get(sessionId)
           if (PluginConfig.isExcluded(roots, directory)) {
             if (held && !tombstoning.has(sessionId)) yield* exclude(sessionId, position.revision)
@@ -441,7 +496,7 @@ export const layer = ({
         const tombstones = new Map(manifest.tombstones.map((t) => [t.sessionId, t]))
         const acked = yield* acknowledged
 
-        for (const [sessionId, { position: local, directory }] of yield* source.positions()) {
+        for (const [sessionId, { position: local, directory }] of newestFirst(yield* source.positions())) {
           const tombstone = tombstones.get(sessionId)
           const hubCopy = held.get(sessionId)
           if (PluginConfig.isExcluded(roots, directory)) {
@@ -522,23 +577,26 @@ export const layer = ({
             logAndContinue((reason) => `could not record ${sessionId} as dirty: ${reason}`),
           ),
         delete: (sessionId, deletion) =>
-          storage.set(`${deletedPrefix(sessionId)}${deletion.timeDeleted}`, { ...deletion, reason: "deleted" }).pipe(
-            Effect.andThen(schedule(sessionId, quietMs)),
+          markDeleted(sessionId, { ...deletion, reason: "deleted" }).pipe(
             logAndContinue((reason) => `could not record ${sessionId} as deleted: ${reason}`),
           ),
         reconcile,
         state: Effect.gen(function* () {
           const queued = yield* queuedSessions
           const acked = yield* acknowledged
-          const positions = yield* source.positions()
+          // An unreadable exclusion list holds every upload, and status reports that on its own line.
+          const roots = yield* config.excludeDirectories.pipe(Effect.orElseSucceed(() => []))
+          let local = 0
           let answered = 0
-          for (const [sessionId, { position }] of positions) {
+          for (const [sessionId, { position, directory }] of yield* source.positions()) {
+            if (PluginConfig.isExcluded(roots, directory)) continue
+            local++
             const held = acked.get(sessionId)
             if (held && later(position, held) <= 0) answered++
           }
           return {
             queued: queued.size,
-            local: positions.size,
+            local,
             answered,
             reconciling: reconciling !== undefined,
             lastReconciled: Option.fromNullishOr(lastReconciled),
@@ -549,7 +607,5 @@ export const layer = ({
       })
     }),
   )
-
-const first = (set: Set<string>): string | undefined => set.values().next().value
 
 export * as Uploader from "./uploader.ts"
