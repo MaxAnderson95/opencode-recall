@@ -147,6 +147,13 @@ export const makeHandler = Effect.fnUntraced(function* ({
     search: ({ protocolVersion: _, ...search }, source) => archive.search(search, source.id),
     inspect: ({ protocolVersion: _, ...inspect }, source) => archive.inspect(inspect, source.id),
     expand: ({ protocolVersion: _, ...expand }, source) => archive.expand(expand, source.id),
+    transcript: ({ protocolVersion: _, ...transcript }, source) => archive.transcript(transcript, source.id),
+    "summary.get": ({ protocolVersion: _, ...key }, source) => archive.getSummary(key, source.id),
+    "summary.put": Effect.fnUntraced(function* ({ protocolVersion: _, ...summary }) {
+      if ((yield* archive.putSummary(summary)) === "stale_revision")
+        return yield* reject("stale_revision", "the archive no longer holds the content this summary was computed from")
+      return {}
+    }),
     status: () => archive.status(),
   }
 

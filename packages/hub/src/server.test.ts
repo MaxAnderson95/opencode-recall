@@ -101,6 +101,22 @@ test("search finds another host's session through the caller's own token and nam
   expect(sessions[0]!.hits[0]!.snippet).toBe("«hello»")
 })
 
+test("the typed client reads a transcript and caches a summary, which a later snapshot makes stale", async () => {
+  const client = clientFor(handler)
+  await run(client.snapshot(snapshot))
+  const transcript = await run(client.transcript({ session: "ses_a", budget: 300_000, maxChars: 2_000 }))
+  expect(transcript).toMatchObject({ kind: "transcript", contentHash: "hash-1", messages: 1, omitted: 0, clipped: 0 })
+
+  const key = { provider: "openai", model: "gpt", focus: "", recipe: 1 }
+  const put = { ...key, sessionId: "ses_a", contentHash: "hash-1", summary: "a greeting", omitted: 0, clipped: 0 }
+  expect(await run(client.summaryPut(put))).toEqual({})
+  expect(await run(client.summaryGet({ ...key, session: "ses_a" }))).toMatchObject({ kind: "cached", summary: "a greeting", omitted: 0, clipped: 0 })
+
+  await run(client.snapshot({ ...snapshot, revision: 4, lastActivity: 3, contentHash: "hash-2" }))
+  expect(await failure(client.summaryPut(put))).toMatchObject({ _tag: "HubError", code: "stale_revision", status: 409 })
+  expect(await run(client.summaryGet({ ...key, session: "ses_a" }))).toMatchObject({ kind: "absent" })
+})
+
 test("hybrid search over the API names an unavailable semantic branch, and status reports the active space", async () => {
   const embedder = fakeEmbedder()
   embedder.down = true

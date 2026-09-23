@@ -133,6 +133,50 @@ export const Expand = Schema.Struct({
 })
 export interface Expand extends Schema.Schema.Type<typeof Expand> {}
 
+/**
+ * A whole session rendered for reading in one pass: one block per message, each message's text cut
+ * to `maxChars`, and messages dropped from the middle until the blocks fit in `budget` characters.
+ */
+export const Transcript = Schema.Struct({
+  session: SessionRef,
+  budget: Int.check(Schema.isBetween({ minimum: 1_000, maximum: 1_000_000 })),
+  maxChars: Int.check(Schema.isBetween({ minimum: 100, maximum: 4_000 })),
+})
+export interface Transcript extends Schema.Schema.Type<typeof Transcript> {}
+
+/**
+ * What a cached summary was made by, besides the session content: the model it was generated
+ * with, the question it answers (empty for a general summary), and the version of the caller's
+ * summary recipe (its prompts and transcript budget).
+ */
+const summaryKeyFields = {
+  provider: NonEmptyString,
+  model: NonEmptyString,
+  /** Absent for the provider's default variant. */
+  variant: Schema.optionalKey(NonEmptyString),
+  focus: Schema.String,
+  recipe: Int.check(Schema.isGreaterThan(0)),
+}
+
+/** The summary cached for the named session's archived content, if there is one. */
+export const SummaryGet = Schema.Struct({ session: SessionRef, ...summaryKeyFields })
+export interface SummaryGet extends Schema.Schema.Type<typeof SummaryGet> {}
+
+/**
+ * Cache a summary of the transcript read at `contentHash`. Rejected as `stale_revision` unless the
+ * archive still holds exactly that content for the session.
+ */
+export const SummaryPut = Schema.Struct({
+  sessionId: NonEmptyString,
+  contentHash: NonEmptyString,
+  ...summaryKeyFields,
+  summary: NonEmptyString,
+  /** What the transcript left out, from its `transcript` response, so a cache hit can say so too. */
+  omitted: NonNegativeInt,
+  clipped: NonNegativeInt,
+})
+export interface SummaryPut extends Schema.Schema.Type<typeof SummaryPut> {}
+
 const version = { protocolVersion: Schema.Literal(PROTOCOL_VERSION) }
 
 export const requests = {
@@ -142,6 +186,9 @@ export const requests = {
   search: Schema.Struct({ ...version, ...Search.fields }),
   inspect: Schema.Struct({ ...version, ...Inspect.fields }),
   expand: Schema.Struct({ ...version, ...Expand.fields }),
+  transcript: Schema.Struct({ ...version, ...Transcript.fields }),
+  "summary.get": Schema.Struct({ ...version, ...SummaryGet.fields }),
+  "summary.put": Schema.Struct({ ...version, ...SummaryPut.fields }),
   status: Schema.Struct(version),
 }
 
@@ -315,6 +362,37 @@ export const responses = {
       messages: Schema.Array(WindowMessage),
     }),
   ]),
+  /**
+   * `contentHash` names the archived content `text` was rendered from, for `summary.put`.
+   * `messages` counts the session's messages; `omitted` of them were dropped from the middle to fit
+   * the budget, and `clipped` of those kept had their text cut to `maxChars`.
+   */
+  transcript: Schema.Union([
+    Missing,
+    Schema.Struct({
+      kind: Schema.Literal("transcript"),
+      ...resolvedFields,
+      contentHash: Schema.String,
+      messages: Int,
+      omitted: Int,
+      clipped: Int,
+      text: Schema.String,
+    }),
+  ]),
+  /** `absent` when nothing is cached under this key for the content the archive holds now. */
+  "summary.get": Schema.Union([
+    Missing,
+    Schema.Struct({ kind: Schema.Literal("absent"), ...resolvedFields }),
+    Schema.Struct({
+      kind: Schema.Literal("cached"),
+      ...resolvedFields,
+      summary: Schema.String,
+      timeCreated: Int,
+      omitted: Int,
+      clipped: Int,
+    }),
+  ]),
+  "summary.put": Schema.Struct({}),
   status: Schema.Struct({
     sessions: Int,
     /** Chunks in the active space, and how many of them are embedded; the rest wait in the queue. */
@@ -377,6 +455,9 @@ export interface Client {
   readonly search: (search: Search) => Effect.Effect<Responses["search"], HubError | TransportError>
   readonly inspect: (inspect: Inspect) => Effect.Effect<Responses["inspect"], HubError | TransportError>
   readonly expand: (expand: Expand) => Effect.Effect<Responses["expand"], HubError | TransportError>
+  readonly transcript: (transcript: Transcript) => Effect.Effect<Responses["transcript"], HubError | TransportError>
+  readonly summaryGet: (key: SummaryGet) => Effect.Effect<Responses["summary.get"], HubError | TransportError>
+  readonly summaryPut: (summary: SummaryPut) => Effect.Effect<Responses["summary.put"], HubError | TransportError>
   readonly status: () => Effect.Effect<Responses["status"], HubError | TransportError>
 }
 
@@ -428,6 +509,9 @@ export function makeClient({ url, token, fetch: fetcher = fetch }: ClientOptions
     search: (search) => call("search", search),
     inspect: (inspect) => call("inspect", inspect),
     expand: (expand) => call("expand", expand),
+    transcript: (transcript) => call("transcript", transcript),
+    summaryGet: (key) => call("summary.get", key),
+    summaryPut: (summary) => call("summary.put", summary),
     status: () => call("status", {}),
   }
 }

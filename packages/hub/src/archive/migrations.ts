@@ -125,6 +125,26 @@ export const migrations: readonly string[] = [
     PRIMARY KEY (chunk_id, space_id)
   ) WITHOUT ROWID;
   `,
+  // Every accepted snapshot replaces the session row, so the cascade drops summaries of content the
+  // archive no longer holds, and a tombstone drops them with the transcript. `variant` is '' for
+  // the provider's default.
+  `
+  CREATE TABLE summaries (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    content_hash TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    variant TEXT NOT NULL,
+    focus TEXT NOT NULL,
+    recipe INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    summary TEXT NOT NULL,
+    omitted INTEGER NOT NULL,
+    clipped INTEGER NOT NULL,
+    time_created INTEGER NOT NULL,
+    PRIMARY KEY (session_id, content_hash, provider, model, variant, focus, recipe)
+  ) WITHOUT ROWID;
+  `,
 ]
 
 /** The first schema version with segments; parts archived before it are segmented on migration. */

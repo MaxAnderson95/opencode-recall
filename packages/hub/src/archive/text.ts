@@ -1,8 +1,10 @@
 /**
  * Pure retrieval helpers carried over from the single-machine recall plugin's `lib/text.ts` and
- * `lib/search.ts`: FTS query construction, segmentation, snippet rendering, and RRF fusion.
+ * `lib/search.ts`: FTS query construction, segmentation, snippet rendering, RRF fusion, and
+ * middle-out truncation, and transcript blocks.
  * Changing any of them changes results, so they stay as measured. No database, no filesystem.
  */
+import type { WindowMessage } from "@opencode-recall/protocol"
 
 const ANSI_RE =
   /[\u001b\u009b](?:\][^\u0007\u001b]*(?:\u0007|\u001b\\)|\[[0-9;?]*[0-9A-ORZcf-nqry=><]|[()#][0-9A-Za-z])/g
@@ -10,9 +12,71 @@ const ANSI_RE =
 export const stripAnsi = (text: string) => text.replace(ANSI_RE, "")
 
 /** One line of at most `max` characters, plus `…` when cut. */
-export function clean(text: string, max: number): string {
+export const clean = (text: string, max: number): string => cut(text, max).text
+
+/** {@link clean}, saying whether the line was cut. */
+export function cut(text: string, max: number): { text: string; cut: boolean } {
   const out = stripAnsi(text).replace(/\s+/g, " ").trim()
-  return out.length > max ? out.slice(0, max) + "…" : out
+  return out.length > max ? { text: out.slice(0, max) + "…", cut: true } : { text: out, cut: false }
+}
+
+function toolLine({ tool, title, status, error }: WindowMessage["tools"][number]): string {
+  const line = `[tool ${tool}] ${title}`.trimEnd()
+  if (status === "completed") return line
+  return status === "error" ? `${line} (failed: ${error || "no error message"})` : `${line} (${status})`
+}
+
+/**
+ * One message as a transcript block, as `recall_expand` renders it but timed in UTC: its tool
+ * one-liners with consecutive repeats collapsed, then its text. `null` when it has neither.
+ */
+export function transcriptBlock(m: WindowMessage): string | null {
+  const tools: string[] = []
+  let last = ""
+  let count = 0
+  const flush = () => {
+    if (count) tools.push(count > 1 ? `${last} (×${count})` : last)
+  }
+  for (const line of m.tools.map(toolLine)) {
+    if (line === last) count++
+    else {
+      flush()
+      last = line
+      count = 1
+    }
+  }
+  flush()
+  const body = [...tools, m.text].filter(Boolean).join("\n")
+  const time = new Date(m.time).toISOString().slice(0, 16).replace("T", " ")
+  return body ? `── ${m.type} @ ${time}Z (${m.messageId})\n${body}` : null
+}
+
+/**
+ * Keep the head and tail of a list of blocks within a character budget, joined by newlines. A
+ * session's goals live at the start and its outcomes at the end, so the middle is what gets
+ * dropped, replaced by `note`. `dropped` is the half-open range of block indices left out.
+ */
+export function middleOut(
+  blocks: string[],
+  budget: number,
+  note: (omitted: number, total: number) => string,
+): { text: string; dropped: { from: number; to: number } } {
+  const total = blocks.reduce((n, b) => n + b.length + 1, 0)
+  if (total <= budget) return { text: blocks.join("\n"), dropped: { from: blocks.length, to: blocks.length } }
+  const head: string[] = []
+  const tail: string[] = []
+  let used = 0
+  let lo = 0
+  let hi = blocks.length - 1
+  while (lo <= hi) {
+    const takeHead = head.length <= tail.length
+    const b = takeHead ? blocks[lo]! : blocks[hi]!
+    if (used + b.length + 1 > budget) break
+    used += b.length + 1
+    if (takeHead) head.push(blocks[lo++]!)
+    else tail.unshift(blocks[hi--]!)
+  }
+  return { text: [...head, note(hi - lo + 1, blocks.length), ...tail].join("\n"), dropped: { from: lo, to: hi + 1 } }
 }
 
 const TOKEN_RE = /[\p{L}\p{N}_./@-]+/gu

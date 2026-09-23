@@ -103,7 +103,7 @@ Storing the text costs about 72 MB, roughly 5% of the archive, and makes semanti
 
 Space identity is the whole recipe, not five parameters: model artifact revision, dimensions, tokenizer and preprocessing, pooling, normalization, query prefix, chunk size, overlap, per-turn cap, and the chunk-rendering version. Anything that changes the bytes fed to the model changes what a vector means. Vector reuse across a change requires identical input text **and** identical recipe.
 
-**`summaries`**: keyed by session content identity, provider, model, variant, focus, and summary-recipe version. Holds the summary and the archived revision it was computed from. Survives an index rebuild.
+**`summaries`**: keyed by session content identity, provider, model, variant, focus, and summary-recipe version. Holds the summary, the archived revision it was computed from, and how many messages its transcript omitted or clipped. Survives an index rebuild.
 
 **`tombstones`**: session id, recording `source_id`, deletion revision, deletion time, and reason (deleted upstream, or excluded by configuration).
 
@@ -237,7 +237,7 @@ Extraction stays host-side deliberately. Uploading raw v2 messages would ship ba
 
 Because instances load per location and any of them may be the uploader, the exclusion list must come from one host-wide configuration source. Privacy behaviour must not depend on which instance happens to upload.
 
-`recall_summarize` calls `ctx.generate.text`, replacing the hidden worker session, keeping the LLM call plugin-side so the hub holds no credentials. It fetches a budgeted transcript from the hub (§4) rather than reading locally. Batch shape is preserved: up to 24 session ids per call at concurrency 4. Two things to verify before implementation: that `ctx.generate.text` honours a system prompt, folding `WORKER_SYSTEM` into the prompt text if not, and that summaries written for a revision are rejected by `summary.put` if the archive has moved on, so a slow summarizer cannot cache a stale result as current.
+`recall_summarize` calls `ctx.generate.text`, replacing the hidden worker session, keeping the LLM call plugin-side so the hub holds no credentials. It fetches a budgeted transcript from the hub (§4) rather than reading locally. Batch shape is preserved: up to 24 session ids per call at concurrency 4. `ctx.generate.text` takes only a prompt and a model reference; verified in #25 against OpenCode 2.0.14, it sends the prompt as a single user message with no system prompt, agent, or tools, so `WORKER_SYSTEM` leads the prompt text. `summary.put` carries the content hash the transcript was read at and is rejected as `stale_revision` unless the archive still holds that content, so a slow summarizer cannot cache a stale result as current; the caller still gets its summary, uncached. Accepting a snapshot or a tombstone drops the session's cached summaries.
 
 `recall_status` reports both sides separately. Host: hub reachability, queue depth, backfill progress, last error, excluded directories, config source. Hub: total sessions and chunks, per-source counts, active space identity, pending embedding backlog, cached summaries, and any session in persistent `hash_divergence`.
 
@@ -328,7 +328,6 @@ Carried deliberately, so they are found on purpose rather than in production.
 
 - A rewind whose only change updates an existing message (a turn completing after the restore) has no newer last activity, so it is rejected until the session gets a new message or a metadata change. A higher revision alone does not help, because last activity leads the comparison.
 - Rewind and tombstone acceptance compare message creation times written by host clocks. Within one host that is one clock; across hosts holding copies of one session, clock skew decides which copy counts as newer.
-- `ctx.generate.text` system-prompt handling is unverified.
 - Throttling the backfill to "yield to interactive searches" is not implementable across processes as stated. Either define it concretely (pause uploads for N seconds after any `recall_*` call in the same process) or drop the claim.
 - No timing in this document has been measured on the Linux host.
 - `docs/agents/domain.md` expects a `CONTEXT.md` and `docs/adr/`; neither exists, and this spec plus the resolved issues serve as both. A later session looking for a glossary will not find one.

@@ -3,7 +3,17 @@ import { Database } from "bun:sqlite"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { Expand, Inspect, Message, Part, Search, Snapshot } from "@opencode-recall/protocol"
+import type {
+  Expand,
+  Inspect,
+  Message,
+  Part,
+  Search,
+  Snapshot,
+  SummaryGet,
+  SummaryPut,
+  Transcript,
+} from "@opencode-recall/protocol"
 import { Effect, Exit, Option, Scope, type Types } from "effect"
 import { Embedder } from "../embedder.ts"
 import { fakeEmbedder } from "../fake-embedder.ts"
@@ -35,6 +45,9 @@ function handle(archive: Archive.Interface, scope: Scope.Closeable) {
     search: (search: Search, callerSourceId: number) => Effect.runPromise(archive.search(search, callerSourceId)),
     inspect: (inspect: Inspect, callerSourceId = 0) => Effect.runPromise(archive.inspect(inspect, callerSourceId)),
     expand: (expand: Expand, callerSourceId = 0) => Effect.runSync(archive.expand(expand, callerSourceId)),
+    transcript: (transcript: Transcript, callerSourceId = 0) => Effect.runSync(archive.transcript(transcript, callerSourceId)),
+    getSummary: (key: SummaryGet, callerSourceId = 0) => Effect.runSync(archive.getSummary(key, callerSourceId)),
+    putSummary: (summary: SummaryPut) => Effect.runSync(archive.putSummary(summary)),
     embedPending: (limit: number) => Effect.runPromise(archive.embedPending(limit)),
     issueToken: (source: string) => Effect.runSync(archive.issueToken(source)),
     listTokens: () => Effect.runSync(archive.listTokens()),
@@ -689,6 +702,72 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     expect(at({ messageId: "ses_a_msg_0", window: 4, maxChars: 4000 }).start).toBe(0)
     expect(at({ messageId: "msg_not_here", window: 4, maxChars: 4000 }).start).toBe(6)
     expect(at({ window: 60, maxChars: 4000 }).messages).toHaveLength(10)
+  })
+
+  test("a transcript renders every message, keeps the head and tail within its budget, and reports what it cut", async () => {
+    const archive = open(path())
+    const draft = session("ses_a", Array.from({ length: 10 }, (_, i) => `message ${i} ` + "word ".repeat(100)))
+    draft.session.messages[9]!.parts.push(
+      { kind: "reasoning", text: "hidden thoughts" },
+      { kind: "tool", tool: "bash", title: "git push", status: "error", error: "rejected", text: "bash git push\nrejected", searchable: true },
+    )
+    draft.session.messages.push({ id: "ses_a_msg_10", type: "assistant", timeCreated: 20, parts: [{ kind: "reasoning", text: "only thoughts" }] })
+    archive.putSnapshot(draft, sourceOf(archive))
+
+    const whole = archive.transcript({ session: "slug", budget: 100_000, maxChars: 4_000 })
+    if (whole.kind !== "transcript") throw new Error(`expected a transcript, got ${whole.kind}`)
+    expect(whole).toMatchObject({ session: { sessionId: "ses_a" }, contentHash: draft.contentHash, messages: 11, omitted: 0, clipped: 0 })
+    expect(whole.text).toStartWith(`── user @ 1970-01-01 00:00Z (ses_a_msg_0)\nmessage 0 word`)
+    expect(whole.text).toContain("(ses_a_msg_9)\n[tool bash] git push (failed: rejected)\nmessage 9 word")
+    expect(whole.text).not.toContain("thoughts")
+
+    const cut = archive.transcript({ session: "ses_a", budget: 1_000, maxChars: 100 })
+    if (cut.kind !== "transcript") throw new Error(`expected a transcript, got ${cut.kind}`)
+    const blocks = cut.text.split("\n── ")
+    const note = blocks.findIndex((b) => b.includes(`[... ${cut.omitted} of 10 messages omitted ...]`))
+    expect(cut.omitted).toBeGreaterThan(0)
+    expect(cut.clipped).toBe(10 - cut.omitted)
+    expect(cut.text).toStartWith("── user @ 1970-01-01 00:00Z (ses_a_msg_0)\n" + ("message 0 " + "word ".repeat(100)).slice(0, 100) + "…")
+    expect(cut.text).toContain("(ses_a_msg_9)")
+    expect(note).toBeGreaterThanOrEqual(0)
+    expect(cut.text.length - blocks[note]!.length).toBeLessThanOrEqual(1_000)
+
+    expect(archive.transcript({ session: "nope", budget: 1_000, maxChars: 100 })).toEqual({ kind: "missing" })
+  })
+
+  test("a summary is cached per key for the held content and dropped once the session advances or is deleted", async () => {
+    const archive = open(path())
+    const laptop = sourceOf(archive)
+    const first = session("ses_a", ["hello", "hi"])
+    archive.putSnapshot(first, laptop)
+    const key = { provider: "openai", model: "gpt", variant: "low", focus: "", recipe: 1 }
+    const put = (fields: Partial<SummaryPut> = {}) =>
+      archive.putSummary({ ...key, sessionId: "ses_a", contentHash: first.contentHash, summary: "it said hello", omitted: 1, clipped: 2, ...fields })
+
+    expect(archive.getSummary({ ...key, session: "nope" })).toEqual({ kind: "missing" })
+    expect(archive.getSummary({ ...key, session: "slug" })).toMatchObject({ kind: "absent", session: { sessionId: "ses_a" } })
+    expect(put()).toBe("stored")
+    expect(archive.getSummary({ ...key, session: "slug" })).toMatchObject({ kind: "cached", summary: "it said hello", omitted: 1, clipped: 2, session: { revision: 2 } })
+    const { variant: _, ...defaultVariant } = key
+    for (const other of [{ ...key, focus: "why?" }, { ...key, model: "other" }, { ...key, provider: "anthropic" }, { ...key, recipe: 2 }, defaultVariant])
+      expect(archive.getSummary({ ...other, session: "ses_a" })).toMatchObject({ kind: "absent" })
+    expect(put({ summary: "rewritten" })).toBe("stored")
+    expect(archive.getSummary({ ...key, session: "ses_a" })).toMatchObject({ kind: "cached", summary: "rewritten" })
+
+    // A summarizer that read the old transcript finishes after the session moved on.
+    const second = session("ses_a", ["hello", "hi", "more"])
+    archive.putSnapshot(second, laptop)
+    expect(archive.getSummary({ ...key, session: "ses_a" })).toMatchObject({ kind: "absent" })
+    expect(put()).toBe("stale_revision")
+    expect(archive.getSummary({ ...key, session: "ses_a" })).toMatchObject({ kind: "absent" })
+    expect(put({ sessionId: "nope" })).toBe("stale_revision")
+
+    expect(put({ contentHash: second.contentHash })).toBe("stored")
+    archive.putTombstone({ sessionId: "ses_a", revision: 9, timeDeleted: 100 }, laptop)
+    expect(put({ contentHash: second.contentHash })).toBe("stale_revision")
+    // Re-imported with the same content after the deletion: the old summary did not survive it.
+    archive.putSnapshot(session("ses_a", ["hello", "hi", "more"], { lastActivity: 200 }), laptop)
+    expect(archive.getSummary({ ...key, session: "ses_a" })).toMatchObject({ kind: "absent" })
   })
 
   test("a slug names the most recently updated session with it and lists the others; an unknown one is missing", async () => {
