@@ -44,7 +44,7 @@ export const make = Effect.fnUntraced(function* () {
         : Option.match(s.lastReconciled, { onNone: () => "not completed yet", onSome: (t) => `last completed ${Tools.fmtDateTime(t)}` })
       host.push(
         `upload queue: ${s.queued} session${s.queued === 1 ? "" : "s"} waiting`,
-        `backfill: ${s.answered} of ${s.local} local sessions answered by the hub at their current position; reconciliation ${reconciled}`,
+        `backfill: ${s.answered} of ${s.local} eligible local sessions answered by the hub at their current position; reconciliation ${reconciled}`,
         ...Option.match(s.pausedBy, { onNone: () => [], onSome: (reason) => [`uploads paused: ${reason}`] }),
         `last error: ${Option.match(s.lastError, { onNone: () => "none", onSome: (e) => `${Tools.fmtDateTime(e.time)} ${e.message}` })}`,
       )

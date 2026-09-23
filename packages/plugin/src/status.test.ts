@@ -70,7 +70,7 @@ test("reports this host's uploads and the hub's archive in separate sections", a
   const output = await run()
   expect(output).toStartWith(`host\n  hub at ${hub.url.href}: reachable\n  config: hub.url: OPENCODE_RECALL_HUB_URL; hub.token: /cfg/recall.json\n`)
   expect(output).toContain("  upload queue: 2 sessions waiting\n")
-  expect(output).toContain("  backfill: 3 of 5 local sessions answered by the hub at their current position; reconciliation last completed 2026-09-20 10:00\n")
+  expect(output).toContain("  backfill: 3 of 5 eligible local sessions answered by the hub at their current position; reconciliation last completed 2026-09-20 10:00\n")
   expect(output).toContain("  last error: 2026-09-20 10:05 upload of ses_x failed, retrying: connection refused\n")
   expect(output).toContain("  excluded directories (index.excludeDirectories in /cfg/recall.json): /work/private, /Users/me/secret\n")
   // The hub embeds in the background, so the session may or may not be embedded yet.
