@@ -67,7 +67,8 @@ export interface Interface {
    * `sourceId`. A matching content hash is `unchanged` at any position and moves nothing.
    *
    * A tombstoned session is `tombstoned` unless the snapshot's last activity is after the deletion
-   * time; such a snapshot is archived and clears the tombstone.
+   * time, or the tombstone is an exclusion `sourceId` recorded; such a snapshot is archived and
+   * clears the tombstone.
    *
    * A `rewound` acceptance is recorded, and a `hash_divergence` is kept as a condition of the
    * session until a copy of it is accepted, it is deleted, or the refused source sends the held
@@ -82,8 +83,11 @@ export interface Interface {
    * was deleted.
    */
   readonly putTombstone: (tombstone: Tombstone, sourceId: number) => Effect.Effect<{ removed: boolean }>
-  /** Every held session's position and hash, and every tombstone, across all sources. */
-  readonly manifest: () => Effect.Effect<Manifest>
+  /**
+   * Every held session's position and hash, and every tombstone, across all sources. A tombstone
+   * is `excludedByCaller` when it is an exclusion `callerSourceId` recorded.
+   */
+  readonly manifest: (callerSourceId: number) => Effect.Effect<Manifest>
   /**
    * Sessions across every source ranked by fusing a BM25 branch and a cosine branch over the
    * active space (or by one alone, per `mode`), each with its best hits. Every filter is applied
@@ -582,11 +586,13 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
     `SELECT r.session_id AS sessionId, src.name AS source, r.from_revision AS fromRevision, r.to_revision AS toRevision, r.time
      FROM rewinds r JOIN sources src ON src.id = r.source_id ORDER BY r.id DESC LIMIT ${RECENT_REWINDS}`,
   )
-  const selectTombstone = db.prepare("SELECT time_deleted AS timeDeleted FROM tombstones WHERE session_id = ?")
+  const selectTombstone = db.prepare(
+    "SELECT time_deleted AS timeDeleted, source_id AS sourceId, reason FROM tombstones WHERE session_id = ?",
+  )
   const deleteTombstone = db.prepare("DELETE FROM tombstones WHERE session_id = ?")
   const upsertTombstone = db.prepare(
     `INSERT INTO tombstones (session_id, source_id, revision, time_deleted, reason)
-     VALUES ($sessionId, $sourceId, $revision, $timeDeleted, 'deleted')
+     VALUES ($sessionId, $sourceId, $revision, $timeDeleted, $reason)
      ON CONFLICT (session_id) DO UPDATE SET source_id = excluded.source_id, revision = excluded.revision,
        time_deleted = excluded.time_deleted, reason = excluded.reason
      WHERE excluded.time_deleted > tombstones.time_deleted`,
@@ -597,7 +603,9 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
      FROM sessions ORDER BY id`,
   )
   const selectManifestTombstones = db.prepare(
-    "SELECT session_id AS sessionId, time_deleted AS timeDeleted FROM tombstones ORDER BY session_id",
+    `SELECT session_id AS sessionId, time_deleted AS timeDeleted,
+       (reason = 'excluded' AND source_id = ?) AS excludedByCaller
+     FROM tombstones ORDER BY session_id`,
   )
   const upsertSource = db.prepare(
     `INSERT INTO sources (name, time_created) VALUES (?, ?)
@@ -631,9 +639,11 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
 
   const putSnapshotTx = db.transaction((snapshot: Snapshot, sourceId: number): { result: PutResult; reused: Reused[] } => {
     const { session } = snapshot
-    const tombstone = selectTombstone.get(session.id) as Pick<Tombstone, "timeDeleted"> | null
+    const tombstone = selectTombstone.get(session.id) as (Pick<Tombstone, "timeDeleted" | "reason"> & { sourceId: number }) | null
+    // The host that excluded the session uploading it again means its exclusion was lifted.
+    const lifted = tombstone?.reason === "excluded" && tombstone.sourceId === sourceId
     // Revisions are not compared: a delete-then-reimport restarts the counter below the tombstone's.
-    if (tombstone && snapshot.lastActivity <= tombstone.timeDeleted) return { result: "tombstoned", reused: [] }
+    if (tombstone && !lifted && snapshot.lastActivity <= tombstone.timeDeleted) return { result: "tombstoned", reused: [] }
     const held = selectHeld.get(session.id) as Held | null
     const result = held ? resolve(snapshot, held) : "archived"
     if (result === "hash_divergence")
@@ -942,9 +952,11 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
   })
 
   const manifestTx = db.transaction(
-    (): Manifest => ({
+    (callerSourceId: number): Manifest => ({
       sessions: selectManifestSessions.all() as Manifest["sessions"],
-      tombstones: selectManifestTombstones.all() as Manifest["tombstones"],
+      tombstones: (selectManifestTombstones.all(callerSourceId) as { sessionId: string; timeDeleted: number; excludedByCaller: number }[]).map(
+        (t) => ({ ...t, excludedByCaller: t.excludedByCaller === 1 }),
+      ),
     }),
   )
   const statusTx = db.transaction(
@@ -967,8 +979,8 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
     migration,
     putSnapshot,
     putTombstone,
-    manifest: Effect.fn("Archive.manifest")(function* () {
-      return manifestTx()
+    manifest: Effect.fn("Archive.manifest")(function* (callerSourceId: number) {
+      return manifestTx(callerSourceId)
     }),
     search,
     inspect,

@@ -6,7 +6,7 @@ import { Effect, Option, Schema } from "effect"
  * stripped while the hub records the content hash that covered it. A new verb needs no bump: a hub
  * without it answers `unknown_verb`.
  */
-export const PROTOCOL_VERSION = 4
+export const PROTOCOL_VERSION = 5
 
 const Int = Schema.Int
 const NonNegativeInt = Int.check(Schema.isGreaterThanOrEqualTo(0))
@@ -65,13 +65,20 @@ export const Snapshot = Schema.Struct({
 })
 export interface Snapshot extends Schema.Schema.Type<typeof Snapshot> {}
 
-/** An observed upstream deletion of a session. */
+/**
+ * A session removed from the archive: `deleted` upstream, or `excluded` by the host's
+ * `excludeDirectories`. An exclusion is lifted by any snapshot from the source that recorded it.
+ */
 export const Tombstone = Schema.Struct({
   sessionId: NonEmptyString,
-  /** The `session.deleted` event's own sequence number. */
+  /** The `session.deleted` event's own sequence number, or the session's revision when it was excluded. */
   revision: NonNegativeInt,
-  /** The `session.deleted` event's creation time; a snapshot must be active after it to return. */
+  /**
+   * The `session.deleted` event's creation time, or the host's clock when it applied the exclusion;
+   * a snapshot must be active after it to return.
+   */
   timeDeleted: Int,
+  reason: Schema.Literals(["deleted", "excluded"]),
 })
 export interface Tombstone extends Schema.Schema.Type<typeof Tombstone> {}
 
@@ -210,7 +217,8 @@ const Position = { revision: NonNegativeInt, lastActivity: Int, contentHash: Non
 /** What the hub holds for every session from every source, so a host can diff without uploading. */
 export const Manifest = Schema.Struct({
   sessions: Schema.Array(Schema.Struct({ sessionId: Schema.String, ...Position })),
-  tombstones: Schema.Array(Schema.Struct({ sessionId: Schema.String, timeDeleted: Int })),
+  /** `excludedByCaller`: the caller excluded the session, so its own snapshot lifts the tombstone at any activity. */
+  tombstones: Schema.Array(Schema.Struct({ sessionId: Schema.String, timeDeleted: Int, excludedByCaller: Schema.Boolean })),
 })
 export interface Manifest extends Schema.Schema.Type<typeof Manifest> {}
 

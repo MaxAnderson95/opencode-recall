@@ -21,7 +21,7 @@ export const make = Effect.fnUntraced(function* () {
   const uploader = yield* Uploader.Service
 
   const execute = Effect.fn("recall_status")(function* () {
-    const [hub, url, configSource, state] = yield* Effect.all(
+    const [hub, url, configSource, state, excluded] = yield* Effect.all(
       [
         Effect.result(Tools.withHub((client) => client.status())),
         config.hub.pipe(
@@ -30,6 +30,7 @@ export const make = Effect.fnUntraced(function* () {
         ),
         config.hubSource.pipe(Effect.catch((e) => Effect.succeed(`invalid (${e.message})`))),
         Effect.result(uploader.state),
+        Effect.result(config.excludeDirectories),
       ],
       { concurrency: "unbounded" },
     )
@@ -48,7 +49,11 @@ export const make = Effect.fnUntraced(function* () {
         `last error: ${Option.match(s.lastError, { onNone: () => "none", onSome: (e) => `${Tools.fmtDateTime(e.time)} ${e.message}` })}`,
       )
     }
-    host.push("excluded directories: none; directory exclusion is not implemented yet, so sessions from every directory are uploaded")
+    host.push(
+      excluded._tag === "Failure"
+        ? `excluded directories: unreadable, so uploads are held (${excluded.failure.message})`
+        : `excluded directories (index.excludeDirectories in ${config.file}): ${excluded.success.join(", ") || "none"}`,
+    )
 
     const hubSection =
       hub._tag === "Success"

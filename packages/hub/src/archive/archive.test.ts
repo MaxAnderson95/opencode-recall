@@ -41,7 +41,7 @@ function handle(archive: Archive.Interface, scope: Scope.Closeable) {
     migration: archive.migration,
     putSnapshot: (snapshot: Snapshot, sourceId: number) => Effect.runSync(archive.putSnapshot(snapshot, sourceId)),
     putTombstone: (...args: Parameters<Archive.Interface["putTombstone"]>) => Effect.runSync(archive.putTombstone(...args)),
-    manifest: () => Effect.runSync(archive.manifest()),
+    manifest: (callerSourceId = 0) => Effect.runSync(archive.manifest(callerSourceId)),
     search: (search: Search, callerSourceId: number) => Effect.runPromise(archive.search(search, callerSourceId)),
     inspect: (inspect: Inspect, callerSourceId = 0) => Effect.runPromise(archive.inspect(inspect, callerSourceId)),
     expand: (expand: Expand, callerSourceId = 0) => Effect.runSync(archive.expand(expand, callerSourceId)),
@@ -226,7 +226,7 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     expect(archive.status().divergences).toEqual([])
 
     archive.putSnapshot(held, laptop)
-    archive.putTombstone({ sessionId: "ses_a", revision: 9, timeDeleted: 99 }, laptop)
+    archive.putTombstone({ sessionId: "ses_a", revision: 9, timeDeleted: 99, reason: "deleted" }, laptop)
     expect(archive.status().divergences).toEqual([])
   })
 
@@ -253,7 +253,7 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     const archive = open(path())
     const laptop = sourceOf(archive)
     archive.putSnapshot(session("ses_a", ["one", "two"]), laptop)
-    expect(archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 20 }, laptop)).toEqual({ removed: true })
+    expect(archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 20, reason: "deleted" }, laptop)).toEqual({ removed: true })
     expect(archive.status()).toMatchObject({ sessions: 0 })
 
     expect(archive.putSnapshot(session("ses_a", ["one", "two"]), laptop)).toBe("tombstoned")
@@ -268,7 +268,7 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     const archive = open(path())
     const laptop = sourceOf(archive)
     archive.putSnapshot(session("ses_a", ["one", "two"], { revision: 9 }), laptop)
-    archive.putTombstone({ sessionId: "ses_a", revision: 10, timeDeleted: 20 }, laptop)
+    archive.putTombstone({ sessionId: "ses_a", revision: 10, timeDeleted: 20, reason: "deleted" }, laptop)
     // A re-import restarts the counter below the tombstone's revision.
     expect(archive.putSnapshot(session("ses_a", ["one"], { revision: 2, lastActivity: 30 }), laptop)).toBe("archived")
     expect(archive.manifest().tombstones).toEqual([])
@@ -278,21 +278,40 @@ describe.each(backends)("archive ($name)", ({ path }) => {
   test("a tombstone for a session never archived is still recorded, and the later deletion wins", async () => {
     const archive = open(path())
     const laptop = sourceOf(archive)
-    expect(archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 50 }, laptop)).toEqual({ removed: false })
-    archive.putTombstone({ sessionId: "ses_a", revision: 2, timeDeleted: 40 }, laptop)
-    expect(archive.manifest().tombstones).toEqual([{ sessionId: "ses_a", timeDeleted: 50 }])
+    expect(archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 50, reason: "deleted" }, laptop)).toEqual({ removed: false })
+    archive.putTombstone({ sessionId: "ses_a", revision: 2, timeDeleted: 40, reason: "deleted" }, laptop)
+    expect(archive.manifest().tombstones).toEqual([{ sessionId: "ses_a", timeDeleted: 50, excludedByCaller: false }])
     expect(archive.putSnapshot(session("ses_a", ["one"], { lastActivity: 45 }), laptop)).toBe("tombstoned")
   })
 
   test("a retried deletion older than the held copy's activity leaves the re-import archived", async () => {
     const archive = open(path())
     const laptop = sourceOf(archive)
-    archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 200 }, laptop)
+    archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 200, reason: "deleted" }, laptop)
     expect(archive.putSnapshot(session("ses_a", ["one"], { lastActivity: 300 }), laptop)).toBe("archived")
-    expect(archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 200 }, laptop)).toEqual({ removed: false })
+    expect(archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 200, reason: "deleted" }, laptop)).toEqual({ removed: false })
     expect(archive.status()).toMatchObject({ sessions: 1 })
     expect(archive.manifest().tombstones).toEqual([])
-    expect(archive.putTombstone({ sessionId: "ses_a", revision: 5, timeDeleted: 400 }, laptop)).toEqual({ removed: true })
+    expect(archive.putTombstone({ sessionId: "ses_a", revision: 5, timeDeleted: 400, reason: "deleted" }, laptop)).toEqual({ removed: true })
+  })
+
+  test("an exclusion drops cached summaries and is lifted only by the excluding source's snapshot", async () => {
+    const archive = open(path())
+    const [laptop, desktop] = [sourceOf(archive, "laptop"), sourceOf(archive, "desktop")]
+    archive.putSnapshot(session("ses_a", ["one"], { lastActivity: 10 }), laptop)
+    const key = { provider: "p", model: "m", focus: "", recipe: 1 }
+    archive.putSummary({ ...key, sessionId: "ses_a", contentHash: "one", summary: "s", omitted: 0, clipped: 0 })
+    expect(archive.putTombstone({ sessionId: "ses_a", revision: 1, timeDeleted: 50, reason: "excluded" }, laptop)).toEqual({
+      removed: true,
+    })
+    expect(archive.status()).toMatchObject({ sessions: 0, summaries: 0 })
+    expect(archive.manifest(laptop).tombstones).toEqual([{ sessionId: "ses_a", timeDeleted: 50, excludedByCaller: true }])
+    expect(archive.manifest(desktop).tombstones).toEqual([{ sessionId: "ses_a", timeDeleted: 50, excludedByCaller: false }])
+
+    // Another host's copy from before the exclusion stays out; the excluding host's comes back.
+    expect(archive.putSnapshot(session("ses_a", ["one"], { lastActivity: 10 }), desktop)).toBe("tombstoned")
+    expect(archive.putSnapshot(session("ses_a", ["one"], { lastActivity: 10 }), laptop)).toBe("archived")
+    expect(archive.manifest(laptop).tombstones).toEqual([])
   })
 
   test("the manifest spans every source and lists tombstones", async () => {
@@ -301,13 +320,13 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     archive.putSnapshot(session("ses_a", ["one"]), laptop)
     archive.putSnapshot(session("ses_b", ["two", "three"], { extractorVersion: 2 }), desktop)
     archive.putSnapshot(session("ses_c", ["gone"]), desktop)
-    archive.putTombstone({ sessionId: "ses_c", revision: 2, timeDeleted: 99 }, desktop)
+    archive.putTombstone({ sessionId: "ses_c", revision: 2, timeDeleted: 99, reason: "deleted" }, desktop)
     expect(archive.manifest()).toEqual({
       sessions: [
         { sessionId: "ses_a", revision: 1, lastActivity: 11, contentHash: "one", extractorVersion: 1 },
         { sessionId: "ses_b", revision: 2, lastActivity: 12, contentHash: "two|three", extractorVersion: 2 },
       ],
-      tombstones: [{ sessionId: "ses_c", timeDeleted: 99 }],
+      tombstones: [{ sessionId: "ses_c", timeDeleted: 99, excludedByCaller: false }],
     })
   })
 
@@ -468,7 +487,7 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     expect(await search(archive, "removedword")).toEqual([])
     expect(ids(await search(archive, "freshword"))).toEqual(["ses_a"])
 
-    archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 30 }, laptop)
+    archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 30, reason: "deleted" }, laptop)
     archive.putSnapshot(session("ses_b", ["other"]), laptop)
     expect(await search(archive, "freshword")).toEqual([])
     expect(ids(await search(archive, "other"))).toEqual(["ses_b"])
@@ -591,7 +610,7 @@ describe.each(backends)("archive ($name)", ({ path }) => {
 
       if (how === "replaced") archive.putSnapshot(session("ses_a", ["walrus tusks"], { revision: 2, lastActivity: 20 }), laptop)
       else {
-        archive.putTombstone({ sessionId: "ses_a", revision: 2, timeDeleted: 20 }, laptop)
+        archive.putTombstone({ sessionId: "ses_a", revision: 2, timeDeleted: 20, reason: "deleted" }, laptop)
         archive.putSnapshot(single("ses_b", "walrus tusks"), laptop)
       }
       release()
@@ -635,7 +654,7 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     const zebra = await archive.search({ query: "zebra", limit: 8, mode: "semantic" }, 0)
     expect(zebra.sessions.flatMap((s) => s.hits.map((h) => h.snippet))).not.toContain("USER: zebra")
 
-    archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 30 }, laptop)
+    archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 30, reason: "deleted" }, laptop)
     expect(await semantic("walrus")).toEqual(["ses_b"])
   })
 
@@ -817,7 +836,7 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     expect(put({ sessionId: "nope" })).toBe("stale_revision")
 
     expect(put({ contentHash: second.contentHash })).toBe("stored")
-    archive.putTombstone({ sessionId: "ses_a", revision: 9, timeDeleted: 100 }, laptop)
+    archive.putTombstone({ sessionId: "ses_a", revision: 9, timeDeleted: 100, reason: "deleted" }, laptop)
     expect(put({ contentHash: second.contentHash })).toBe("stale_revision")
     // Re-imported with the same content after the deletion: the old summary did not survive it.
     archive.putSnapshot(session("ses_a", ["hello", "hi", "more"], { lastActivity: 200 }), laptop)
@@ -940,7 +959,7 @@ describe("archive (file-backed only)", () => {
     archive.putSnapshot(session("ses_a", ["one two", "three"]), laptop)
     archive.putSnapshot(session("ses_a", ["four"], { revision: 5, lastActivity: 50 }), laptop)
     archive.putSnapshot(session("ses_b", ["five"]), laptop)
-    archive.putTombstone({ sessionId: "ses_b", revision: 9, timeDeleted: 90 }, laptop)
+    archive.putTombstone({ sessionId: "ses_b", revision: 9, timeDeleted: 90, reason: "deleted" }, laptop)
     archive.close()
 
     const db = new Database(path)
