@@ -4,8 +4,13 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { Message, Part, Search, Snapshot } from "@opencode-recall/protocol"
+import type { Embedder } from "../embedder.ts"
+import { fakeEmbedder } from "../fake-embedder.ts"
 import { SCHEMA_VERSION, openArchive, type Archive } from "./index.ts"
 import { SEGMENTED, migrations } from "./migrations.ts"
+
+/** The first schema version with vector spaces. */
+const SPACES = 7
 
 const dirs: string[] = []
 const archives: Archive[] = []
@@ -16,8 +21,8 @@ function tempPath(): string {
   return join(dir, "archive.db")
 }
 
-function open(path: string): Archive {
-  const archive = openArchive(path)
+function open(path: string, embedder: Embedder = fakeEmbedder()): Archive {
+  const archive = openArchive(path, embedder)
   archives.push(archive)
   return archive
 }
@@ -63,8 +68,9 @@ function single(id: string, text: string, { directory = "/work", type = "user", 
   return snapshot
 }
 
-const search = (archive: Archive, query: string, filters: Partial<Search> = {}, caller = 0) =>
-  archive.search({ query, limit: 25, ...filters }, caller).sessions
+/** Lexical unless `filters` says otherwise, so ranking tests are not perturbed by the fake embedder. */
+const search = async (archive: Archive, query: string, filters: Partial<Search> = {}, caller = 0) =>
+  (await archive.search({ query, limit: 25, mode: "lexical", ...filters }, caller)).sessions
 
 const ids = (results: { sessionId: string }[]) => results.map((r) => r.sessionId).sort()
 
@@ -77,21 +83,21 @@ const backends = [
 ]
 
 describe.each(backends)("archive ($name)", ({ path }) => {
-  test("a fresh archive is migrated to the current schema and holds nothing", () => {
+  test("a fresh archive is migrated to the current schema and holds nothing", async () => {
     const archive = open(path())
     expect(archive.migration).toEqual({ from: 0, to: SCHEMA_VERSION })
-    expect(archive.status()).toEqual({ sessions: 0 })
+    expect(archive.status()).toMatchObject({ sessions: 0 })
   })
 
-  test("snapshots are counted once per session and replacing one does not duplicate it", () => {
+  test("snapshots are counted once per session and replacing one does not duplicate it", async () => {
     const archive = open(path())
     archive.putSnapshot(session("ses_a", ["hello", "hi"]), sourceOf(archive))
     archive.putSnapshot(session("ses_b", ["other"]), sourceOf(archive))
     archive.putSnapshot(session("ses_a", ["hello", "hi", "more"]), sourceOf(archive))
-    expect(archive.status()).toEqual({ sessions: 2 })
+    expect(archive.status()).toMatchObject({ sessions: 2 })
   })
 
-  test("a later position replaces the held copy; an earlier one is stale and changes nothing", () => {
+  test("a later position replaces the held copy; an earlier one is stale and changes nothing", async () => {
     const archive = open(path())
     const laptop = sourceOf(archive)
     expect(archive.putSnapshot(session("ses_a", ["one"]), laptop)).toBe("archived")
@@ -103,7 +109,7 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     expect(archive.putSnapshot(session("ses_a", ["one", "two"]), laptop)).toBe("unchanged")
   })
 
-  test("a matching hash is a no-op at any position", () => {
+  test("a matching hash is a no-op at any position", async () => {
     const archive = open(path())
     const laptop = sourceOf(archive)
     archive.putSnapshot(session("ses_a", ["one", "two"]), laptop)
@@ -116,7 +122,7 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     )
   })
 
-  test("an equal position with different content diverges unless the extractor is newer", () => {
+  test("an equal position with different content diverges unless the extractor is newer", async () => {
     const archive = open(path())
     const laptop = sourceOf(archive)
     archive.putSnapshot(session("ses_a", ["one", "two"], { extractorVersion: 2 }), laptop)
@@ -132,7 +138,7 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     )
   })
 
-  test("a rewind with newer activity is accepted and the stale pre-rewind copy never displaces it", () => {
+  test("a rewind with newer activity is accepted and the stale pre-rewind copy never displaces it", async () => {
     const archive = open(path())
     const [laptop, desktop] = [sourceOf(archive, "laptop"), sourceOf(archive, "desktop")]
     const preRewind = session("ses_a", ["x1", "x2"], { revision: 9, lastActivity: 50 })
@@ -145,22 +151,22 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     }
   })
 
-  test("a tombstone deletes the session and rejects snapshots active at or before the deletion", () => {
+  test("a tombstone deletes the session and rejects snapshots active at or before the deletion", async () => {
     const archive = open(path())
     const laptop = sourceOf(archive)
     archive.putSnapshot(session("ses_a", ["one", "two"]), laptop)
     expect(archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 20 }, laptop)).toEqual({ removed: true })
-    expect(archive.status()).toEqual({ sessions: 0 })
+    expect(archive.status()).toMatchObject({ sessions: 0 })
 
     expect(archive.putSnapshot(session("ses_a", ["one", "two"]), laptop)).toBe("tombstoned")
     // The deletion time decides, not the revision.
     expect(archive.putSnapshot(session("ses_a", ["one", "two", "x"], { revision: 99, lastActivity: 20 }), laptop)).toBe(
       "tombstoned",
     )
-    expect(archive.status()).toEqual({ sessions: 0 })
+    expect(archive.status()).toMatchObject({ sessions: 0 })
   })
 
-  test("a snapshot active after the deletion is archived and clears the tombstone", () => {
+  test("a snapshot active after the deletion is archived and clears the tombstone", async () => {
     const archive = open(path())
     const laptop = sourceOf(archive)
     archive.putSnapshot(session("ses_a", ["one", "two"], { revision: 9 }), laptop)
@@ -171,7 +177,7 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     expect(archive.putSnapshot(session("ses_a", ["one"], { revision: 1, lastActivity: 15 }), laptop)).toBe("unchanged")
   })
 
-  test("a tombstone for a session never archived is still recorded, and the later deletion wins", () => {
+  test("a tombstone for a session never archived is still recorded, and the later deletion wins", async () => {
     const archive = open(path())
     const laptop = sourceOf(archive)
     expect(archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 50 }, laptop)).toEqual({ removed: false })
@@ -180,18 +186,18 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     expect(archive.putSnapshot(session("ses_a", ["one"], { lastActivity: 45 }), laptop)).toBe("tombstoned")
   })
 
-  test("a retried deletion older than the held copy's activity leaves the re-import archived", () => {
+  test("a retried deletion older than the held copy's activity leaves the re-import archived", async () => {
     const archive = open(path())
     const laptop = sourceOf(archive)
     archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 200 }, laptop)
     expect(archive.putSnapshot(session("ses_a", ["one"], { lastActivity: 300 }), laptop)).toBe("archived")
     expect(archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 200 }, laptop)).toEqual({ removed: false })
-    expect(archive.status()).toEqual({ sessions: 1 })
+    expect(archive.status()).toMatchObject({ sessions: 1 })
     expect(archive.manifest().tombstones).toEqual([])
     expect(archive.putTombstone({ sessionId: "ses_a", revision: 5, timeDeleted: 400 }, laptop)).toEqual({ removed: true })
   })
 
-  test("the manifest spans every source and lists tombstones", () => {
+  test("the manifest spans every source and lists tombstones", async () => {
     const archive = open(path())
     const [laptop, desktop] = [sourceOf(archive, "laptop"), sourceOf(archive, "desktop")]
     archive.putSnapshot(session("ses_a", ["one"]), laptop)
@@ -207,7 +213,7 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     })
   })
 
-  test("an issued token authenticates as its source and has the documented shape", () => {
+  test("an issued token authenticates as its source and has the documented shape", async () => {
     const archive = open(path())
     const token = archive.issueToken("laptop")
     expect(token).toMatch(/^opencode-recall_[A-Za-z0-9_-]{43}$/)
@@ -217,7 +223,7 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     expect(archive.authenticate("opencode-recall_nope")).toBeNull()
   })
 
-  test("several tokens for one source share its identity; other sources get their own", () => {
+  test("several tokens for one source share its identity; other sources get their own", async () => {
     const archive = open(path())
     const [a, b, c] = [archive.issueToken("laptop"), archive.issueToken("laptop"), archive.issueToken("desktop")]
     expect(a).not.toBe(b)
@@ -225,7 +231,7 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     expect(archive.authenticate(c)!.id).not.toBe(archive.authenticate(a)!.id)
   })
 
-  test("listing shows tokens by source without their values, and revoking one fails it at once", () => {
+  test("listing shows tokens by source without their values, and revoking one fails it at once", async () => {
     const archive = open(path())
     const old = archive.issueToken("laptop")
     const fresh = archive.issueToken("laptop")
@@ -239,7 +245,7 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     expect(archive.revokeToken(tokens[0]!.id)).toBe(false)
   })
 
-  test("a revoked token's id is never reused, so repeating the revoke cannot hit a newer token", () => {
+  test("a revoked token's id is never reused, so repeating the revoke cannot hit a newer token", async () => {
     const archive = open(path())
     archive.issueToken("laptop")
     const [revoked] = archive.listTokens()
@@ -251,7 +257,7 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     expect(archive.authenticate(desktop)).toMatchObject({ name: "desktop" })
   })
 
-  test("search ranks sessions from every source with snippets, origin, own-source flag, and revision", () => {
+  test("search ranks sessions from every source with snippets, origin, own-source flag, and revision", async () => {
     const archive = open(path())
     const [laptop, desktop] = [sourceOf(archive, "laptop"), sourceOf(archive, "desktop")]
     archive.putSnapshot(single("ses_a", "the deploy failed on the ingress controller"), laptop)
@@ -261,13 +267,14 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     )
     archive.putSnapshot(single("ses_c", "nothing relevant"), desktop)
 
-    const results = search(archive, "deploy failed", {}, laptop)
+    const results = await search(archive, "deploy failed", {}, laptop)
     expect(results.map((r) => [r.sessionId, r.source, r.ownSource, r.revision])).toEqual([
       ["ses_a", "laptop", true, 1],
       ["ses_b", "desktop", false, 1],
     ])
     expect(results[0]!.hits).toEqual([
       {
+        branch: "lexical",
         messageId: "ses_a_msg_0",
         messageType: "user",
         kind: "text",
@@ -278,20 +285,20 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     expect(results[0]).toMatchObject({ title: "title", directory: "/work", lexicalMatches: 1 })
   })
 
-  test("all tokens must match unless none do, and then any may", () => {
+  test("all tokens must match unless none do, and then any may", async () => {
     const archive = open(path())
     const laptop = sourceOf(archive)
     archive.putSnapshot(single("ses_both", "alpha beta"), laptop)
     archive.putSnapshot(single("ses_one", "alpha only"), laptop)
-    expect(ids(search(archive, "alpha beta"))).toEqual(["ses_both"])
-    expect(ids(search(archive, "alpha gamma"))).toEqual(["ses_both", "ses_one"])
-    expect(search(archive, "gamma")).toEqual([])
+    expect(ids(await search(archive, "alpha beta"))).toEqual(["ses_both"])
+    expect(ids(await search(archive, "alpha gamma"))).toEqual(["ses_both", "ses_one"])
+    expect(await search(archive, "gamma")).toEqual([])
     // Operators and quotes are matched as text, never parsed.
-    expect(ids(search(archive, 'alpha" OR "x'))).toEqual(["ses_both", "ses_one"])
-    expect(search(archive, "  ")).toEqual([])
+    expect(ids(await search(archive, 'alpha" OR "x'))).toEqual(["ses_both", "ses_one"])
+    expect(await search(archive, "  ")).toEqual([])
   })
 
-  test("every filter narrows inside the query, even when the crowd fills every candidate slot", () => {
+  test("every filter narrows inside the query, even when the crowd fills every candidate slot", async () => {
     const archive = open(path())
     const [laptop, desktop] = [sourceOf(archive, "laptop"), sourceOf(archive, "desktop")]
     // 70 short, top-ranked matches that each filter rejects: a post-filter over the top 60 finds nothing.
@@ -303,19 +310,19 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     archive.putSnapshot(single("ses_early", long, { directory: "/target", time: 1 }), desktop)
     archive.putSnapshot(single("ses_late", long, { directory: "/target", time: 5000 }), desktop)
 
-    expect(ids(search(archive, "needle"))).not.toContain("ses_early")
-    expect(ids(search(archive, "needle", { directory: "targ" }))).toEqual(["ses_early", "ses_late"])
-    expect(ids(search(archive, "needle", { source: "desktop" }))).toEqual(["ses_early", "ses_late"])
-    expect(ids(search(archive, "needle", { sessionId: "ses_late" }))).toEqual(["ses_late"])
-    expect(ids(search(archive, "needle", { includeTools: false }))).toEqual(["ses_early", "ses_late"])
-    expect(ids(search(archive, "needle", { scope: "user-messages" }))).toEqual(["ses_early", "ses_late"])
-    expect(ids(search(archive, "needle", { since: 2000 }))).toEqual(["ses_late"])
-    expect(ids(search(archive, "needle", { until: 100 }))).toEqual(["ses_early"])
+    expect(ids(await search(archive, "needle"))).not.toContain("ses_early")
+    expect(ids(await search(archive, "needle", { directory: "targ" }))).toEqual(["ses_early", "ses_late"])
+    expect(ids(await search(archive, "needle", { source: "desktop" }))).toEqual(["ses_early", "ses_late"])
+    expect(ids(await search(archive, "needle", { sessionId: "ses_late" }))).toEqual(["ses_late"])
+    expect(ids(await search(archive, "needle", { includeTools: false }))).toEqual(["ses_early", "ses_late"])
+    expect(ids(await search(archive, "needle", { scope: "user-messages" }))).toEqual(["ses_early", "ses_late"])
+    expect(ids(await search(archive, "needle", { since: 2000 }))).toEqual(["ses_late"])
+    expect(ids(await search(archive, "needle", { until: 100 }))).toEqual(["ses_early"])
     // LIKE wildcards in the directory filter are literal.
-    expect(search(archive, "needle", { directory: "t_rget" })).toEqual([])
+    expect(await search(archive, "needle", { directory: "t_rget" })).toEqual([])
   })
 
-  test("user-messages scope skips synthetic context and child sessions' user messages", () => {
+  test("user-messages scope skips synthetic context and child sessions' user messages", async () => {
     const archive = open(path())
     const laptop = sourceOf(archive)
     archive.putSnapshot(single("ses_user", "needle"), laptop)
@@ -323,23 +330,23 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     const child = single("ses_child", "needle")
     child.session.parentId = "ses_user"
     archive.putSnapshot(child, laptop)
-    expect(ids(search(archive, "needle", { scope: "user-messages" }))).toEqual(["ses_user"])
-    expect(ids(search(archive, "needle"))).toEqual(["ses_child", "ses_synthetic", "ses_user"])
+    expect(ids(await search(archive, "needle", { scope: "user-messages" }))).toEqual(["ses_user"])
+    expect(ids(await search(archive, "needle"))).toEqual(["ses_child", "ses_synthetic", "ses_user"])
   })
 
-  test("the calling session is searched only before its last compaction", () => {
+  test("the calling session is searched only before its last compaction", async () => {
     const archive = open(path())
     const laptop = sourceOf(archive)
     archive.putSnapshot(session("ses_self", ["needle early", "needle late"]), laptop)
     archive.putSnapshot(single("ses_other", "needle"), laptop)
 
     const excluding = (before: number) => search(archive, "needle", { exclude: { sessionId: "ses_self", before } })
-    expect(excluding(11).find((r) => r.sessionId === "ses_self")!.hits.map((h) => h.messageId)).toEqual(["ses_self_msg_0"])
+    expect((await excluding(11)).find((r) => r.sessionId === "ses_self")!.hits.map((h) => h.messageId)).toEqual(["ses_self_msg_0"])
     // Never compacted: all of it is already in the caller's context.
-    expect(ids(excluding(0))).toEqual(["ses_other"])
+    expect(ids(await excluding(0))).toEqual(["ses_other"])
   })
 
-  test("failed tool error text is searchable; parts flagged not searchable are not", () => {
+  test("failed tool error text is searchable; parts flagged not searchable are not", async () => {
     const archive = open(path())
     const laptop = sourceOf(archive)
     const snapshot = session("ses_a", ["x"])
@@ -348,52 +355,212 @@ describe.each(backends)("archive ($name)", ({ path }) => {
       { kind: "tool", tool: "recall_search", title: "q", status: "completed", text: "recall_search q\nechoed", searchable: false },
     ]
     archive.putSnapshot(snapshot, laptop)
-    expect(search(archive, "rejected")[0]!.hits[0]).toMatchObject({ kind: "tool", snippet: "bash git push «rejected»" })
-    expect(search(archive, "echoed")).toEqual([])
+    expect((await search(archive, "rejected"))[0]!.hits[0]).toMatchObject({ kind: "tool", snippet: "bash git push «rejected»" })
+    expect(await search(archive, "echoed")).toEqual([])
   })
 
-  test("replacing or deleting a session leaves no stale postings behind", () => {
+  test("replacing or deleting a session leaves no stale postings behind", async () => {
     const archive = open(path())
     const laptop = sourceOf(archive)
     archive.putSnapshot(session("ses_a", ["removedword"]), laptop)
-    expect(ids(search(archive, "removedword"))).toEqual(["ses_a"])
+    expect(ids(await search(archive, "removedword"))).toEqual(["ses_a"])
 
     // The new segment reuses the old row id, so a posting left behind would match it.
     archive.putSnapshot(session("ses_a", ["freshword"], { revision: 2, lastActivity: 20 }), laptop)
-    expect(search(archive, "removedword")).toEqual([])
-    expect(ids(search(archive, "freshword"))).toEqual(["ses_a"])
+    expect(await search(archive, "removedword")).toEqual([])
+    expect(ids(await search(archive, "freshword"))).toEqual(["ses_a"])
 
     archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 30 }, laptop)
     archive.putSnapshot(session("ses_b", ["other"]), laptop)
-    expect(search(archive, "freshword")).toEqual([])
-    expect(ids(search(archive, "other"))).toEqual(["ses_b"])
+    expect(await search(archive, "freshword")).toEqual([])
+    expect(ids(await search(archive, "other"))).toEqual(["ses_b"])
   })
 
-  test("a long non-ASCII part is split on encoded positions and its snippets are exact", () => {
+  test("a long non-ASCII part is split on encoded positions and its snippets are exact", async () => {
     const archive = open(path())
     const laptop = sourceOf(archive)
     // Astral characters are two UTF-16 units but four UTF-8 bytes, so any unit/byte mix-up
     // shifts every later segment.
     const text = `${"😀 ".repeat(3000)}résumé needle 東京 ${"🎉".repeat(9000)} tail`
     archive.putSnapshot(single("ses_a", text), laptop)
-    const [hit] = search(archive, "needle")[0]!.hits
+    const [hit] = (await search(archive, "needle"))[0]!.hits
     expect(hit!.snippet).toContain("😀 résumé «needle» 東京 🎉")
-    expect(search(archive, "tail")[0]!.hits[0]!.snippet).toEndWith("🎉 «tail»")
+    expect((await search(archive, "tail"))[0]!.hits[0]!.snippet).toEndWith("🎉 «tail»")
   })
 
-  test("text after an embedded NUL stays searchable, in its own segment and in later ones", () => {
+  test("text after an embedded NUL stays searchable, in its own segment and in later ones", async () => {
     const archive = open(path())
     const laptop = sourceOf(archive)
     // Shell output such as `find -print0` carries NULs, and SQLite's text functions stop at one.
     archive.putSnapshot(single("ses_short", "prefix\u0000needle"), laptop)
     archive.putSnapshot(single("ses_long", `a\u0000 ${"word ".repeat(2000)}latertoken`), laptop)
-    expect(search(archive, "needle")[0]!.hits[0]!.snippet).toBe("prefix\u0000«needle»")
-    expect(ids(search(archive, "latertoken"))).toEqual(["ses_long"])
+    expect((await search(archive, "needle"))[0]!.hits[0]!.snippet).toBe("prefix\u0000«needle»")
+    expect(ids(await search(archive, "latertoken"))).toEqual(["ses_long"])
+  })
+
+  test("hybrid fuses both branches; semantic finds by meaning what BM25 misses, and each mode runs one branch", async () => {
+    const archive = open(path())
+    const laptop = sourceOf(archive)
+    archive.putSnapshot(single("ses_meaning", "the deployment kept failing overnight"), laptop)
+    archive.putSnapshot(single("ses_words", "deploying needs a green build"), laptop)
+    archive.putSnapshot(single("ses_other", "lunch plans for friday"), laptop)
+    while ((await archive.embedPending(2)) > 0);
+
+    const run = (mode: Search["mode"]) => archive.search({ query: "deploying failing", limit: 25, mode }, laptop)
+    const lexical = await run("lexical")
+    expect(ids(lexical.sessions)).toEqual(["ses_meaning", "ses_words"])
+    expect(lexical.sessions.every((s) => s.semanticMatches === 0 && s.hits.every((h) => h.branch === "lexical"))).toBe(true)
+
+    const semantic = await run("semantic")
+    expect(semantic.sessions[0]!.sessionId).toBe("ses_meaning")
+    expect(semantic.sessions[0]!.lexicalMatches).toBe(0)
+    expect(semantic.sessions[0]!.hits[0]).toEqual({
+      branch: "semantic",
+      messageId: "ses_meaning_msg_0",
+      time: 10,
+      score: expect.any(Number),
+      snippet: "USER: the deployment kept «failing» overnight",
+    })
+
+    const hybrid = await run("hybrid")
+    expect(hybrid.semanticUnavailable).toBeUndefined()
+    expect(hybrid.sessions[0]).toMatchObject({ sessionId: "ses_meaning", lexicalMatches: 1, semanticMatches: 1 })
+    expect(await run(undefined)).toEqual(hybrid)
+  })
+
+  test("a snapshot is lexically searchable before its chunks are embedded", async () => {
+    const embedder = fakeEmbedder()
+    const archive = open(path(), embedder)
+    archive.putSnapshot(session("ses_a", ["where is the needle", "in the haystack"]), sourceOf(archive))
+    expect(archive.status()).toMatchObject({ sessions: 1, chunks: 2, embeddedChunks: 0 })
+
+    const { sessions, semanticUnavailable } = await archive.search({ query: "needle", limit: 8 }, 0)
+    expect(semanticUnavailable).toBeUndefined()
+    expect(sessions.map((s) => [s.sessionId, s.lexicalMatches, s.semanticMatches])).toEqual([["ses_a", 1, 0]])
+
+    expect(await archive.embedPending(32)).toBe(2)
+    expect(archive.status()).toMatchObject({ chunks: 2, embeddedChunks: 2 })
+    // Only the `all`-scope chunk competes; the `user-messages` one answers that scope alone.
+    expect((await archive.search({ query: "needle", limit: 8 }, 0)).sessions[0]!.semanticMatches).toBe(1)
+    expect(await archive.embedPending(32)).toBe(0)
+  })
+
+  test("with the embedder down, hybrid returns lexical results and says the semantic branch was unavailable", async () => {
+    const embedder = fakeEmbedder()
+    const archive = open(path(), embedder)
+    archive.putSnapshot(single("ses_a", "the needle"), sourceOf(archive))
+    await archive.embedPending(32)
+    embedder.down = true
+
+    const hybrid = await archive.search({ query: "needle", limit: 8 }, 0)
+    expect(hybrid.semanticUnavailable).toBe("embedding model unavailable")
+    expect(hybrid.sessions.map((s) => [s.sessionId, s.lexicalMatches, s.semanticMatches])).toEqual([["ses_a", 1, 0]])
+    expect(await archive.search({ query: "needle", limit: 8, mode: "semantic" }, 0)).toEqual({
+      sessions: [],
+      semanticUnavailable: "embedding model unavailable",
+    })
+    // Lexical mode never asks the embedder.
+    expect(await archive.search({ query: "needle", limit: 8, mode: "lexical" }, 0)).not.toHaveProperty("semanticUnavailable")
+  })
+
+  test("embedding rejects and leaves the chunks queued while the embedder fails", async () => {
+    const embedder = fakeEmbedder()
+    const archive = open(path(), embedder)
+    archive.putSnapshot(single("ses_a", "the needle"), sourceOf(archive))
+    embedder.down = true
+    await expect(archive.embedPending(32)).rejects.toThrow("embedding model unavailable")
+    expect(archive.status()).toMatchObject({ chunks: 2, embeddedChunks: 0 })
+    embedder.down = false
+    expect(await archive.embedPending(32)).toBe(2)
+  })
+
+  test("a grown session keeps the vectors of its unchanged chunks and embeds only the new ones", async () => {
+    const embedder = fakeEmbedder()
+    const archive = open(path(), embedder)
+    const laptop = sourceOf(archive)
+    archive.putSnapshot(session("ses_a", ["first question", "first answer"]), laptop)
+    await archive.embedPending(32)
+    embedder.calls.length = 0
+
+    archive.putSnapshot(session("ses_a", ["first question", "first answer", "second question"]), laptop)
+    expect(archive.status()).toMatchObject({ chunks: 4, embeddedChunks: 2 })
+    await archive.embedPending(32)
+    expect(embedder.calls).toEqual([["USER: second question", "second question"]])
+    const { sessions } = await archive.search({ query: "first answer", limit: 8, mode: "semantic" }, 0)
+    expect(sessions[0]!.hits[0]).toMatchObject({ messageId: "ses_a_msg_0", snippet: "USER: «first» question ASSISTANT: «first» «answer»" })
+  })
+
+  test("a replaced or deleted session's chunks leave the semantic results", async () => {
+    const archive = open(path())
+    const laptop = sourceOf(archive)
+    const semantic = async (query: string) =>
+      ids((await archive.search({ query, limit: 8, mode: "semantic" }, 0)).sessions)
+    archive.putSnapshot(single("ses_a", "zebra"), laptop)
+    archive.putSnapshot(single("ses_b", "yak"), laptop)
+    await archive.embedPending(32)
+    expect(await semantic("zebra")).toEqual(["ses_a", "ses_b"])
+
+    archive.putSnapshot(session("ses_a", ["walrus"], { revision: 2, lastActivity: 20 }), laptop)
+    await archive.embedPending(32)
+    const zebra = await archive.search({ query: "zebra", limit: 8, mode: "semantic" }, 0)
+    expect(zebra.sessions.flatMap((s) => s.hits.map((h) => h.snippet))).not.toContain("USER: zebra")
+
+    archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 30 }, laptop)
+    expect(await semantic("walrus")).toEqual(["ses_b"])
+  })
+
+  test("every filter narrows the semantic branch before its candidate cut", async () => {
+    const archive = open(path())
+    const [laptop, desktop] = [sourceOf(archive, "laptop"), sourceOf(archive, "desktop")]
+    // 70 exact matches that each filter rejects, so a post-filter over the top 60 would find nothing.
+    for (let i = 0; i < 70; i++)
+      archive.putSnapshot(single(`ses_crowd_${i}`, "needle", { directory: "/crowd", type: "synthetic", time: 1000 }), laptop)
+    archive.putSnapshot(single("ses_early", "needle and more words", { directory: "/target", time: 1 }), desktop)
+    archive.putSnapshot(single("ses_late", "needle and more words", { directory: "/target", time: 5000 }), desktop)
+    const child = single("ses_child", "needle and more words", { directory: "/target", time: 5000 })
+    child.session.parentId = "ses_early"
+    archive.putSnapshot(child, desktop)
+    while ((await archive.embedPending(64)) > 0);
+
+    const semantic = async (filters: Partial<Search>) =>
+      ids((await archive.search({ query: "needle", limit: 25, mode: "semantic", ...filters }, 0)).sessions)
+    expect(await semantic({})).not.toContain("ses_early")
+    expect(await semantic({ directory: "targ" })).toEqual(["ses_child", "ses_early", "ses_late"])
+    expect(await semantic({ source: "desktop" })).toEqual(["ses_child", "ses_early", "ses_late"])
+    expect(await semantic({ sessionId: "ses_late" })).toEqual(["ses_late"])
+    expect(await semantic({ scope: "user-messages" })).toEqual(["ses_early", "ses_late"])
+    expect(await semantic({ directory: "/target", since: 2000 })).toEqual(["ses_child", "ses_late"])
+    expect(await semantic({ directory: "/target", until: 100 })).toEqual(["ses_early"])
+    expect(await semantic({ directory: "/target", exclude: { sessionId: "ses_late", before: 0 } })).toEqual([
+      "ses_child",
+      "ses_early",
+    ])
+  })
+
+  test("status reports the active space's full recipe", async () => {
+    const archive = open(path())
+    expect(archive.status().activeSpace).toEqual({
+      recipe: {
+        model: "fake/bag-of-words",
+        revision: "1",
+        dtype: "fp32",
+        dims: 64,
+        runtime: "fake",
+        pooling: "mean",
+        normalize: true,
+        queryPrefix: "query: ",
+        chunkChars: 1200,
+        chunkOverlap: 200,
+        turnChars: 60000,
+        rendering: 1,
+      },
+      matchesConfigured: true,
+    })
   })
 })
 
 describe("archive (file-backed only)", () => {
-  test("stores sessions, messages, and parts rows, and a replace leaves no stale rows", () => {
+  test("stores sessions, messages, and parts rows, and a replace leaves no stale rows", async () => {
     const path = tempPath()
     const archive = open(path)
     archive.putSnapshot(session("ses_a", ["one", "two", "three"]), sourceOf(archive))
@@ -409,7 +576,7 @@ describe("archive (file-backed only)", () => {
     db.close()
   })
 
-  test("tool parts keep their name, title, status, error text, and searchability", () => {
+  test("tool parts keep their name, title, status, error text, and searchability", async () => {
     const path = tempPath()
     const archive = open(path)
     const snapshot = session("ses_a", ["one"])
@@ -429,7 +596,7 @@ describe("archive (file-backed only)", () => {
     db.close()
   })
 
-  test("segments are at most 8,000 characters, stored as byte positions that reassemble the part", () => {
+  test("segments are at most 8,000 characters, stored as byte positions that reassemble the part", async () => {
     const path = tempPath()
     const archive = open(path)
     const text = `${"😀 ".repeat(3000)}résumé\u0000東京\n${"🎉".repeat(9000)} tail`
@@ -446,7 +613,7 @@ describe("archive (file-backed only)", () => {
     db.close()
   })
 
-  test("the FTS index stays consistent with its content across replaces and deletions", () => {
+  test("the FTS index stays consistent with its content across replaces and deletions", async () => {
     const path = tempPath()
     const archive = open(path)
     const laptop = sourceOf(archive)
@@ -463,7 +630,7 @@ describe("archive (file-backed only)", () => {
     db.close()
   })
 
-  test("parts archived before segments existed are segmented and searchable after migrating", () => {
+  test("parts archived before segments existed are segmented and searchable after migrating", async () => {
     const path = tempPath()
     const db = new Database(path, { create: true })
     for (const sql of migrations.slice(0, SEGMENTED - 1)) db.run(sql)
@@ -478,11 +645,11 @@ describe("archive (file-backed only)", () => {
 
     const archive = open(path)
     expect(archive.migration.from).toBe(SEGMENTED - 1)
-    expect(search(archive, "needle")[0]!.hits.map((h) => h.snippet)).toEqual(["legacy «needle»"])
-    expect(search(archive, "hidden")).toEqual([])
+    expect((await search(archive, "needle"))[0]!.hits.map((h) => h.snippet)).toEqual(["legacy «needle»"])
+    expect(await search(archive, "hidden")).toEqual([])
   })
 
-  test("source_id moves to the source of each accepted snapshot, but not on a no-op", () => {
+  test("source_id moves to the source of each accepted snapshot, but not on a no-op", async () => {
     const path = tempPath()
     const archive = open(path)
     const [laptop, desktop] = [sourceOf(archive, "laptop"), sourceOf(archive, "desktop")]
@@ -498,7 +665,7 @@ describe("archive (file-backed only)", () => {
     db.close()
   })
 
-  test("stores only a SHA-256 of each token, and attributes snapshots to the source", () => {
+  test("stores only a SHA-256 of each token, and attributes snapshots to the source", async () => {
     const path = tempPath()
     const archive = open(path)
     const token = archive.issueToken("laptop")
@@ -513,7 +680,7 @@ describe("archive (file-backed only)", () => {
     db.close()
   })
 
-  test("an archive from before sources existed migrates forward and keeps its sessions", () => {
+  test("an archive from before sources existed migrates forward and keeps its sessions", async () => {
     const path = tempPath()
     const db = new Database(path, { create: true })
     db.run(migrations[0]!)
@@ -523,41 +690,112 @@ describe("archive (file-backed only)", () => {
 
     const archive = open(path)
     expect(archive.migration).toEqual({ from: 1, to: SCHEMA_VERSION })
-    expect(archive.status()).toEqual({ sessions: 1 })
+    expect(archive.status()).toMatchObject({ sessions: 1 })
     // A row archived before positions existed sits behind any real snapshot.
     expect(archive.putSnapshot(session("ses_old", ["one"]), sourceOf(archive))).toBe("archived")
   })
 
-  test("a token revoked through another connection fails on the serving connection's next check", () => {
+  test("a token revoked through another connection fails on the serving connection's next check", async () => {
     const path = tempPath()
     const serving = open(path)
     const token = serving.issueToken("laptop")
     expect(serving.authenticate(token)).not.toBeNull()
 
-    const admin = openArchive(path)
+    const admin = openArchive(path, fakeEmbedder())
     admin.revokeToken(admin.listTokens()[0]!.id)
     admin.close()
     expect(serving.authenticate(token)).toBeNull()
   })
 
-  test("reopening an up-to-date archive applies no migrations and keeps its data", () => {
+  test("chunks whose embedding failed are embedded from the queue after a restart", async () => {
     const path = tempPath()
-    const first = openArchive(path)
+    const down = fakeEmbedder()
+    down.down = true
+    const first = openArchive(path, down)
+    first.putSnapshot(single("ses_a", "the needle"), sourceOf(first))
+    await expect(first.embedPending(32)).rejects.toThrow()
+    first.close()
+
+    const second = open(path)
+    expect(second.status()).toMatchObject({ chunks: 2, embeddedChunks: 0 })
+    expect(await second.embedPending(32)).toBe(2)
+    const { sessions } = await second.search({ query: "needle", limit: 8, mode: "semantic" }, 0)
+    expect(ids(sessions)).toEqual(["ses_a"])
+  })
+
+  test("the active space is kept when the hub's embedder differs, and the semantic branch says to reindex", async () => {
+    const path = tempPath()
+    const first = openArchive(path, fakeEmbedder())
+    first.putSnapshot(single("ses_a", "the needle"), sourceOf(first))
+    first.close()
+
+    const other = fakeEmbedder({ model: "fake/other" })
+    const archive = open(path, other)
+    expect(archive.status().activeSpace).toMatchObject({ recipe: { model: "fake/bag-of-words" }, matchesConfigured: false })
+    expect(await archive.embedPending(32)).toBe(0)
+    const { sessions, semanticUnavailable } = await archive.search({ query: "needle", limit: 8 }, 0)
+    expect(ids(sessions)).toEqual(["ses_a"])
+    expect(semanticUnavailable).toContain("run reindex")
+    expect(other.calls).toEqual([])
+  })
+
+  test("stores each chunk's exact text, provenance, and hash in the active space's chunk set", async () => {
+    const path = tempPath()
+    const archive = open(path)
+    archive.putSnapshot(session("ses_a", ["question", "answer"]), sourceOf(archive))
+    await archive.embedPending(32)
+
+    const db = new Database(path, { readonly: true })
+    const rows = db
+      .query(
+        `SELECT c.session_id, c.message_id, c.window_index, c.scope, c.time_created, c.text, c.hash, length(v.embedding) AS bytes
+         FROM chunks c JOIN chunk_sets cs ON cs.id = c.chunk_set_id JOIN vector_spaces s ON s.id = cs.space_id AND s.active = 1
+         JOIN vectors v ON v.chunk_id = c.id AND v.space_id = s.id ORDER BY c.id`,
+      )
+      .all()
+    const sha = (text: string) => new Bun.CryptoHasher("sha256").update(text).digest("hex")
+    expect(rows).toEqual([
+      { session_id: "ses_a", message_id: "ses_a_msg_0", window_index: 0, scope: "all", time_created: 10, text: "USER: question\nASSISTANT: answer", hash: sha("USER: question\nASSISTANT: answer"), bytes: 256 },
+      { session_id: "ses_a", message_id: "ses_a_msg_0", window_index: 0, scope: "user-messages", time_created: 10, text: "question", hash: sha("question"), bytes: 256 },
+    ])
+    db.close()
+  })
+
+  test("sessions archived before vector spaces existed are chunked on migrating", async () => {
+    const path = tempPath()
+    const db = new Database(path, { create: true })
+    for (const sql of migrations.slice(0, SPACES - 1)) db.run(sql)
+    db.run(`PRAGMA user_version = ${SPACES - 1}`)
+    db.run("INSERT INTO sessions (id, slug, title, directory, time_created, time_updated) VALUES ('ses_old', 's', 't', '/w', 1, 2)")
+    db.run("INSERT INTO messages VALUES ('msg_old', 'ses_old', 0, 'user', 5)")
+    db.run("INSERT INTO parts (message_id, ordinal, kind, text) VALUES ('msg_old', 0, 'text', 'legacy needle')")
+    db.close()
+
+    const archive = open(path)
+    expect(archive.status()).toMatchObject({ sessions: 1, chunks: 2, embeddedChunks: 0 })
+    await archive.embedPending(32)
+    const { sessions } = await archive.search({ query: "needle", limit: 8, mode: "semantic" }, 0)
+    expect(sessions[0]!.hits[0]!.snippet).toBe("USER: legacy «needle»")
+  })
+
+  test("reopening an up-to-date archive applies no migrations and keeps its data", async () => {
+    const path = tempPath()
+    const first = openArchive(path, fakeEmbedder())
     first.putSnapshot(session("ses_a", ["hello"]), sourceOf(first))
     first.close()
 
     const second = open(path)
     expect(second.migration).toEqual({ from: SCHEMA_VERSION, to: SCHEMA_VERSION })
-    expect(second.status()).toEqual({ sessions: 1 })
+    expect(second.status()).toMatchObject({ sessions: 1 })
   })
 
-  test("refuses a database migrated by a newer binary, naming both versions", () => {
+  test("refuses a database migrated by a newer binary, naming both versions", async () => {
     const path = tempPath()
     const db = new Database(path, { create: true })
     db.run(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`)
     db.close()
 
-    expect(() => openArchive(path)).toThrow(
+    expect(() => openArchive(path, fakeEmbedder())).toThrow(
       `archive schema version ${SCHEMA_VERSION + 1} is newer than this binary supports (${SCHEMA_VERSION})`,
     )
     const after = new Database(path, { readonly: true })

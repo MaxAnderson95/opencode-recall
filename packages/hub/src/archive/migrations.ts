@@ -87,6 +87,42 @@ export const migrations: readonly string[] = [
     FROM segments JOIN parts ON parts.id = segments.part_id;
   CREATE VIRTUAL TABLE fts USING fts5(text, content='segment_text', content_rowid='id');
   `,
+  // A space's identity is its whole recipe, stored as JSON. A chunk with no vector in its space is
+  // waiting to be embedded; that absence is the retry queue, so it survives a restart.
+  `
+  CREATE TABLE vector_spaces (
+    id INTEGER PRIMARY KEY,
+    recipe TEXT NOT NULL UNIQUE,
+    active INTEGER NOT NULL DEFAULT 0,
+    time_created INTEGER NOT NULL
+  );
+  CREATE UNIQUE INDEX vector_spaces_one_active ON vector_spaces(active) WHERE active = 1;
+  CREATE TABLE chunk_sets (
+    id INTEGER PRIMARY KEY,
+    space_id INTEGER NOT NULL REFERENCES vector_spaces(id) ON DELETE CASCADE,
+    time_created INTEGER NOT NULL
+  );
+  CREATE TABLE chunks (
+    id INTEGER PRIMARY KEY,
+    chunk_set_id INTEGER NOT NULL REFERENCES chunk_sets(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    window_index INTEGER NOT NULL,
+    scope TEXT NOT NULL,
+    time_created INTEGER NOT NULL,
+    hash TEXT NOT NULL,
+    text TEXT NOT NULL
+  );
+  CREATE INDEX chunks_set_idx ON chunks(chunk_set_id, id);
+  CREATE INDEX chunks_session_idx ON chunks(session_id);
+  CREATE INDEX chunks_message_idx ON chunks(message_id);
+  CREATE TABLE vectors (
+    chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+    space_id INTEGER NOT NULL REFERENCES vector_spaces(id) ON DELETE CASCADE,
+    embedding BLOB NOT NULL,
+    PRIMARY KEY (chunk_id, space_id)
+  ) WITHOUT ROWID;
+  `,
 ]
 
 /** The first schema version with segments; parts archived before it are segmented on migration. */

@@ -9,6 +9,7 @@
     "serve": "bun src/main.ts serve"
   },
   "dependencies": {
+    "@huggingface/transformers": "4.3.0",
     "@opencode-recall/protocol": "workspace:*",
     "zod": "4.6.5"
   }

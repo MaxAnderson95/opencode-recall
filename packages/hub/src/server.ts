@@ -77,7 +77,7 @@ async function readBody(req: Request, limits: Limits): Promise<string | Response
   }
 }
 
-type Handlers = { [V in Verb]: (request: VerbRequest<V>, source: Source) => Responses[V] }
+type Handlers = { [V in Verb]: (request: VerbRequest<V>, source: Source) => Responses[V] | Promise<Responses[V]> }
 
 /** A handler's refusal, answered with its code rather than as an internal error. */
 class Rejection extends Error {
@@ -98,8 +98,19 @@ const isVerb = (name: string): name is Verb => Object.hasOwn(requests, name)
 /**
  * The `POST /v1/<verb>` handler. Every request is authenticated before anything
  * else is read, and every body is schema-validated before any handler sees it.
+ * `onArchived` runs after each snapshot the archive accepts.
  */
-export function createHandler({ archive, log, limits = DEFAULT_LIMITS }: { archive: Archive; log: Log; limits?: Limits }) {
+export function createHandler({
+  archive,
+  log,
+  limits = DEFAULT_LIMITS,
+  onArchived = () => {},
+}: {
+  archive: Archive
+  log: Log
+  limits?: Limits
+  onArchived?: () => void
+}) {
   let ingesting = 0
 
   const handlers: Handlers = {
@@ -122,6 +133,7 @@ export function createHandler({ archive, log, limits = DEFAULT_LIMITS }: { archi
         default:
           log("info", `snapshot ${result}`, { ...fields, messages: snapshot.session.messages.length })
       }
+      if (result !== "unchanged") onArchived()
       return { outcome: result }
     },
     tombstone: ({ protocolVersion: _, ...tombstone }, source) => {
@@ -134,10 +146,10 @@ export function createHandler({ archive, log, limits = DEFAULT_LIMITS }: { archi
     status: () => archive.status(),
   }
 
-  function dispatch<V extends Verb>(verb: V, body: unknown, source: Source): Response {
+  async function dispatch<V extends Verb>(verb: V, body: unknown, source: Source): Promise<Response> {
     const parsed = requests[verb].safeParse(body)
     if (!parsed.success) return fail("invalid_request", z.prettifyError(parsed.error))
-    return Response.json(handlers[verb](parsed.data as VerbRequest<V>, source))
+    return Response.json(await handlers[verb](parsed.data as VerbRequest<V>, source))
   }
 
   return async (req: Request): Promise<Response> => {
@@ -183,7 +195,7 @@ export function createHandler({ archive, log, limits = DEFAULT_LIMITS }: { archi
       )
 
     try {
-      return dispatch(verb, body, source)
+      return await dispatch(verb, body, source)
     } catch (e) {
       if (e instanceof Rejection) return fail(e.code, e.message)
       log("error", "request failed", { verb, error: e instanceof Error ? e.message : String(e) })

@@ -6,7 +6,7 @@ import { z } from "zod"
  * while the hub records the content hash that covered it. A new verb needs no bump: a hub without
  * it answers `unknown_verb`.
  */
-export const PROTOCOL_VERSION = 2
+export const PROTOCOL_VERSION = 3
 
 const version = z.literal(PROTOCOL_VERSION)
 
@@ -69,6 +69,8 @@ export const Tombstone = z.strictObject({
 /** A corpus search. Every filter narrows the candidates inside the query, before any ranking cut. */
 export const Search = z.strictObject({
   query: z.string(),
+  /** `hybrid` (the default) fuses BM25 and cosine rankings; the others run one branch alone. */
+  mode: z.enum(["hybrid", "lexical", "semantic"]).optional(),
   /** `user-messages`: only the text of top-level sessions' user messages. */
   scope: z.enum(["all", "user-messages"]).optional(),
   /** Inclusive bounds on message creation time, in epoch milliseconds. */
@@ -119,16 +121,17 @@ export type Manifest = {
   tombstones: Pick<Tombstone, "sessionId" | "timeDeleted">[]
 }
 
-/** One matching part of a search result. */
+/**
+ * One hit of a search result. A lexical hit is a matching part; a semantic hit is an embedded
+ * chunk of the turn anchored at `messageId`, scored by cosine similarity to the query.
+ */
 export type SearchHit = {
   messageId: string
-  messageType: Message["type"]
-  kind: Part["kind"]
   /** The message's creation time. */
   time: number
-  /** An excerpt of the matching segment, query terms marked `«…»`. */
+  /** An excerpt of the matching segment or chunk, query terms marked `«…»`. */
   snippet: string
-}
+} & ({ branch: "lexical"; messageType: Message["type"]; kind: Part["kind"] } | { branch: "semantic"; score: number })
 
 /** One ranked session. Where it came from is reported and never affects its rank. */
 export type SearchResult = {
@@ -146,8 +149,35 @@ export type SearchResult = {
   revision: number
   /** Lexical candidates that matched in this session. */
   lexicalMatches: number
+  /** Semantic candidates that matched in this session. */
+  semanticMatches: number
   /** Its best hits, at most two, one per message. */
   hits: SearchHit[]
+}
+
+/**
+ * Everything that decides what a stored vector means. Two spaces with any field different hold
+ * incomparable vectors, even at the same model and dimensions.
+ */
+export type SpaceRecipe = {
+  /** Model repository and the exact artifact revision its files were fetched at. */
+  model: string
+  revision: string
+  dtype: string
+  dims: number
+  /** The runtime that tokenizes and runs the model. */
+  runtime: string
+  pooling: "mean"
+  normalize: boolean
+  /** Prepended to a query, never to a chunk. */
+  queryPrefix: string
+  /** Characters per chunk window and the overlap between consecutive windows. */
+  chunkChars: number
+  chunkOverlap: number
+  /** Characters of one turn embedded at most; a longer turn keeps its head and tail. */
+  turnChars: number
+  /** Version of the turn-pair rendering that produces chunk text. */
+  rendering: number
 }
 
 export type Responses = {
@@ -159,9 +189,19 @@ export type Responses = {
   /** `removed`: whether the archive held a copy of the session that this deleted. */
   tombstone: { removed: boolean }
   manifest: Manifest
-  /** Best first. */
-  search: { sessions: SearchResult[] }
-  status: { sessions: number }
+  /**
+   * Best first. `semanticUnavailable` is set, with the reason, when the requested semantic branch
+   * could not run; hybrid results are then lexical only.
+   */
+  search: { sessions: SearchResult[]; semanticUnavailable?: string }
+  status: {
+    sessions: number
+    /** Chunks in the active space, and how many of them are embedded; the rest wait in the queue. */
+    chunks: number
+    embeddedChunks: number
+    /** `matchesConfigured` is false when this hub would build a different space than the active one. */
+    activeSpace: { recipe: SpaceRecipe; matchesConfigured: boolean }
+  }
 }
 
 export type ErrorCode =
