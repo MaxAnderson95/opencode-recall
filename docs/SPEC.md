@@ -77,7 +77,7 @@ Shape, not literal DDL.
 
 **`sources`**: one per host. Identity, display label, created time. A source is a stable identity that outlives any individual token, so rotation does not create a new source.
 
-**`sessions`**: keyed by OpenCode session id alone, with `source_id` as an attribute. Holds slug, title, directory (raw, unnormalized), `parent_id`, `time_created`, `time_updated` (display only, not a revision), `revision`, `compaction_boundary`, `extractor_version`, and the session content hash.
+**`sessions`**: keyed by OpenCode session id alone, with `source_id` as an attribute. Holds slug, title, directory (raw, unnormalized), `parent_id`, `time_created`, `time_updated` (display only, not a revision), `revision`, `last_activity`, `compaction_boundary`, `extractor_version`, and the session content hash.
 
 Keying on the id alone means a database copied between machines, or a rebuilt host, updates one row rather than producing a duplicate conversation in results.
 
@@ -105,7 +105,7 @@ Space identity is the whole recipe, not five parameters: model artifact revision
 
 **`summaries`**: keyed by session content identity, provider, model, variant, focus, and summary-recipe version. Holds the summary and the archived revision it was computed from. Survives an index rebuild.
 
-**`tombstones`**: session id, deletion revision, and reason (deleted upstream, or excluded by configuration).
+**`tombstones`**: session id, recording `source_id`, deletion revision, deletion time, and reason (deleted upstream, or excluded by configuration).
 
 ### 3.3 Normalization
 
@@ -185,15 +185,19 @@ Search results carry the source host name, a boolean for whether that source is 
 
 ## 5. Sync
 
-**Revision** is `event_sequence.seq`, OpenCode's per-session monotonic event counter. One row exists per session, keyed by session id, and it advances with activity in that session.
+**Revision** is `event_sequence.seq`, OpenCode's per-session event counter. One row exists per session, keyed by session id. Every durable session event, including every message insert and update, takes the next value in the same transaction, so within one database it only moves forward: through ordinary turns, compaction, and revert.
 
 `session_v2.time_updated` is **not** usable as a revision. Message content is written without bumping it, and turn completion explicitly preserves it, so two different transcripts can carry the same value. Measured against the live database: **865 of 4,461 sessions (19.4%) hold messages newer than their own `time_updated`, by up to 16 hours.** `session_v2.version` is not a counter either; it holds the OpenCode version string that created the session.
 
-Before relying on `event_sequence.seq`, verify its behaviour across imports, forks, and a restored database, since a counter that resets or is copied reintroduces the same class of bug.
+**The revision rewinds.** Verified in #15 against OpenCode 2.0.14: the counter is monotonic only within one database lineage. Deleting a session removes its row, and re-importing the export restarts it at the message count (9 became 3). Restoring an older copy restores the older counter, and new activity then reuses revisions the hub already holds for a different transcript (9, rewound to 3, reached 9 again with different messages). OpenCode's own migrations have deleted every row and re-derived them lower. A copied database, or an import on another host, gives two hosts the same counter values for different transcripts. Forks are unaffected: they get a new session id.
 
-The snapshot carries the revision, the content hash, and the `extractor_version`, all read in one consistent database transaction so the revision cannot describe a different transcript than the one sent.
+**Last activity** is therefore carried alongside the revision: the later of the newest `session_message.time_created` and `session_v2.time_updated`. Messages alone are not enough, because a committed revert deletes the newest messages and moves their maximum backwards; it sets `time_updated` to the revert time instead, as do renames and the other metadata events. A stale snapshot from a racing uploader is an older read of the same database, so its last activity is never newer than what the hub holds. A snapshot after a rewind with new messages or a rename always has a newer one.
 
-**Acceptance.** The hub accepts a snapshot whose revision exceeds what it holds. Equal revision with a matching hash is a no-op. Equal revision with a differing hash is accepted **if** the `extractor_version` is higher, and rejected as `hash_divergence` otherwise.
+The snapshot carries the revision, the last activity, the content hash, and the `extractor_version`, all read in one consistent database transaction so the revision cannot describe a different transcript than the one sent.
+
+**Acceptance** orders snapshots by the **position** `(last activity, revision)`, compared in that order. A snapshot whose hash matches what the hub holds is a no-op at any position, which absorbs a rewind that did not change content. A later position is accepted; when its revision is not higher than the held one, the acceptance is a **rewind** and is recorded for `recall_status`. An equal position with a differing hash is accepted **if** the `extractor_version` is higher and rejected as `hash_divergence` if not. An earlier position is rejected as `stale_revision`.
+
+Last activity leads the comparison so acceptance is a single total order with no cycle. If a higher revision always won, a copy still holding the pre-rewind transcript at revision 9 would overwrite an accepted rewind at revision 3 on its next reconciliation, and the rewound copy would win it back on the one after. Revision breaks ties, which covers turn completion and other message updates that change content without creating a message or bumping `time_updated`.
 
 That exception is not a detail. Extraction rules will change (a tool cap, the skip list, a bug fix), which changes content hashes for sessions that never changed. Without it there is no path to re-extract history, because reconciliation only enqueues newer revisions, and every affected session would be permanently stuck.
 
@@ -201,17 +205,19 @@ A persistent `hash_divergence` means two hosts hold genuinely different copies o
 
 **Triggers.** `session.execution.succeeded`, `session.execution.failed`, and `session.execution.interrupted`, excluding `reason: "shutdown"`, plus `session.deleted`, `session.renamed`, and `session.moved`. `session.idle` is dead on v2 and is not used. A short quiet period precedes snapshot building: a subagent-heavy session fires an execution event per child turn, and each would otherwise trigger a full re-extract and re-upload of the parent.
 
-**Queue.** A work list of dirty session ids and observed revisions in `ctx.storage`. Snapshots are built at send time, so many changes to one session collapse into a single upload of current state, the queue stays small enough for a key-value store, and a session deleted before its upload sends a tombstone instead.
+**Queue.** A work list of dirty session ids and observed positions in `ctx.storage`. Snapshots are built at send time, so many changes to one session collapse into a single upload of current state, the queue stays small enough for a key-value store, and a session deleted before its upload sends a tombstone instead.
 
-**No lease.** `ctx.storage` offers only `get`, `set`, `remove`, and `scan`, with no compare-and-set, so a lease cannot be made race-free there. Duplicate uploaders are tolerated instead: the content hash turns a duplicate into a no-op, so a race costs bytes, not correctness. One rule makes this safe and is mandatory: **an acknowledgement clears only the exact work it acknowledges**, comparing the revision it uploaded against the marker, or it will erase a dirty marker created while its upload was in flight.
+**No lease.** `ctx.storage` offers only `get`, `set`, `remove`, and `scan`, with no compare-and-set, so a lease cannot be made race-free there. Duplicate uploaders are tolerated instead: the content hash turns a duplicate into a no-op, so a race costs bytes, not correctness. One rule makes this safe and is mandatory: **an acknowledgement clears only the exact work it acknowledges**, comparing the position it uploaded against the marker, or it will erase a dirty marker created while its upload was in flight.
 
-**Reconciliation.** At startup, after any event-stream reconnection, and on a periodic sweep. Startup-only is insufficient: servers run for days, the event stream is documented as lossy under slow-consumer overflow, and multiple `opencode serve` processes exist on one machine. The periodic sweep needs no network: keep the acked revision per session in `ctx.storage` and scan `session_v2` for anything ahead of it.
+**Reconciliation.** At startup, after any event-stream reconnection, and on a periodic sweep. Startup-only is insufficient: servers run for days, the event stream is documented as lossy under slow-consumer overflow, and multiple `opencode serve` processes exist on one machine. The periodic sweep needs no network: keep the acked position per session in `ctx.storage` and scan for any session whose local position is later. Revision alone would miss a rewind: after revision 9 is acked, a restore to 3 followed by new messages at 6 stays below the checkpoint if its execution event was lost. `ctx.storage` lives in `opencode.db`, so a restore rolls the checkpoint back with the transcript, and the new activity is still later than the restored checkpoint.
 
-The hub returns a manifest of session id to `(revision, content hash, extractor_version, tombstone marker)`, **across all sources, not just the caller's**. The host diffs and enqueues what is missing, locally newer, or extracted by an older extractor.
+The hub returns a manifest of session id to `(revision, last activity, content hash, extractor_version, tombstone marker)`, **across all sources, not just the caller's**. The host diffs and enqueues what is missing, at a later local position, or extracted by an older extractor.
 
 Three details, each fixing a failure the obvious version has. The manifest spans sources, or a rebuilt host under a new token sees all 4,500 sessions as missing and uploads every one to receive equal-hash no-ops. It carries the content hash, so a host can skip a matching session without building a payload. It includes tombstones, or a session deleted on the hub but still present locally is "missing" on every sweep, is uploaded, is rejected, and repeats forever.
 
-**Tombstones** block resurrection: any snapshot at or below the tombstone's revision is rejected. A strictly newer revision clears it, which is the only way a deleted session legitimately returns.
+**Tombstones** block resurrection: a snapshot whose last activity is not after the deletion time is rejected as `tombstoned`. A snapshot with activity after the deletion clears it, which is the only way a deleted session legitimately returns. Revisions are not compared here, because delete-then-reimport restarts the counter below the tombstone's revision. Re-importing sets `time_updated` to the import time, so an explicit re-import after the deletion does return the session.
+
+The deletion time depends on the reason. For an upstream deletion it is the `session.deleted` event's creation time. For an exclusion (§6) no OpenCode event exists, so it is the host's clock when the plugin applied the changed `excludeDirectories` or observed the `session.moved` into an excluded directory. Either way the plugin records the time in the queued tombstone when it is created, so every retry sends the same value. An exclusion tombstone is also cleared by any snapshot from the source that recorded it, because that host uploading the session means its exclusion was lifted; a later-activity snapshot from another source clears it as it would a deletion.
 
 **Hub-has-but-host-lacks.** Absence is never deletion. OpenCode may have removed a session while the plugin was down, the host may be new, or a restored database may be older. The host never infers a deletion from absence; only an observed `session.deleted` produces a tombstone. Sessions the hub holds from a host that no longer reports them stay in the archive.
 
@@ -289,7 +295,7 @@ Recorded because each looks obviously correct on paper and will otherwise be pro
 
 ## 10. Build order
 
-1. **Sync correctness slice, before anything else.** One host uploads a consistent snapshot, updates it, retries after a lost acknowledgement, deletes it, restarts, and reconciles. Exercise two plugin instances against it. This is where the subtle failures live, and building retrieval first would hide them behind something that appears to work.
+1. **Sync correctness slice, before anything else.** One host uploads a consistent snapshot, updates it, retries after a lost acknowledgement, deletes it, restarts, and reconciles. Exercise two plugin instances against it. Then rewind it: restore an older database, add messages, and reconcile against a second host still holding the pre-rewind copy at a higher revision; the rewound copy must stay accepted across repeated sweeps on both hosts. This is where the subtle failures live, and building retrieval first would hide them behind something that appears to work.
 2. Archive module and schema, with migrations, tested through its interface against both `:memory:` and a file-backed database.
 3. Extraction and normalization, carrying the pure functions over, verified against real sessions.
 4. Embedding and the vector space, including space identity and the active-space concept.
@@ -310,7 +316,8 @@ Running both plugins at once does not compare them: OpenCode lets a later tool r
 
 Carried deliberately, so they are found on purpose rather than in production.
 
-- `event_sequence.seq` behaviour is unverified across imports, forks, and restored databases.
+- A rewind whose only change updates an existing message (a turn completing after the restore) has no newer last activity, so it is rejected until the session gets a new message or a metadata change. A higher revision alone does not help, because last activity leads the comparison.
+- Rewind and tombstone acceptance compare message creation times written by host clocks. Within one host that is one clock; across hosts holding copies of one session, clock skew decides which copy counts as newer.
 - `ctx.generate.text` system-prompt handling is unverified.
 - Throttling the backfill to "yield to interactive searches" is not implementable across processes as stated. Either define it concretely (pause uploads for N seconds after any `recall_*` call in the same process) or drop the claim.
 - No timing in this document has been measured on the Linux host.
