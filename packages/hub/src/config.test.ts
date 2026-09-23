@@ -24,6 +24,7 @@ test("environment variables win over the JSON file, which wins over defaults", a
     dataDir: "/from/env",
     logLevel: "debug",
   })
+  expect(await load({ OPENCODE_RECALL_MODELS_DIR: "/opt/models" })).toEqual({ ...HubConfig.DEFAULTS, modelsDir: "/opt/models" })
 })
 
 test("the embedding recipe merges field by field, the environment over the file over the defaults", async () => {

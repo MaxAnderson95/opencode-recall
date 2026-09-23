@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
 import { HubError, PROTOCOL_VERSION, makeClient, type Snapshot } from "@opencode-recall/protocol"
 import { Effect, Exit, Layer, Scope } from "effect"
-import { Archive } from "./archive/index.ts"
+import { Archive, SCHEMA_VERSION } from "./archive/index.ts"
+import { Embedder } from "./embedder.ts"
 import { fakeEmbedder, fakeLayer } from "./fake-embedder.ts"
 import { Log } from "./log.ts"
 import { makeHandler, type Limits } from "./server.ts"
@@ -21,12 +22,20 @@ const failure = <A, E>(effect: Effect.Effect<A, E>) => run(Effect.flip(effect))
 const openArchive = (embedder = fakeEmbedder()) =>
   sync(Archive.make(":memory:").pipe(Effect.provide(fakeLayer(embedder)), Scope.provide(scope)))
 
-/** A handler over `on`, logging to `logLines` at debug, or nowhere. */
+/** A handler over `on` and `embedder`, logging to `logLines` at debug, or nowhere. */
 const handlerFor = (
   on: Archive.Interface,
   options: Parameters<typeof makeHandler>[0] = {},
   log: Layer.Layer<never> = Log.layer("error", () => {}),
-) => run(makeHandler(options).pipe(Effect.provideService(Archive.Service, on), Effect.provide(log)))
+  embedder: Embedder.Interface = fakeEmbedder(),
+) =>
+  run(
+    makeHandler(options).pipe(
+      Effect.provideService(Archive.Service, on),
+      Effect.provideService(Embedder.Service, embedder),
+      Effect.provide(log),
+    ),
+  )
 
 beforeEach(async () => {
   scope = sync(Scope.make())
@@ -66,6 +75,33 @@ const { session } = snapshot
 
 const clientFor = (h: typeof handler) =>
   makeClient({ url: "http://hub/", token, fetch: async (input, init) => h(new Request(input, init)) })
+
+test("the probes need no token, and readiness waits for the model and names why it failed", async () => {
+  const embedder = fakeEmbedder()
+  const h = await handlerFor(archive, {}, undefined, embedder)
+  const probe = async (path: string) => {
+    const res = await h(new Request(`http://hub${path}`))
+    return { status: res.status, body: await res.json() }
+  }
+
+  expect(await probe("/healthz")).toEqual({ status: 200, body: { ok: true, schemaVersion: SCHEMA_VERSION } })
+  expect(await probe("/readyz")).toEqual({
+    status: 503,
+    body: { ready: false, schemaVersion: SCHEMA_VERSION, model: { state: "loading" } },
+  })
+  await run(embedder.load)
+  expect(await probe("/readyz")).toEqual({
+    status: 200,
+    body: { ready: true, schemaVersion: SCHEMA_VERSION, model: { state: "loaded" } },
+  })
+  embedder.down = true
+  expect(await probe("/readyz")).toEqual({
+    status: 503,
+    body: { ready: false, schemaVersion: SCHEMA_VERSION, model: { state: "failed", error: "embedding model unavailable" } },
+  })
+  expect(await probe("/healthz")).toMatchObject({ status: 200 })
+  expect((await h(new Request("http://hub/v1/status"))).status).toBe(401)
+})
 
 test("the typed client archives a snapshot and status counts it", async () => {
   const client = clientFor(handler)

@@ -31,6 +31,35 @@ test("serve refuses to start against an archive migrated by a newer binary", asy
   expect(lines.at(-1).error).toContain(`archive schema version ${SCHEMA_VERSION + 1} is newer`)
 })
 
+test("a migration that fails leaves the archive at its old version with everything it held, and serve exits", async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), "recall-hub-"))
+  dirs.push(dataDir)
+  const path = join(dataDir, "archive.db")
+  Effect.runSync(Effect.scoped(Effect.flatMap(Archive.make(path), (a) => a.issueToken("laptop"))).pipe(Effect.provide(fakeLayer())))
+  // Claiming one version fewer makes the last migration run again: its first table is created,
+  // then its second already exists, so the migration fails partway through.
+  const before = new Database(path)
+  before.run("DROP TABLE divergences")
+  before.run(`PRAGMA user_version = ${SCHEMA_VERSION - 1}`)
+  before.close()
+
+  const proc = Bun.spawn(["bun", join(import.meta.dir, "main.ts"), "serve"], {
+    env: { ...process.env, OPENCODE_RECALL_DATA_DIR: dataDir, OPENCODE_RECALL_LISTEN: "127.0.0.1:0" },
+    stdout: "pipe",
+    stderr: "pipe",
+  })
+  expect(await proc.exited).toBe(1)
+  const last = JSON.parse((await new Response(proc.stdout).text()).trim().split("\n").at(-1)!)
+  expect(last).toMatchObject({ level: "error", msg: "startup failed" })
+  expect(last.error).toContain("already exists")
+
+  const after = new Database(path, { readonly: true })
+  expect(after.query("PRAGMA user_version").get()).toEqual({ user_version: SCHEMA_VERSION - 1 })
+  expect(after.query("SELECT count(*) AS n FROM tokens").get()).toEqual({ n: 1 })
+  expect(after.query("SELECT name FROM sqlite_master WHERE name = 'divergences'").get()).toBeNull()
+  after.close()
+})
+
 async function hub(dataDir: string, ...args: string[]) {
   const proc = Bun.spawn(["bun", join(import.meta.dir, "main.ts"), ...args], {
     env: { ...process.env, OPENCODE_RECALL_DATA_DIR: dataDir },

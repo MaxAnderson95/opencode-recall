@@ -18,6 +18,8 @@ const Chunking = Schema.Struct({
 
 export const Settings = Schema.Struct({
   dataDir: Schema.String.check(Schema.isNonEmpty()),
+  /** Where model files are read from and downloaded to; `<dataDir>/models` when unset. */
+  modelsDir: Schema.optionalKey(Schema.String.check(Schema.isNonEmpty())),
   listen: Schema.String.check(Schema.isPattern(/^.+:\d+$/, { message: "expected host:port" })),
   logLevel: LogLevel,
   /** The model this hub embeds with. Changing it (or `chunking`) takes effect through `reindex`. */
@@ -29,6 +31,7 @@ export interface Settings extends Schema.Schema.Type<typeof Settings> {}
 /** The JSON file: any subset of the settings, and nothing else. Values are checked after merging. */
 const FileSettings = Schema.Struct({
   dataDir: Schema.optionalKey(Schema.String),
+  modelsDir: Schema.optionalKey(Schema.String),
   listen: Schema.optionalKey(Schema.String),
   logLevel: Schema.optionalKey(Schema.String),
   embedding: Schema.optionalKey(
@@ -75,6 +78,7 @@ export const load: Effect.Effect<Settings, Invalid> = Effect.gen(function* () {
   const env = yield* Config.all({
     file: fromEnv("OPENCODE_RECALL_CONFIG"),
     dataDir: fromEnv("OPENCODE_RECALL_DATA_DIR"),
+    modelsDir: fromEnv("OPENCODE_RECALL_MODELS_DIR"),
     listen: fromEnv("OPENCODE_RECALL_LISTEN"),
     logLevel: fromEnv("OPENCODE_RECALL_LOG_LEVEL"),
     embedding: Config.all({

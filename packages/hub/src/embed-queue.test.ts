@@ -4,13 +4,14 @@ import { Context, Effect, Layer, Option, type Scope } from "effect"
 import { TestClock } from "effect/testing"
 import { Archive } from "./archive/index.ts"
 import { EmbedQueue } from "./embed-queue.ts"
+import type { Embedder } from "./embedder.ts"
 import { fakeEmbedder, fakeLayer } from "./fake-embedder.ts"
 import { Log } from "./log.ts"
 
 type Line = { msg: string; retryInMs?: number; chunks?: number }
 
 /** Runs `body` with an in-memory archive, a fake embedder, a captured debug log, and a test clock. */
-const run = <A, E>(body: (env: Env) => Effect.Effect<A, E, Archive.Service | Scope.Scope>) => {
+const run = <A, E>(body: (env: Env) => Effect.Effect<A, E, Archive.Service | Embedder.Service | Scope.Scope>) => {
   const lines: Line[] = []
   const embedder = fakeEmbedder()
   return Effect.runPromise(
@@ -19,7 +20,7 @@ const run = <A, E>(body: (env: Env) => Effect.Effect<A, E, Archive.Service | Sco
       const source = Option.getOrThrow(yield* archive.authenticate(yield* archive.issueToken("laptop"))).id
       return yield* body({ archive, embedder, source, lines })
     }).pipe(
-      Effect.provide(Archive.layer(":memory:").pipe(Layer.provide(fakeLayer(embedder)))),
+      Effect.provide(Archive.layer(":memory:").pipe(Layer.provideMerge(fakeLayer(embedder)))),
       Effect.provide(Layer.mergeAll(Log.layer("debug", (line) => lines.push(JSON.parse(line))), TestClock.layer())),
       Effect.scoped,
     ),
@@ -67,6 +68,15 @@ test("a kick drains the whole queue, including chunks queued while it runs", () 
         return embedded === 42
       })
       expect((yield* archive.status()).embeddedChunks).toBe(42)
+    }),
+  ))
+
+test("starting the queue loads the model even with nothing to embed", () =>
+  run(({ embedder }) =>
+    Effect.gen(function* () {
+      yield* start()
+      yield* settle(() => embedder.loaded)
+      expect(embedder.calls).toEqual([])
     }),
   ))
 

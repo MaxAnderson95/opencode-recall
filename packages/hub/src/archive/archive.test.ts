@@ -604,7 +604,7 @@ describe.each(backends)("archive ($name)", ({ path }) => {
       const fake = fakeEmbedder()
       let gate = Promise.resolve()
       const archive = open(path(), {
-        model: fake.model,
+        ...fake,
         embed: (texts) => Effect.promise(() => gate).pipe(Effect.andThen(fake.embed(texts))),
       })
       const laptop = sourceOf(archive)

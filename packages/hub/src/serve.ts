@@ -11,7 +11,7 @@ import { makeHandler } from "./server.ts"
 
 export const archivePath = (config: HubConfig.Settings) => join(config.dataDir, "archive.db")
 
-export const modelsDir = (config: HubConfig.Settings) => join(config.dataDir, "models")
+export const modelsDir = (config: HubConfig.Settings) => config.modelsDir ?? join(config.dataDir, "models")
 
 /** The vector space the configuration asks for: its embedding model and chunking. */
 export const configuredRecipe = (config: HubConfig.Settings) =>
@@ -37,7 +37,7 @@ export const dataArchive = archiveWith(configuredRecipe)
  * The embedder for the active space, so a hub whose configured model differs keeps answering
  * queries and embedding new chunks on the vectors it has until a reindex. The configured model
  * when there is no active space yet, or the active one was made by another runtime than this
- * binary's. Model files live under `<dataDir>/models`; nothing loads until used.
+ * binary's. Model files live under {@link modelsDir}; nothing loads until used.
  */
 export const dataEmbedder = Layer.unwrap(
   Effect.gen(function* () {
@@ -98,11 +98,11 @@ type EmbedderLayer = Layer.Layer<Embedder.Service, never, HubConfig.Service>
 /**
  * The data directory's archive embedding with `fallback`, set to build the configured recipe; or,
  * given an `embedder`, embedding with it and set to build its model with the configured chunking,
- * which is how tests stand in for a configured model.
+ * which is how tests stand in for a configured model. The embedder is provided alongside it.
  */
 export const archive = (embedder: EmbedderLayer | undefined, fallback: EmbedderLayer) =>
   (embedder ? archiveWith((config, model) => Archive.recipeFor(model, config.chunking)) : dataArchive).pipe(
-    Layer.provide(embedder ?? fallback),
+    Layer.provideMerge(embedder ?? fallback),
   )
 
 /**
