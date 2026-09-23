@@ -3,7 +3,8 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import { Plugin } from "@opencode/plugin"
 import { configFilePath, loadHubConfig } from "./config.ts"
-import { readPosition, readPositions, readSnapshot } from "./source.ts"
+import { searchTool } from "./search.ts"
+import { compactionBoundary, readPosition, readPositions, readSnapshot } from "./source.ts"
 import { createUploader } from "./uploader.ts"
 
 function sourceDbPath(env: Record<string, string | undefined>): string {
@@ -17,6 +18,7 @@ export default Plugin.define({
   setup: async (ctx) => {
     const env = process.env
     const db = new Database(sourceDbPath(env), { readonly: true })
+    const loadConfig = () => loadHubConfig(env, configFilePath(env))
     const uploader = createUploader({
       source: {
         position: (id) => readPosition(db, id),
@@ -24,7 +26,10 @@ export default Plugin.define({
         snapshot: (id) => readSnapshot(db, id),
       },
       storage: ctx.storage,
-      loadConfig: () => loadHubConfig(env, configFilePath(env)),
+      loadConfig,
+    })
+    await ctx.tool.transform((tools) => {
+      tools.add(searchTool({ loadConfig, compactionBoundary: (id) => compactionBoundary(db, id) }))
     })
     const abort = new AbortController()
     void uploader.reconcile()

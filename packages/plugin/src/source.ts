@@ -60,6 +60,17 @@ export function readSnapshot(db: Database, sessionId: string): Snapshot | null {
   })()
 }
 
+/** Time of the session's latest completed compaction, or 0 if it never compacted. */
+export function compactionBoundary(db: Database, sessionId: string): number {
+  const row = db
+    .query(
+      `SELECT max(time_created) AS t FROM session_message
+       WHERE session_id = ? AND type = 'compaction' AND json_extract(data, '$.status') = 'completed'`,
+    )
+    .get(sessionId) as { t: number | null }
+  return row.t ?? 0
+}
+
 /** Read one v2 session's transcript, or `null` if the database does not hold it or it is never uploaded. */
 export function readSession(db: Database, sessionId: string): Session | null {
   const row = db

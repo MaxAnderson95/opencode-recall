@@ -130,6 +130,7 @@ export function createHandler({ archive, log, limits = DEFAULT_LIMITS }: { archi
       return result
     },
     manifest: () => archive.manifest(),
+    search: ({ protocolVersion: _, ...search }, source) => archive.search(search, source.id),
     status: () => archive.status(),
   }
 

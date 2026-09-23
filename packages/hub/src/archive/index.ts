@@ -6,8 +6,9 @@
  */
 import { Database } from "bun:sqlite"
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
-import type { Manifest, Snapshot, Tombstone } from "@opencode-recall/protocol"
-import { migrations } from "./migrations.ts"
+import type { Manifest, Search, SearchHit, SearchResult, Snapshot, Tombstone } from "@opencode-recall/protocol"
+import { SEGMENTED, migrations } from "./migrations.ts"
+import { ftsQuery, fuse, makeSnippet, queryTokens, segments } from "./text.ts"
 
 export const SCHEMA_VERSION = migrations.length
 
@@ -43,6 +44,13 @@ export type Archive = {
   putTombstone(tombstone: Tombstone, sourceId: number): { removed: boolean }
   /** Every held session's position and hash, and every tombstone, across all sources. */
   manifest(): Manifest
+  /**
+   * BM25-ranked sessions across every source, each with its best hits. Every filter is applied in
+   * the query before the candidate cut. The query's tokens must all match (each quoted as a
+   * phrase); when none do and there are several tokens, any may match. `ownSource` compares each
+   * session's source against `callerSourceId`.
+   */
+  search(search: Search, callerSourceId: number): { sessions: SearchResult[] }
   /**
    * Mint a token for the named source, creating the source if it is new.
    * The returned value is the only copy; the archive keeps just its hash.
@@ -85,6 +93,11 @@ function migrate(db: Database): { from: number; to: number } {
           `archive schema version ${from} is newer than this binary supports (${SCHEMA_VERSION}); refusing to start`,
         )
       for (const sql of migrations.slice(from)) db.run(sql)
+      if (from > 0 && from < SEGMENTED) {
+        const segment = segmenter(db)
+        const rows = db.query("SELECT id, text FROM parts WHERE searchable = 1").all() as { id: number; text: string }[]
+        for (const { id, text } of rows) segment(id, text)
+      }
       // PRAGMA takes no bound parameters; SCHEMA_VERSION is a compile-time integer.
       db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`)
       return { from, to: SCHEMA_VERSION }
@@ -92,8 +105,70 @@ function migrate(db: Database): { from: number; to: number } {
     .immediate()
 }
 
+/** At most this many characters (code points) per FTS row. */
+const SEGMENT_CHARS = 8_000
+/** Lexical candidates ranked before fusion. */
+const CANDIDATES = 60
+const RRF_K = 60
+
+/** Write a searchable part's segments and index each one from the view, so indexed text is what a delete re-reads. */
+function segmenter(db: Database) {
+  const insertSegment = db.prepare("INSERT INTO segments (part_id, start, length) VALUES (?, ?, ?)")
+  const indexSegments = db.prepare(
+    "INSERT INTO fts (rowid, text) SELECT id, text FROM segment_text WHERE id IN (SELECT id FROM segments WHERE part_id = ?)",
+  )
+  return (partId: number, text: string) => {
+    for (const { start, length } of segments(text, SEGMENT_CHARS)) insertSegment.run(partId, start, length)
+    indexSegments.run(partId)
+  }
+}
+
+type Candidate = Omit<SearchHit, "snippet"> & { sessionId: string; segmentId: number }
+
+/** The lexical branch's statement and arguments. Every filter is a condition here, never a post-filter. */
+function lexicalQuery(match: string, f: Search): { sql: string; args: (string | number)[] } {
+  const where = ["fts MATCH ?"]
+  const args: (string | number)[] = [match]
+  const add = (condition: string, ...values: (string | number)[]) => {
+    where.push(condition)
+    args.push(...values)
+  }
+  if (f.sessionId !== undefined) add("s.id = ?", f.sessionId)
+  if (f.directory !== undefined) add("s.directory LIKE ? ESCAPE '\\'", `%${f.directory.replace(/[\\%_]/g, "\\$&")}%`)
+  if (f.source !== undefined) add("src.name = ?", f.source)
+  if (f.includeTools === false) add("p.kind <> 'tool'")
+  if (f.scope === "user-messages") add("m.type = 'user' AND p.kind = 'text' AND s.parent_id IS NULL")
+  if (f.since !== undefined) add("m.time_created >= ?", f.since)
+  if (f.until !== undefined) add("m.time_created <= ?", f.until)
+  if (f.exclude) add("NOT (s.id = ? AND m.time_created >= ?)", f.exclude.sessionId, f.exclude.before)
+  const sql = `SELECT s.id AS sessionId, m.id AS messageId, m.type AS messageType, p.kind, m.time_created AS time,
+      seg.id AS segmentId
+    FROM fts
+    JOIN segments seg ON seg.id = fts.rowid
+    JOIN parts p ON p.id = seg.part_id
+    JOIN messages m ON m.id = p.message_id
+    JOIN sessions s ON s.id = m.session_id
+    LEFT JOIN sources src ON src.id = s.source_id
+    WHERE ${where.join(" AND ")}
+    ORDER BY rank LIMIT ${CANDIDATES}`
+  return { sql, args }
+}
+
 function bind(db: Database, migration: { from: number; to: number }): Archive {
-  const deleteSession = db.prepare("DELETE FROM sessions WHERE id = ?")
+  const segment = segmenter(db)
+  // FTS rows first: the delete re-reads each row's text through the view to find its postings.
+  const unindexSession = db.prepare(
+    `INSERT INTO fts (fts, rowid, text)
+     SELECT 'delete', v.id, v.text FROM segment_text v
+     JOIN segments seg ON seg.id = v.id JOIN parts p ON p.id = seg.part_id JOIN messages m ON m.id = p.message_id
+     WHERE m.session_id = ?`,
+  )
+  const deleteSessionRow = db.prepare("DELETE FROM sessions WHERE id = ?")
+  /** Cascades to messages, parts, and segments, so a shrunken transcript leaves nothing behind. */
+  const deleteSession = (id: string) => {
+    unindexSession.run(id)
+    return deleteSessionRow.run(id).changes > 0
+  }
   const selectHeld = db.prepare(
     `SELECT revision, last_activity AS lastActivity, extractor_version AS extractorVersion, content_hash AS contentHash
      FROM sessions WHERE id = ?`,
@@ -112,6 +187,12 @@ function bind(db: Database, migration: { from: number; to: number }): Archive {
     `INSERT INTO parts (message_id, ordinal, kind, text, tool_name, tool_title, status, error, searchable)
      VALUES ($messageId, $ordinal, $kind, $text, $toolName, $toolTitle, $status, $error, $searchable)`,
   )
+  const selectResultSession = db.prepare(
+    `SELECT s.id AS sessionId, s.slug, s.title, s.directory, s.parent_id AS parentId, s.time_updated AS timeUpdated,
+       coalesce(src.name, '') AS source, s.source_id IS ? AS ownSource, s.revision
+     FROM sessions s LEFT JOIN sources src ON src.id = s.source_id WHERE s.id = ?`,
+  )
+  const selectSegmentText = db.prepare("SELECT text FROM segment_text WHERE id = ?")
   const countSessions = db.prepare("SELECT count(*) AS n FROM sessions")
   const selectTombstone = db.prepare("SELECT time_deleted AS timeDeleted FROM tombstones WHERE session_id = ?")
   const deleteTombstone = db.prepare("DELETE FROM tombstones WHERE session_id = ?")
@@ -170,8 +251,7 @@ function bind(db: Database, migration: { from: number; to: number }): Archive {
     if (result !== "archived" && result !== "rewound") return result
 
     if (tombstone) deleteTombstone.run(session.id)
-    // Cascades to messages and parts, so a shrunken transcript leaves nothing behind.
-    deleteSession.run(session.id)
+    deleteSession(session.id)
     insertSession.run({
       id: session.id,
       sourceId,
@@ -196,7 +276,8 @@ function bind(db: Database, migration: { from: number; to: number }): Archive {
       })
       message.parts.forEach((part, partOrdinal) => {
         const tool = part.kind === "tool" ? part : undefined
-        insertPart.run({
+        const searchable = tool?.searchable ?? true
+        const { lastInsertRowid } = insertPart.run({
           messageId: message.id,
           ordinal: partOrdinal,
           kind: part.kind,
@@ -205,8 +286,9 @@ function bind(db: Database, migration: { from: number; to: number }): Archive {
           toolTitle: tool?.title ?? null,
           status: tool?.status ?? null,
           error: tool?.error ?? null,
-          searchable: tool?.searchable ?? true,
+          searchable,
         })
+        if (searchable) segment(Number(lastInsertRowid), part.text)
       })
     })
     return result
@@ -217,7 +299,41 @@ function bind(db: Database, migration: { from: number; to: number }): Archive {
     const held = selectHeld.get(tombstone.sessionId) as Held | null
     if (held && held.lastActivity > tombstone.timeDeleted) return { removed: false }
     upsertTombstone.run({ ...tombstone, sourceId })
-    return { removed: deleteSession.run(tombstone.sessionId).changes > 0 }
+    return { removed: deleteSession(tombstone.sessionId) }
+  })
+
+  const lexical = (match: string, f: Search): Candidate[] => {
+    const { sql, args } = lexicalQuery(match, f)
+    // `query` caches the compiled statement per distinct filter combination.
+    return db.query(sql).all(...args) as Candidate[]
+  }
+
+  const search = db.transaction((f: Search, callerSourceId: number) => {
+    const all = ftsQuery(f.query, "AND")
+    if (!all) return { sessions: [] }
+    let candidates = lexical(all, f)
+    const tokens = queryTokens(f.query)
+    if (!candidates.length && tokens.length > 1) candidates = lexical(ftsQuery(f.query, "OR")!, f)
+
+    const groups = fuse([{ hits: candidates, which: "lex" }], (h) => h.sessionId, {
+      rrfK: RRF_K,
+      perBranchCap: 3,
+      hitsPerKey: 2,
+    })
+    const sessions = groups.slice(0, f.limit).map((g): SearchResult => {
+      type Row = Omit<SearchResult, "lexicalMatches" | "hits" | "ownSource"> & { ownSource: number }
+      const row = selectResultSession.get(callerSourceId, g.key) as Row
+      return {
+        ...row,
+        ownSource: row.ownSource === 1,
+        lexicalMatches: g.nLex,
+        hits: g.hits.map(({ sessionId: _, segmentId, ...hit }) => {
+          const { text } = selectSegmentText.get(segmentId) as { text: string }
+          return { ...hit, snippet: makeSnippet(text, tokens) }
+        }),
+      }
+    })
+    return { sessions }
   })
 
   return {
@@ -229,6 +345,7 @@ function bind(db: Database, migration: { from: number; to: number }): Archive {
       sessions: selectManifestSessions.all() as Manifest["sessions"],
       tombstones: selectManifestTombstones.all() as Manifest["tombstones"],
     })),
+    search: (f, callerSourceId) => search(f, callerSourceId),
     issueToken: (source) => issueToken(source),
     listTokens: () => selectTokens.all() as TokenInfo[],
     revokeToken: (id) => deleteToken.run(id).changes > 0,

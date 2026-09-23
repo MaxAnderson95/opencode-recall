@@ -3,7 +3,8 @@ import { z } from "zod"
 /**
  * Bumped on any change to a request or response shape, including an added field. Request schemas
  * reject unknown fields, so a field sent without a bump fails loudly instead of being stripped
- * while the hub records the content hash that covered it.
+ * while the hub records the content hash that covered it. A new verb needs no bump: a hub without
+ * it answers `unknown_verb`.
  */
 export const PROTOCOL_VERSION = 2
 
@@ -65,10 +66,35 @@ export const Tombstone = z.strictObject({
   timeDeleted: z.number().int(),
 })
 
+/** A corpus search. Every filter narrows the candidates inside the query, before any ranking cut. */
+export const Search = z.strictObject({
+  query: z.string(),
+  /** `user-messages`: only the text of top-level sessions' user messages. */
+  scope: z.enum(["all", "user-messages"]).optional(),
+  /** Inclusive bounds on message creation time, in epoch milliseconds. */
+  since: z.number().int().optional(),
+  until: z.number().int().optional(),
+  /** Case-insensitive substring of the session's working directory. */
+  directory: z.string().optional(),
+  /** Name of the host the session was archived from. */
+  source: z.string().optional(),
+  sessionId: z.string().optional(),
+  /** Whether tool output is matched; default true. */
+  includeTools: z.boolean().optional(),
+  /** Sessions returned. */
+  limit: z.number().int().min(1).max(25),
+  /**
+   * The calling session, whose content the caller can already see: its messages created at or after
+   * `before` are left out. `before` is the time of its last compaction, or 0 if it never compacted.
+   */
+  exclude: z.strictObject({ sessionId: z.string().min(1), before: z.number().int() }).optional(),
+})
+
 export const requests = {
   snapshot: z.strictObject({ protocolVersion: version, ...Snapshot.shape }),
   tombstone: z.strictObject({ protocolVersion: version, ...Tombstone.shape }),
   manifest: z.strictObject({ protocolVersion: version }),
+  search: z.strictObject({ protocolVersion: version, ...Search.shape }),
   status: z.strictObject({ protocolVersion: version }),
 }
 
@@ -84,12 +110,44 @@ export type Message = z.infer<typeof Message>
 export type Session = z.infer<typeof Session>
 export type Snapshot = z.infer<typeof Snapshot>
 export type Tombstone = z.infer<typeof Tombstone>
+export type Search = z.infer<typeof Search>
 export type Request<V extends Verb> = z.infer<(typeof requests)[V]>
 
 /** What the hub holds for every session from every source, so a host can diff without uploading. */
 export type Manifest = {
   sessions: ({ sessionId: string } & Pick<Snapshot, "revision" | "lastActivity" | "contentHash" | "extractorVersion">)[]
   tombstones: Pick<Tombstone, "sessionId" | "timeDeleted">[]
+}
+
+/** One matching part of a search result. */
+export type SearchHit = {
+  messageId: string
+  messageType: Message["type"]
+  kind: Part["kind"]
+  /** The message's creation time. */
+  time: number
+  /** An excerpt of the matching segment, query terms marked `«…»`. */
+  snippet: string
+}
+
+/** One ranked session. Where it came from is reported and never affects its rank. */
+export type SearchResult = {
+  sessionId: string
+  slug: string
+  title: string
+  directory: string
+  parentId: string | null
+  timeUpdated: number
+  /** Name of the host the archived copy was last accepted from. */
+  source: string
+  /** Whether that host is the caller's own. */
+  ownSource: boolean
+  /** The archived revision, which may trail the host's newest turn. */
+  revision: number
+  /** Lexical candidates that matched in this session. */
+  lexicalMatches: number
+  /** Its best hits, at most two, one per message. */
+  hits: SearchHit[]
 }
 
 export type Responses = {
@@ -101,6 +159,8 @@ export type Responses = {
   /** `removed`: whether the archive held a copy of the session that this deleted. */
   tombstone: { removed: boolean }
   manifest: Manifest
+  /** Best first. */
+  search: { sessions: SearchResult[] }
   status: { sessions: number }
 }
 
@@ -167,6 +227,7 @@ export function createClient({ url, token, fetch: fetcher = fetch }: ClientOptio
     snapshot: (snapshot: Snapshot) => call("snapshot", snapshot),
     tombstone: (tombstone: Tombstone) => call("tombstone", tombstone),
     manifest: () => call("manifest", {}),
+    search: (search: Search) => call("search", search),
     status: () => call("status", {}),
   }
 }
