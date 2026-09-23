@@ -105,7 +105,7 @@ function migrate(db: Database): { from: number; to: number } {
     .immediate()
 }
 
-/** At most this many characters (code points) per FTS row. */
+/** At most this many characters (UTF-16 code units) per FTS row. */
 const SEGMENT_CHARS = 8_000
 /** Lexical candidates ranked before fusion. */
 const CANDIDATES = 60

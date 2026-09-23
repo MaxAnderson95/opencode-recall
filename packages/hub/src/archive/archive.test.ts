@@ -369,16 +369,26 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     expect(ids(search(archive, "other"))).toEqual(["ses_b"])
   })
 
-  test("a long non-ASCII part is split on character positions and its snippets are exact", () => {
+  test("a long non-ASCII part is split on encoded positions and its snippets are exact", () => {
     const archive = open(path())
     const laptop = sourceOf(archive)
-    // Astral characters are two UTF-16 units but one SQLite character, so any unit/character mix-up
+    // Astral characters are two UTF-16 units but four UTF-8 bytes, so any unit/byte mix-up
     // shifts every later segment.
     const text = `${"😀 ".repeat(3000)}résumé needle 東京 ${"🎉".repeat(9000)} tail`
     archive.putSnapshot(single("ses_a", text), laptop)
     const [hit] = search(archive, "needle")[0]!.hits
     expect(hit!.snippet).toContain("😀 résumé «needle» 東京 🎉")
     expect(search(archive, "tail")[0]!.hits[0]!.snippet).toEndWith("🎉 «tail»")
+  })
+
+  test("text after an embedded NUL stays searchable, in its own segment and in later ones", () => {
+    const archive = open(path())
+    const laptop = sourceOf(archive)
+    // Shell output such as `find -print0` carries NULs, and SQLite's text functions stop at one.
+    archive.putSnapshot(single("ses_short", "prefix\u0000needle"), laptop)
+    archive.putSnapshot(single("ses_long", `a\u0000 ${"word ".repeat(2000)}latertoken`), laptop)
+    expect(search(archive, "needle")[0]!.hits[0]!.snippet).toBe("prefix\u0000«needle»")
+    expect(ids(search(archive, "latertoken"))).toEqual(["ses_long"])
   })
 })
 
@@ -419,21 +429,17 @@ describe("archive (file-backed only)", () => {
     db.close()
   })
 
-  test("segments are at most 8,000 characters, stored as substr positions that reassemble the part", () => {
+  test("segments are at most 8,000 characters, stored as byte positions that reassemble the part", () => {
     const path = tempPath()
     const archive = open(path)
-    const text = `${"😀 ".repeat(3000)}résumé 東京\n${"🎉".repeat(9000)} tail`
+    const text = `${"😀 ".repeat(3000)}résumé\u0000東京\n${"🎉".repeat(9000)} tail`
     archive.putSnapshot(single("ses_a", text), sourceOf(archive))
 
     const db = new Database(path, { readonly: true })
-    const rows = db.query("SELECT text, length(text) AS chars FROM segment_text ORDER BY id").all() as {
-      text: string
-      chars: number
-    }[]
+    const rows = db.query("SELECT text FROM segment_text ORDER BY id").all() as { text: string }[]
     expect(rows.length).toBeGreaterThan(2)
-    expect(rows.every((r) => r.chars <= 8_000)).toBe(true)
     expect(rows.map((r) => r.text).join("")).toBe(text)
-    // Each segment is the JavaScript slice it was cut as, so a UTF-16 offset read as a character
+    // Each segment is the JavaScript slice it was cut as, so a UTF-16 offset read as a byte
     // position (which still tiles the text) is caught too.
     expect(rows[0]!.text).toBe("😀 ".repeat(2666))
     expect(rows.every((r) => r.text.length <= 8_000)).toBe(true)

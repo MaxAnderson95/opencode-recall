@@ -27,8 +27,8 @@ const isHighSurrogate = (code: number) => code >= 0xd800 && code <= 0xdbff
  *
  * Long parts are split rather than truncated: nothing becomes unsearchable, and BM25 length
  * normalisation stops being skewed by the occasional 400 KB message. Breaks prefer a newline, then
- * whitespace, near the end of each segment. A hard cut never splits a surrogate pair, since SQLite
- * would see one character where JavaScript sees two halves.
+ * whitespace, near the end of each segment. A hard cut never splits a surrogate pair, since each half
+ * alone would encode to UTF-8 as a replacement character.
  */
 function segmentText(text: string, size: number): { start: number; text: string }[] {
   if (size <= 0 || text.length <= size) return text.trim() ? [{ start: 0, text }] : []
@@ -51,24 +51,17 @@ function segmentText(text: string, size: number): { start: number; text: string 
   return out
 }
 
-/** Code points in `text[from, to)`, which is what SQLite counts as characters. */
-function codePoints(text: string, from: number, to: number): number {
-  let n = 0
-  for (let i = from; i < to; i++, n++) if (isHighSurrogate(text.charCodeAt(i)) && i + 1 < to) i++
-  return n
-}
-
 /**
- * The segments of a part's text, as SQLite `substr` character positions: `start` is zero-based and
- * `length` counts code points, not the UTF-16 code units JavaScript string offsets use.
+ * The segments of a part's text, as positions in its UTF-8 encoding: `start` is a zero-based byte
+ * offset and `length` a byte count, not the UTF-16 code units JavaScript string offsets use.
  */
 export function segments(text: string, size: number): { start: number; length: number }[] {
   let unit = 0
-  let point = 0
+  let byte = 0
   return segmentText(text, size).map((seg) => {
-    point += codePoints(text, unit, seg.start)
+    byte += Buffer.byteLength(text.slice(unit, seg.start))
     unit = seg.start
-    return { start: point, length: codePoints(seg.text, 0, seg.text.length) }
+    return { start: byte, length: Buffer.byteLength(seg.text) }
   })
 }
 
