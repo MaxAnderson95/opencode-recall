@@ -9,6 +9,12 @@ const ANSI_RE =
 
 export const stripAnsi = (text: string) => text.replace(ANSI_RE, "")
 
+/** One line of at most `max` characters, plus `…` when cut. */
+export function clean(text: string, max: number): string {
+  const out = stripAnsi(text).replace(/\s+/g, " ").trim()
+  return out.length > max ? out.slice(0, max) + "…" : out
+}
+
 const TOKEN_RE = /[\p{L}\p{N}_./@-]+/gu
 
 export function queryTokens(query: string): string[] {
