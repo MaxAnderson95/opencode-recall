@@ -271,9 +271,19 @@ Current baseline, 393 real queries:
 | semantic only | 0.4198 | 0.2901 | 0.6081 | 0.7226 |
 | hybrid | 0.5069 | 0.3664 | 0.7023 | 0.7863 |
 
-The columns are **hit rate, not recall**: they measure whether any relevant session appears in the top K, and some queries have several relevant sessions. The harness currently labels them `R@K`, which is wrong and should be renamed.
+The columns are **hit rate, not recall**: they measure whether any relevant session appears in the top K, and some queries have several relevant sessions.
 
-Four further limits on what these numbers can support. Relevance is inferred from a subsequent tool call, and opening a session can be an investigation that proved irrelevant. Labels carry incumbent bias, since the human could only open what the current ranking showed. The harness reimplements the semantic branch so it can swap vector sets, so it does not exercise the entire production path, and it must be ported to the hub's Archive module before step 4 can gate anything. And labels regenerate against a growing corpus, so the corpus, labels, and configuration must be frozen for any comparison to be reproducible.
+That table came from the single-machine plugin's index, with the semantic branch reimplemented in the harness. The harness now runs every query through the hub's Archive module on a **frozen corpus**: the same 393 labels, every v2 session up to the newest labelled search (4,418 sessions, 74,675 chunks), and a record of the labels' hash, every session's content hash, and the vector space recipe, which scoring checks before it runs. Two runs over one frozen corpus give identical numbers. Reproduced there:
+
+| configuration | MRR@10 | Hit@1 | Hit@5 | Hit@10 |
+| --- | --- | --- | --- | --- |
+| BM25 only | 0.4106 | 0.3053 | 0.5471 | 0.6234 |
+| semantic only | 0.4177 | 0.2875 | 0.6081 | 0.7048 |
+| hybrid | 0.5116 | 0.3766 | 0.7099 | 0.7786 |
+
+Every cell is within 0.02 of the table above. The largest gap is semantic Hit@10, 7 queries lower with none higher. Two of those queries point only at sessions that exist solely in OpenCode's v1 tables, which §3.3 drops, so no v2 archive can find them. The other five sat at ranks 7 to 10 in the old harness and rank 11 to 22 here, with one beyond 25.
+
+Three further limits on what these numbers can support. Relevance is inferred from a subsequent tool call, and opening a session can be an investigation that proved irrelevant. Labels carry incumbent bias, since the human could only open what the current ranking showed. And a change to chunk rendering or the embedding recipe needs a newly frozen corpus, since the recorded fingerprint covers both.
 
 ## 9. Rejected, with the measurements that rejected them
 
