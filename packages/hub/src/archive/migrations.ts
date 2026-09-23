@@ -31,4 +31,19 @@ export const migrations: readonly string[] = [
   );
   CREATE INDEX parts_message_idx ON parts(message_id, ordinal);
   `,
+  `
+  CREATE TABLE sources (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    time_created INTEGER NOT NULL
+  );
+  CREATE TABLE tokens (
+    -- AUTOINCREMENT: ids are revocation handles, so a revoked id must never name a newer token.
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER NOT NULL REFERENCES sources(id),
+    hash BLOB NOT NULL UNIQUE,
+    time_created INTEGER NOT NULL
+  );
+  ALTER TABLE sessions ADD COLUMN source_id INTEGER REFERENCES sources(id);
+  `,
 ]

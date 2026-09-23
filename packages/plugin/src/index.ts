@@ -2,8 +2,10 @@ import { Database } from "bun:sqlite"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { Plugin } from "@opencode/plugin"
-import { createClient, type Client } from "@opencode-recall/protocol"
+import type { Client } from "@opencode-recall/protocol"
+import { configFilePath, loadHubConfig } from "./config.ts"
 import { readSession } from "./source.ts"
+import { createUploader } from "./uploader.ts"
 
 function sourceDbPath(env: Record<string, string | undefined>): string {
   if (env.OPENCODE_RECALL_SOURCE_DB) return env.OPENCODE_RECALL_SOURCE_DB
@@ -22,13 +24,12 @@ export async function uploadSession(db: Database, client: Client, sessionId: str
 export default Plugin.define({
   id: "opencode-recall",
   setup: async (ctx) => {
-    const hubUrl = process.env.OPENCODE_RECALL_HUB_URL
-    if (!hubUrl) {
-      console.error("opencode-recall: OPENCODE_RECALL_HUB_URL is not set; uploads disabled")
-      return
-    }
-    const db = new Database(sourceDbPath(process.env), { readonly: true })
-    const client = createClient({ url: hubUrl })
+    const env = process.env
+    const db = new Database(sourceDbPath(env), { readonly: true })
+    const uploader = createUploader({
+      upload: (client, sessionId) => uploadSession(db, client, sessionId),
+      loadConfig: () => loadHubConfig(env, configFilePath(env)),
+    })
     const abort = new AbortController()
 
     void (async () => {
@@ -37,11 +38,7 @@ export default Plugin.define({
           event.type === "session.execution.succeeded" ||
           event.type === "session.execution.failed" ||
           (event.type === "session.execution.interrupted" && event.data.reason !== "shutdown")
-        if (!turnEnded) continue
-        const sessionId = event.data.sessionID
-        uploadSession(db, client, sessionId).catch((e) =>
-          console.error(`opencode-recall: upload of ${sessionId} failed:`, e),
-        )
+        if (turnEnded) uploader.enqueue(event.data.sessionID)
       }
     })().catch((e) => {
       if (!abort.signal.aborted) console.error("opencode-recall: event stream failed:", e)
@@ -49,6 +46,7 @@ export default Plugin.define({
 
     return () => {
       abort.abort()
+      uploader.stop()
       db.close()
     }
   },

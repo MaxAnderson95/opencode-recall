@@ -51,7 +51,7 @@ export type Responses = {
   status: { sessions: number }
 }
 
-export type ErrorCode = "protocol_version" | "invalid_request" | "unknown_verb" | "internal"
+export type ErrorCode = "invalid_token" | "protocol_version" | "invalid_request" | "unknown_verb" | "internal"
 export type ErrorBody = { error: { code: ErrorCode; message: string } }
 
 export class HubError extends Error {
@@ -65,16 +65,21 @@ export class HubError extends Error {
   }
 }
 
-export type ClientOptions = { url: string; fetch?: (url: string, init: RequestInit) => Promise<Response> }
+export type ClientOptions = {
+  url: string
+  /** Bearer token issued by the hub's `token issue`; it identifies this host's source. */
+  token: string
+  fetch?: (url: string, init: RequestInit) => Promise<Response>
+}
 
 /** Typed client for the hub's `POST /v1/<verb>` API. Non-2xx responses throw {@link HubError}. */
-export function createClient({ url, fetch: fetcher = fetch }: ClientOptions) {
+export function createClient({ url, token, fetch: fetcher = fetch }: ClientOptions) {
   const base = url.replace(/\/+$/, "")
 
   async function call<V extends Verb>(verb: V, input: Omit<Request<V>, "protocolVersion">): Promise<Responses[V]> {
     const res = await fetcher(`${base}/v1/${verb}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
       body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, ...input }),
     })
     if (res.ok) return (await res.json()) as Responses[V]

@@ -19,6 +19,8 @@ bun run typecheck
 
 Run the hub with `bun packages/hub/src/main.ts serve`. It reads `OPENCODE_RECALL_DATA_DIR` (default `./data`), `OPENCODE_RECALL_LISTEN` (default `127.0.0.1:7438`), `OPENCODE_RECALL_LOG_LEVEL` (default `info`), and `OPENCODE_RECALL_CONFIG`, an optional JSON file with the same keys (`dataDir`, `listen`, `logLevel`) that the environment overrides.
 
-The plugin loads from the `packages/plugin` directory. It uploads a session to `OPENCODE_RECALL_HUB_URL` whenever one of its turns ends, reading OpenCode's database from `OPENCODE_RECALL_SOURCE_DB` or `$XDG_DATA_HOME/opencode/opencode.db`.
+Every hub request needs a bearer token, which identifies the source (host) its uploads are attributed to. `bun packages/hub/src/main.ts token issue <source>` prints a new token once; `token list` shows token ids by source; `token revoke <id>` makes that token fail on the next request. A source can hold several tokens, so rotating one (issue, update the host, revoke the old id) keeps its identity.
+
+The plugin loads from the `packages/plugin` directory. It uploads a session whenever one of its turns ends, reading OpenCode's database from `OPENCODE_RECALL_SOURCE_DB` or `$XDG_DATA_HOME/opencode/opencode.db`. The hub address and token come from `OPENCODE_RECALL_HUB_URL` and `OPENCODE_RECALL_TOKEN`, or from `hub.url` and `hub.token` in `~/.config/opencode/recall.json`; the environment wins. A missing config, a rejected token, or a protocol version mismatch pauses uploads with the work kept; the plugin re-reads the config file and probes the hub every 30 seconds, and resumes once the hub accepts it.
 
 Planning happens on the Wayfinder map in this repo's issues (label `wayfinder:map`).
