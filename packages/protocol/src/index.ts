@@ -6,7 +6,7 @@ import { Effect, Option, Schema } from "effect"
  * stripped while the hub records the content hash that covered it. A new verb needs no bump: a hub
  * without it answers `unknown_verb`.
  */
-export const PROTOCOL_VERSION = 3
+export const PROTOCOL_VERSION = 4
 
 const Int = Schema.Int
 const NonNegativeInt = Int.check(Schema.isGreaterThanOrEqualTo(0))
@@ -316,6 +316,27 @@ export const SpaceRecipe = Schema.Struct({
 })
 export interface SpaceRecipe extends Schema.Schema.Type<typeof SpaceRecipe> {}
 
+/** Two hosts hold different copies of one session at one position; the archive keeps `heldFrom`'s. */
+export const Divergence = Schema.Struct({
+  sessionId: Schema.String,
+  title: Schema.String,
+  heldFrom: Schema.String,
+  refusedFrom: Schema.String,
+  /** The first and the latest refusal of `refusedFrom`'s copy. */
+  timeFirst: Int,
+  timeLast: Int,
+})
+export interface Divergence extends Schema.Schema.Type<typeof Divergence> {}
+
+export const Rewind = Schema.Struct({
+  sessionId: Schema.String,
+  source: Schema.String,
+  fromRevision: Int,
+  toRevision: Int,
+  time: Int,
+})
+export interface Rewind extends Schema.Schema.Type<typeof Rewind> {}
+
 export const responses = {
   /**
    * `unchanged`: the hub already holds this content, so nothing was written.
@@ -400,10 +421,53 @@ export const responses = {
     embeddedChunks: Int,
     /** `matchesConfigured` is false when this hub would build a different space than the active one. */
     activeSpace: Schema.Struct({ recipe: SpaceRecipe, matchesConfigured: Schema.Boolean }),
+    /**
+     * Sessions per source they were last accepted from: archived, lexically searchable (at least
+     * one indexed part), and embedded (every chunk has a vector in the active space).
+     */
+    sources: Schema.Array(Schema.Struct({ source: Schema.String, archived: Int, searchable: Int, embedded: Int })),
+    summaries: Int,
+    /** Copies refused as `hash_divergence` that no acceptance has replaced since, oldest first. */
+    divergences: Schema.Array(Divergence),
+    /** Acceptances at a revision not higher than the one held: how many, and the latest few. */
+    rewinds: Schema.Struct({ total: Int, recent: Schema.Array(Rewind) }),
   }),
 } satisfies Record<Verb, Schema.Top>
 
 export type Responses = { [V in Verb]: (typeof responses)[V]["Type"] }
+
+const utc = (ms: number) => `${new Date(ms).toISOString().slice(0, 16).replace("T", " ")}Z`
+
+/**
+ * The operator remedy for a `hash_divergence`: a rename moves that host's last activity past the
+ * held position, so its next upload is accepted, and any acceptance clears the condition.
+ */
+export const divergenceRemedy = (d: Pick<Divergence, "heldFrom" | "refusedFrom">) =>
+  `rename the session on ${d.heldFrom} to keep the archived copy, or on ${d.refusedFrom} to archive ${d.refusedFrom}'s copy instead. ` +
+  "The rename makes that host's next upload later than the held position, so it is accepted and the divergence clears; turns only the other copy holds stay out of the archive."
+
+/** The hub's side of the status, as `recall_status` and the hub's `status` subcommand print it. */
+export function renderHubStatus(s: Responses["status"]): string {
+  const { recipe, matchesConfigured } = s.activeSpace
+  const lines = [
+    `sessions archived: ${s.sessions}`,
+    ...s.sources.map((c) => `  from ${c.source || "(no source)"}: ${c.archived} archived, ${c.searchable} searchable, ${c.embedded} embedded`),
+    `chunks: ${s.chunks}, ${s.embeddedChunks} embedded, ${s.chunks - s.embeddedChunks} waiting to be embedded`,
+    `vector space: ${recipe.model}@${recipe.revision.slice(0, 12)} (${recipe.dtype}, ${recipe.dims}d, rendering v${recipe.rendering})${matchesConfigured ? "" : "; differs from this hub's configured space, run reindex"}`,
+    `cached summaries: ${s.summaries}`,
+    `rewinds accepted: ${s.rewinds.total}`,
+    ...s.rewinds.recent.map((r) => `  ${r.sessionId} from ${r.source}: revision ${r.fromRevision} -> ${r.toRevision} at ${utc(r.time)}`),
+  ]
+  if (!s.divergences.length) return [...lines, "hash_divergence: none"].join("\n")
+  return [
+    ...lines,
+    `hash_divergence: ${s.divergences.length} session${s.divergences.length === 1 ? "" : "s"} where two hosts hold different copies`,
+    ...s.divergences.flatMap((d) => [
+      `  ${d.sessionId} "${d.title}": archived copy from ${d.heldFrom}; ${d.refusedFrom}'s copy refused (first ${utc(d.timeFirst)}, latest ${utc(d.timeLast)})`,
+      `    remedy: ${divergenceRemedy(d)}`,
+    ]),
+  ].join("\n")
+}
 
 export const ErrorCode = Schema.Literals([
   "invalid_token",

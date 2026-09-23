@@ -50,15 +50,21 @@ const readFile = Effect.fnUntraced(function* (path: string) {
  * through the current `ConfigProvider`, win over `hub.url` and `hub.token` in the file at `path`.
  * `None` while either is missing or empty.
  */
-export const load = Effect.fn("PluginConfig.load")(function* (path: string) {
+const resolve = Effect.fnUntraced(function* (path: string) {
   const { hub } = yield* readFile(path)
   const env = yield* Config.all({ url: optional("OPENCODE_RECALL_HUB_URL"), token: optional("OPENCODE_RECALL_TOKEN") }).pipe(
     Effect.mapError(invalid),
   )
   const url = env.url || hub?.url
   const token = env.token || hub?.token
-  if (!url || !token) return Option.none<Hub>()
-  return Option.some(yield* Schema.decodeUnknownEffect(Hub)({ url, token }).pipe(Effect.mapError(invalid)))
+  const from = (variable: string, fromEnv: string | undefined, fromFile: unknown) => (fromEnv ? variable : fromFile ? path : "not set")
+  const source = `hub.url: ${from("OPENCODE_RECALL_HUB_URL", env.url, hub?.url)}; hub.token: ${from("OPENCODE_RECALL_TOKEN", env.token, hub?.token)}`
+  if (!url || !token) return { hub: Option.none<Hub>(), source }
+  return { hub: Option.some(yield* Schema.decodeUnknownEffect(Hub)({ url, token }).pipe(Effect.mapError(invalid))), source }
+})
+
+export const load = Effect.fn("PluginConfig.load")(function* (path: string) {
+  return (yield* resolve(path)).hub
 })
 
 /** Today's plugin's variant names, so a trailing one is not read as part of a slash-containing model id. */
@@ -93,6 +99,8 @@ export const loadSummaryModel = Effect.fn("PluginConfig.loadSummaryModel")(funct
 export interface Interface {
   /** Read fresh on every run, so an edited file takes effect without restarting OpenCode. */
   readonly hub: Effect.Effect<Option.Option<Hub>, Invalid>
+  /** Where the hub URL and token currently come from, for `recall_status`. Read fresh, as `hub` is. */
+  readonly hubSource: Effect.Effect<string, Invalid>
   /** Read fresh on every run, as `hub` is. */
   readonly summaryModel: Effect.Effect<SummaryModel, Invalid>
 }
@@ -100,6 +108,9 @@ export interface Interface {
 export class Service extends Context.Service<Service, Interface>()("@opencode-recall/plugin/PluginConfig") {}
 
 export const layer = (path: string) =>
-  Layer.succeed(Service, Service.of({ hub: load(path), summaryModel: loadSummaryModel(path) }))
+  Layer.succeed(
+    Service,
+    Service.of({ hub: load(path), hubSource: Effect.map(resolve(path), (r) => r.source), summaryModel: loadSummaryModel(path) }),
+  )
 
 export * as PluginConfig from "./config.ts"

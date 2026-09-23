@@ -63,6 +63,7 @@ async function summarize(
 ): Promise<string> {
   const layer = Layer.succeed(PluginConfig.Service, {
     hub: Effect.succeed(Option.some(hubConfig)),
+    hubSource: Effect.succeed("test"),
     summaryModel: Effect.succeed(PluginConfig.DEFAULT_SUMMARY_MODEL),
   })
   const tool = await Effect.runPromise(SummarizeTool.make(generate).pipe(Effect.provide(layer)))
@@ -239,4 +240,13 @@ test("an unknown session, a failing model, and missing arguments are each named"
   expect(output).toContain("No archived session found for 'ses_nope'")
   expect(output).toContain("# ses_remote\nSummarization failed with openai/gpt-5.6-luna/low: Model unavailable: openai/gpt-5.6-luna")
   expect(await summarize(failing, {})).toBe("Provide session_id or session_ids.")
+})
+
+test("an unreachable hub is reported per session as not having looked, and no model is called", async () => {
+  const model = fakeModel()
+  await hub.stop()
+  const output = await summarize(model.generate, { session_ids: ["ses_remote", "ses_other"] })
+  expect(output).toContain("# ses_remote\nrecall could not look: the hub request failed")
+  expect(output).toContain("# ses_other\nrecall could not look: the hub request failed")
+  expect(model.calls).toHaveLength(0)
 })

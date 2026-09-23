@@ -5,8 +5,10 @@ import { Config, Effect, Layer, Logger, ManagedRuntime, Option, Stream } from "e
 import { PluginConfig } from "./config.ts"
 import { ExpandTool } from "./expand.ts"
 import { InspectTool } from "./inspect.ts"
+import { Instructions } from "./instructions.ts"
 import { SearchTool } from "./search.ts"
 import { Source } from "./source.ts"
+import { StatusTool } from "./status.ts"
 import { Storage } from "./storage.ts"
 import { SummarizeTool } from "./summarize.ts"
 import { Uploader } from "./uploader.ts"
@@ -66,20 +68,18 @@ export default Plugin.define({
       }),
     )
     const runtime = ManagedRuntime.make(
-      events(ctx).pipe(Layer.provide(Uploader.layer()), Layer.provideMerge(services), Layer.provideMerge(log)),
+      events(ctx).pipe(Layer.provideMerge(Uploader.layer()), Layer.provideMerge(services), Layer.provideMerge(log)),
     )
     // Building the runtime starts the uploader and the event subscription, so a failed setup,
     // which returns no cleanup to the host, must release them itself.
     try {
-      const [search, inspect, expand, summarize] = await runtime.runPromise(
-        Effect.all([SearchTool.make(), InspectTool.make(), ExpandTool.make(), SummarizeTool.make(ctx.generate)]),
+      const tools = await runtime.runPromise(
+        Effect.all([SearchTool.make(), InspectTool.make(), ExpandTool.make(), SummarizeTool.make(ctx.generate), StatusTool.make()]),
       )
-      await ctx.tool.transform((tools) => {
-        tools.add(search)
-        tools.add(inspect)
-        tools.add(expand)
-        tools.add(summarize)
+      await ctx.tool.transform((editor) => {
+        for (const tool of tools) editor.add(tool)
       })
+      await ctx.session.hook("context", Instructions.inject)
     } catch (e) {
       await runtime.dispose()
       throw e

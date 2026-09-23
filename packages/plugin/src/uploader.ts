@@ -8,6 +8,7 @@ import {
   type TransportError,
 } from "@opencode-recall/protocol"
 import {
+  Clock,
   Context,
   Deferred,
   Effect,
@@ -87,8 +88,23 @@ export interface Interface {
    * the first success starts the periodic sweep.
    */
   readonly reconcile: Effect.Effect<void>
+  /** What `recall_status` reports about this host's uploads, read from the work list and the local database. */
+  readonly state: Effect.Effect<State, Storage.Failed>
+}
+
+export interface State {
+  /** Sessions with an upload or a deletion waiting. */
+  readonly queued: number
+  /** Sessions this host holds, and how many of them the hub has answered at their current position. */
+  readonly local: number
+  readonly answered: number
+  /** Whether a manifest diff is running, and when one last completed in this process. */
+  readonly reconciling: boolean
+  readonly lastReconciled: Option.Option<number>
   /** Why uploads are held, or `None` while they flow. */
-  readonly pausedBy: Effect.Effect<Option.Option<string>>
+  readonly pausedBy: Option.Option<string>
+  /** The latest failure this process logged, with when it happened. */
+  readonly lastError: Option.Option<{ readonly message: string; readonly time: number }>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode-recall/plugin/Uploader") {}
@@ -105,15 +121,6 @@ export type Timing = {
 }
 
 const defectMessage = (defect: unknown) => (defect instanceof Error ? defect.message : String(defect))
-
-/** Logs a failure or defect of background work and continues; interruption still stops it. */
-const logAndContinue =
-  (message: (reason: string) => string) =>
-  <A, E extends { readonly message: string }, R>(self: Effect.Effect<A, E, R>) =>
-    self.pipe(
-      Effect.catch((e) => Effect.logWarning(message(describe(e)))),
-      Effect.catchDefect((defect) => Effect.logWarning(message(defectMessage(defect)))),
-    )
 
 /**
  * Uploads dirty sessions one at a time from a work list in `ctx.storage`, building each snapshot
@@ -149,6 +156,24 @@ export const layer = ({ quietMs = 2_000, retryMs = 30_000, probeIntervalMs = 30_
       let reconciling: Deferred.Deferred<void> | undefined
       /** A reconciliation was held back by a pause and runs once the hub accepts the config. */
       let reconcileOnResume = false
+      let lastReconciled: number | null = null
+      let lastError: { message: string; time: number } | null = null
+
+      /** Log a failure and keep it as the one `recall_status` reports. */
+      const warn = (message: string) =>
+        Effect.gen(function* () {
+          yield* Effect.logWarning(message)
+          lastError = { message, time: yield* Clock.currentTimeMillis }
+        })
+
+      /** Logs a failure or defect of background work and continues; interruption still stops it. */
+      const logAndContinue =
+        (message: (reason: string) => string) =>
+        <A, E extends { readonly message: string }, R>(self: Effect.Effect<A, E, R>) =>
+          self.pipe(
+            Effect.catch((e) => warn(message(describe(e)))),
+            Effect.catchDefect((defect) => warn(message(defectMessage(defect)))),
+          )
 
       const background = <A, E>(effect: Effect.Effect<A, E>) => Effect.asVoid(Effect.forkIn(effect, scope))
 
@@ -183,7 +208,7 @@ export const layer = ({ quietMs = 2_000, retryMs = 30_000, probeIntervalMs = 30_
 
       const pause = (reason: string) =>
         Effect.gen(function* () {
-          if (pausedBy === null) yield* Effect.logWarning(`uploads paused until configuration is fixed: ${reason}`)
+          if (pausedBy === null) yield* warn(`uploads paused until configuration is fixed: ${reason}`)
           pausedBy = reason
           yield* FiberHandle.run(probing, probeUntilResumed, { onlyIfMissing: true })
         })
@@ -226,11 +251,11 @@ export const layer = ({ quietMs = 2_000, retryMs = 30_000, probeIntervalMs = 30_
             if (kind === "pause")
               return Effect.sync(() => due.add(sessionId)).pipe(Effect.andThen(pause(describe(e))), Effect.as("pause" as const))
             if (kind === "retry")
-              return Effect.logWarning(`upload of ${sessionId} failed, retrying: ${describe(e)}`).pipe(
+              return warn(`upload of ${sessionId} failed, retrying: ${describe(e)}`).pipe(
                 Effect.andThen(schedule(sessionId, retryMs)),
                 Effect.as("retry" as const),
               )
-            return Effect.logWarning(`upload of ${sessionId} rejected and dropped: ${describe(e)}`).pipe(Effect.as("done" as const))
+            return warn(`upload of ${sessionId} rejected and dropped: ${describe(e)}`).pipe(Effect.as("done" as const))
           }),
         )
 
@@ -291,7 +316,7 @@ export const layer = ({ quietMs = 2_000, retryMs = 30_000, probeIntervalMs = 30_
           const sessionId = next
           due.delete(sessionId)
           const retry = (reason: string) =>
-            Effect.logWarning(`upload of ${sessionId} failed, retrying: ${reason}`).pipe(
+            warn(`upload of ${sessionId} failed, retrying: ${reason}`).pipe(
               Effect.andThen(schedule(sessionId, retryMs)),
               Effect.as("retry" as const),
             )
@@ -309,10 +334,17 @@ export const layer = ({ quietMs = 2_000, retryMs = 30_000, probeIntervalMs = 30_
         if (Option.isSome(ran) && due.size > 0 && pausedBy === null) yield* drain
       })
 
+      /** Every session with work in the list, from any instance. */
+      const queuedSessions = Effect.gen(function* () {
+        const ids = new Set<string>()
+        for (const { key } of yield* storage.scan(DIRTY, Schema.Unknown)) ids.add(key.slice(DIRTY.length, key.lastIndexOf("/")))
+        for (const { key } of yield* storage.scan(DELETED, Schema.Unknown)) ids.add(key.slice(DELETED.length, key.lastIndexOf("/")))
+        return ids
+      })
+
       /** Find work left by a previous run or another instance. */
       const resume = Effect.gen(function* () {
-        for (const { key } of yield* storage.scan(DIRTY, Schema.Unknown)) due.add(key.slice(DIRTY.length, key.lastIndexOf("/")))
-        for (const { key } of yield* storage.scan(DELETED, Schema.Unknown)) due.add(key.slice(DELETED.length, key.lastIndexOf("/")))
+        for (const id of yield* queuedSessions) due.add(id)
       })
 
       /** Queue every local session whose position is later than the last one the hub answered. No network. */
@@ -357,6 +389,7 @@ export const layer = ({ quietMs = 2_000, retryMs = 30_000, probeIntervalMs = 30_
         }
 
         reconcileOnResume = false
+        lastReconciled = yield* Clock.currentTimeMillis
         yield* FiberHandle.run(sweeping, sweepForever, { onlyIfMissing: true })
       }).pipe(
         Effect.catch((e) => {
@@ -368,7 +401,7 @@ export const layer = ({ quietMs = 2_000, retryMs = 30_000, probeIntervalMs = 30_
       )
 
       const retryReconcile = (reason: string) =>
-        Effect.logWarning(`reconciliation failed, retrying: ${reason}`).pipe(
+        warn(`reconciliation failed, retrying: ${reason}`).pipe(
           Effect.andThen(FiberHandle.run(reconcileRetry, Effect.delay(reconcile, retryMs))),
           Effect.asVoid,
         )
@@ -402,7 +435,25 @@ export const layer = ({ quietMs = 2_000, retryMs = 30_000, probeIntervalMs = 30_
             logAndContinue((reason) => `could not record ${sessionId} as deleted: ${reason}`),
           ),
         reconcile,
-        pausedBy: Effect.sync(() => Option.fromNullishOr(pausedBy)),
+        state: Effect.gen(function* () {
+          const queued = yield* queuedSessions
+          const acked = yield* acknowledged
+          const positions = yield* source.positions()
+          let answered = 0
+          for (const [sessionId, position] of positions) {
+            const held = acked.get(sessionId)
+            if (held && later(position, held) <= 0) answered++
+          }
+          return {
+            queued: queued.size,
+            local: positions.size,
+            answered,
+            reconciling: reconciling !== undefined,
+            lastReconciled: Option.fromNullishOr(lastReconciled),
+            pausedBy: Option.fromNullishOr(pausedBy),
+            lastError: Option.fromNullishOr(lastError),
+          }
+        }),
       })
     }),
   )
