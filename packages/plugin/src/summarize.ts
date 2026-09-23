@@ -83,6 +83,11 @@ const DESCRIPTION =
 /** What a cached summary is keyed by besides the session. */
 type Key = Omit<SummaryGet, "session">
 
+/** What the summarized transcript left out, for the status line of a fresh or a cached summary. */
+const truncation = ({ omitted, clipped }: { omitted: number; clipped: number }) =>
+  (omitted ? ` · ${omitted} messages omitted from the middle to fit ${BUDGET} characters` : "") +
+  (clipped ? ` · ${clipped} messages cut to ${MESSAGE_CHARS} characters` : "")
+
 /** The model failed, timed out, or returned nothing. */
 class Failed extends Schema.TaggedError<Failed>()("Summarize.Failed", { message: Schema.String }) {}
 
@@ -98,7 +103,7 @@ export const make = Effect.fnUntraced(function* (generate: Generate) {
       const cached = yield* Tools.withHub((hub) => hub.summaryGet({ ...key, session: ref }))
       if (cached.kind === "missing") return Tools.notFound(ref)
       if (cached.kind === "cached")
-        return `${Tools.header(cached, ref, "summarizing")}\n(cached ${Tools.fmtDateTime(cached.timeCreated)} · ${tag}${suffix})\n\n${cached.summary}`
+        return `${Tools.header(cached, ref, "summarizing")}\n(cached ${Tools.fmtDateTime(cached.timeCreated)} · ${tag}${truncation(cached)}${suffix})\n\n${cached.summary}`
       // Read the very session the slug named a moment ago.
       session = cached.session.sessionId
     }
@@ -133,7 +138,8 @@ export const make = Effect.fnUntraced(function* (generate: Generate) {
     if (!summary) return yield* new Failed({ message: "the model returned no text" })
     const secs = ((yield* Clock.currentTimeMillis) - started) / 1000
 
-    const put = { ...key, sessionId: s.sessionId, contentHash: transcript.contentHash, summary }
+    const { omitted, clipped } = transcript
+    const put = { ...key, sessionId: s.sessionId, contentHash: transcript.contentHash, summary, omitted, clipped }
     const cachedNote = yield* Tools.withHub((hub) =>
       hub.summaryPut(put).pipe(
         Effect.as(""),
@@ -144,11 +150,7 @@ export const make = Effect.fnUntraced(function* (generate: Generate) {
       ),
     ).pipe(Effect.catchTag("Tools.CouldNotLook", (e) => Effect.succeed(` · not cached: ${e.message}`)))
 
-    const cut = [
-      transcript.omitted ? ` · ${transcript.omitted} messages omitted from the middle to fit ${BUDGET} characters` : "",
-      transcript.clipped ? ` · ${transcript.clipped} messages cut to ${MESSAGE_CHARS} characters` : "",
-    ].join("")
-    const status = `(fresh · ${tag} · ${transcript.messages} messages${cut} · ${secs.toFixed(1)}s${suffix}${cachedNote})`
+    const status = `(fresh · ${tag} · ${transcript.messages} messages${truncation(transcript)} · ${secs.toFixed(1)}s${suffix}${cachedNote})`
     return `${Tools.header(transcript, ref, "summarizing")}\n${status}\n\n${summary}`
   })
 
@@ -203,7 +205,8 @@ export const make = Effect.fnUntraced(function* (generate: Generate) {
     description: DESCRIPTION,
     input: INPUT,
     options: { codemode: false },
-    execute: (input, ctx) => Effect.runPromiseWith(context)(execute(input, ctx)),
+    // Cancelling the call interrupts the batch, so no further hub request or model call starts.
+    execute: (input, ctx) => Effect.runPromiseWith(context)(execute(input, ctx), { signal: ctx.signal }),
   }
   return info
 })

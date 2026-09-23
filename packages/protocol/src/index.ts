@@ -171,6 +171,9 @@ export const SummaryPut = Schema.Struct({
   contentHash: NonEmptyString,
   ...summaryKeyFields,
   summary: NonEmptyString,
+  /** What the transcript left out, from its `transcript` response, so a cache hit can say so too. */
+  omitted: NonNegativeInt,
+  clipped: NonNegativeInt,
 })
 export interface SummaryPut extends Schema.Schema.Type<typeof SummaryPut> {}
 
@@ -380,7 +383,14 @@ export const responses = {
   "summary.get": Schema.Union([
     Missing,
     Schema.Struct({ kind: Schema.Literal("absent"), ...resolvedFields }),
-    Schema.Struct({ kind: Schema.Literal("cached"), ...resolvedFields, summary: Schema.String, timeCreated: Int }),
+    Schema.Struct({
+      kind: Schema.Literal("cached"),
+      ...resolvedFields,
+      summary: Schema.String,
+      timeCreated: Int,
+      omitted: Int,
+      clipped: Int,
+    }),
   ]),
   "summary.put": Schema.Struct({}),
   status: Schema.Struct({

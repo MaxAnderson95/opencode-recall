@@ -103,7 +103,7 @@ Storing the text costs about 72 MB, roughly 5% of the archive, and makes semanti
 
 Space identity is the whole recipe, not five parameters: model artifact revision, dimensions, tokenizer and preprocessing, pooling, normalization, query prefix, chunk size, overlap, per-turn cap, and the chunk-rendering version. Anything that changes the bytes fed to the model changes what a vector means. Vector reuse across a change requires identical input text **and** identical recipe.
 
-**`summaries`**: keyed by session content identity, provider, model, variant, focus, and summary-recipe version. Holds the summary and the archived revision it was computed from. Survives an index rebuild.
+**`summaries`**: keyed by session content identity, provider, model, variant, focus, and summary-recipe version. Holds the summary, the archived revision it was computed from, and how many messages its transcript omitted or clipped. Survives an index rebuild.
 
 **`tombstones`**: session id, recording `source_id`, deletion revision, deletion time, and reason (deleted upstream, or excluded by configuration).
 

@@ -139,6 +139,8 @@ export const migrations: readonly string[] = [
     recipe INTEGER NOT NULL,
     revision INTEGER NOT NULL,
     summary TEXT NOT NULL,
+    omitted INTEGER NOT NULL,
+    clipped INTEGER NOT NULL,
     time_created INTEGER NOT NULL,
     PRIMARY KEY (session_id, content_hash, provider, model, variant, focus, recipe)
   ) WITHOUT ROWID;

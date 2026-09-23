@@ -55,13 +55,18 @@ function fakeModel(answer: (input: Input) => Promise<string> | string = () => "S
 
 const context = { sessionID: "ses_self", progress: async () => {} } as unknown as ToolContext
 
-async function summarize(generate: Generate, input: object, hubConfig: PluginConfig.Hub = config): Promise<string> {
+async function summarize(
+  generate: Generate,
+  input: object,
+  hubConfig: PluginConfig.Hub = config,
+  signal: AbortSignal = new AbortController().signal,
+): Promise<string> {
   const layer = Layer.succeed(PluginConfig.Service, {
     hub: Effect.succeed(Option.some(hubConfig)),
     summaryModel: Effect.succeed(PluginConfig.DEFAULT_SUMMARY_MODEL),
   })
   const tool = await Effect.runPromise(SummarizeTool.make(generate).pipe(Effect.provide(layer)))
-  const { content } = await tool.execute(input, context)
+  const { content } = await tool.execute(input, { ...context, signal })
   if (typeof content !== "string") throw new Error("expected text content")
   return content
 }
@@ -117,7 +122,7 @@ test("a summary of a session that advanced while it was generated is returned bu
   expect(next.calls[0]!.prompt).toContain("and the tag?")
 })
 
-test("a transcript cut to fit the budget says what was cut", async () => {
+test("a transcript cut to fit the budget says what was cut, on a cache hit from another host too", async () => {
   desktop.addSession("ses_long", { title: "Long one", time: 200 })
   for (let i = 0; i < 200; i++) desktop.addMessage("ses_long", "user", { text: `turn ${i} ` + "x".repeat(2_500) }, 201 + i)
   await archive("ses_long")
@@ -130,6 +135,42 @@ test("a transcript cut to fit the budget says what was cut", async () => {
   expect(model.calls[0]!.prompt).toContain(`[... ${omitted} of 200 messages omitted ...]`)
   expect(model.calls[0]!.prompt).toContain("turn 0 ")
   expect(model.calls[0]!.prompt).toContain("turn 199 ")
+
+  const desktopHub = { url: hub.url.href, token: hub.issueToken("desktop") }
+  const cached = await summarize(model.generate, { session_id: "ses_long" }, desktopHub)
+  expect(cached).toMatch(/\(cached [\d-]+ [\d:]+ · openai\/gpt-5\.6-luna\/low · /)
+  expect(cached).toContain(
+    `· ${omitted} messages omitted from the middle to fit 300000 characters · ${200 - omitted} messages cut to 2000 characters)`,
+  )
+  expect(model.calls).toHaveLength(1)
+})
+
+test("cancelling a batch starts no further model call", async () => {
+  for (let i = 0; i < 4; i++) {
+    desktop.addSession(`ses_${i}`, { title: `Session ${i}`, time: 300 + i })
+    desktop.addMessage(`ses_${i}`, "user", { text: `question ${i}` }, 301 + i)
+    await archive(`ses_${i}`)
+  }
+  const abort = new AbortController()
+  const held: (() => void)[] = []
+  // The first wave is held and cancelled; any later call answers at once.
+  const model = fakeModel(async () => {
+    if (held.length < 4)
+      await new Promise<void>((resolve) => {
+        held.push(resolve)
+        if (held.length === 4) {
+          abort.abort()
+          for (const release of held) release()
+        }
+      })
+    return "SUMMARY"
+  })
+
+  const ids = ["ses_remote", "ses_0", "ses_1", "ses_2", "ses_3"]
+  await expect(summarize(model.generate, { session_ids: ids }, config, abort.signal)).rejects.toThrow()
+  // Long enough for a fifth session's hub reads and model call to start, had the batch gone on.
+  await Bun.sleep(100)
+  expect(model.calls).toHaveLength(4)
 })
 
 test("a batch of 24 sessions runs four at a time, and a larger one is refused", async () => {

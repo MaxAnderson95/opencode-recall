@@ -531,14 +531,15 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
      WHERE message_id = ? ORDER BY ordinal`,
   )
   const selectSummary = db.prepare(
-    `SELECT summary, time_created AS timeCreated FROM summaries
+    `SELECT summary, time_created AS timeCreated, omitted, clipped FROM summaries
      WHERE session_id = $sessionId AND content_hash = (SELECT content_hash FROM sessions WHERE id = $sessionId)
        AND provider = $provider AND model = $model AND variant = $variant AND focus = $focus AND recipe = $recipe`,
   )
   const upsertSummary = db.prepare(
-    `INSERT INTO summaries (session_id, content_hash, provider, model, variant, focus, recipe, revision, summary, time_created)
-     VALUES ($sessionId, $contentHash, $provider, $model, $variant, $focus, $recipe, $revision, $summary, $timeCreated)
-     ON CONFLICT DO UPDATE SET revision = excluded.revision, summary = excluded.summary, time_created = excluded.time_created`,
+    `INSERT INTO summaries (session_id, content_hash, provider, model, variant, focus, recipe, revision, summary, omitted, clipped, time_created)
+     VALUES ($sessionId, $contentHash, $provider, $model, $variant, $focus, $recipe, $revision, $summary, $omitted, $clipped, $timeCreated)
+     ON CONFLICT DO UPDATE SET revision = excluded.revision, summary = excluded.summary, omitted = excluded.omitted,
+       clipped = excluded.clipped, time_created = excluded.time_created`,
   )
   const selectSegmentText = db.prepare("SELECT text FROM segment_text WHERE id = ?")
   const countSessions = db.prepare("SELECT count(*) AS n FROM sessions")
@@ -857,6 +858,8 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
     const cached = selectSummary.get({ sessionId: resolved.session.sessionId, ...summaryKey(f) }) as {
       summary: string
       timeCreated: number
+      omitted: number
+      clipped: number
     } | null
     return cached ? { kind: "cached", ...resolved, ...cached } : { kind: "absent", ...resolved }
   })
@@ -870,6 +873,8 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
       ...summaryKey(f),
       revision: held.revision,
       summary: f.summary,
+      omitted: f.omitted,
+      clipped: f.clipped,
       timeCreated: Date.now(),
     })
     return "stored"

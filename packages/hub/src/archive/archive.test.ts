@@ -742,12 +742,12 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     archive.putSnapshot(first, laptop)
     const key = { provider: "openai", model: "gpt", variant: "low", focus: "", recipe: 1 }
     const put = (fields: Partial<SummaryPut> = {}) =>
-      archive.putSummary({ ...key, sessionId: "ses_a", contentHash: first.contentHash, summary: "it said hello", ...fields })
+      archive.putSummary({ ...key, sessionId: "ses_a", contentHash: first.contentHash, summary: "it said hello", omitted: 1, clipped: 2, ...fields })
 
     expect(archive.getSummary({ ...key, session: "nope" })).toEqual({ kind: "missing" })
     expect(archive.getSummary({ ...key, session: "slug" })).toMatchObject({ kind: "absent", session: { sessionId: "ses_a" } })
     expect(put()).toBe("stored")
-    expect(archive.getSummary({ ...key, session: "slug" })).toMatchObject({ kind: "cached", summary: "it said hello", session: { revision: 2 } })
+    expect(archive.getSummary({ ...key, session: "slug" })).toMatchObject({ kind: "cached", summary: "it said hello", omitted: 1, clipped: 2, session: { revision: 2 } })
     const { variant: _, ...defaultVariant } = key
     for (const other of [{ ...key, focus: "why?" }, { ...key, model: "other" }, { ...key, provider: "anthropic" }, { ...key, recipe: 2 }, defaultVariant])
       expect(archive.getSummary({ ...other, session: "ses_a" })).toMatchObject({ kind: "absent" })
