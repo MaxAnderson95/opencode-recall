@@ -12,7 +12,7 @@ import { createHash } from "node:crypto"
 import { existsSync, mkdirSync, unlinkSync } from "node:fs"
 import path from "node:path"
 import { SCHEMA_VERSION, openArchive, type Archive } from "../../../packages/hub/src/archive/index.ts"
-import { onnxEmbedder } from "../../../packages/hub/src/embedder.ts"
+import { onnxEmbedder, type Embedder } from "../../../packages/hub/src/embedder.ts"
 import { readPositions, readSnapshot } from "../../../packages/plugin/src/source.ts"
 import type { Label } from "./score.ts"
 
@@ -44,13 +44,15 @@ const under = (roots: string[], directory: string) =>
 /**
  * Build a corpus in `dir` from every session in `opencodeDb` and the labels at `labelsPath`, then
  * embed all of it. Slow: every chunk goes through the model. Rerunning after an interruption
- * during embedding resumes it; any other existing `dir` is refused.
+ * during embedding resumes it; any other existing `dir` is refused. A corpus is sealed only once
+ * every chunk is embedded in a space `embedder` matches, so resuming with a different model
+ * throws and stays resumable with the original one.
  */
 export async function freezeCorpus(opts: {
   dir: string
   opencodeDb: string
   labelsPath: string
-  modelDir: string
+  embedder: Embedder
   excludeDirectories: string[]
 }): Promise<void> {
   const f = files(opts.dir)
@@ -74,7 +76,7 @@ export async function freezeCorpus(opts: {
   }
   const ingested: Ingested = await Bun.file(f.ingested).json()
 
-  const archive = openArchive(f.archive, onnxEmbedder(opts.modelDir))
+  const archive = openArchive(f.archive, opts.embedder)
   try {
     const { chunks, embeddedChunks } = archive.status()
     const started = Date.now()
@@ -85,6 +87,14 @@ export async function freezeCorpus(opts: {
       process.stdout.write(`\r  embedded ${embeddedChunks + embedded}/${chunks} chunks, ${rate.toFixed(0)}/s   `)
     }
     console.log()
+    // `embedPending` also returns 0 when the embedder cannot embed into the active space.
+    const done = archive.status()
+    if (!done.activeSpace.matchesConfigured || done.embeddedChunks !== done.chunks)
+      throw new Error(
+        `${done.embeddedChunks}/${done.chunks} chunks embedded, and this embedder ` +
+          `${done.activeSpace.matchesConfigured ? "matches" : "does not match"} the corpus's vector space; ` +
+          "rerun freeze with the embedder it was started with",
+      )
     const record: Frozen = { ...ingested, fingerprint: fingerprint(archive), frozenAt: new Date().toISOString() }
     await Bun.write(f.record, JSON.stringify(record, null, 2) + "\n")
     unlinkSync(f.ingested)
@@ -94,8 +104,8 @@ export async function freezeCorpus(opts: {
 }
 
 /** Archive every session the cutoff and exclusions keep, leaving their chunks queued for embedding. */
-function ingest(path: string, opts: { opencodeDb: string; modelDir: string }, { cutoff, excludeDirectories }: Ingested) {
-  const archive = openArchive(path, onnxEmbedder(opts.modelDir))
+function ingest(path: string, opts: { opencodeDb: string; embedder: Embedder }, { cutoff, excludeDirectories }: Ingested) {
+  const archive = openArchive(path, opts.embedder)
   const source = new Database(opts.opencodeDb, { readonly: true })
   try {
     const sourceId = archive.authenticate(archive.issueToken("eval"))!.id

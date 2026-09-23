@@ -1,4 +1,5 @@
 /** Freezes the mined labels and a corpus built from OpenCode's database into `data/corpus/`. */
+import { onnxEmbedder } from "../../../packages/hub/src/embedder.ts"
 import { configFilePath } from "../../../packages/plugin/src/config.ts"
 import { config, paths } from "./config.ts"
 import { freezeCorpus } from "./corpus.ts"
@@ -11,7 +12,7 @@ await freezeCorpus({
   dir: paths.corpus,
   opencodeDb: config.opencodeDb,
   labelsPath: paths.labels,
-  modelDir: paths.models,
+  embedder: onnxEmbedder(paths.models),
   excludeDirectories: index?.excludeDirectories ?? [],
 })
 console.log(`frozen into ${paths.corpus}`)
