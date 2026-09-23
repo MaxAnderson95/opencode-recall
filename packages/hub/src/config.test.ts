@@ -40,6 +40,9 @@ test("the embedding recipe merges field by field, the environment over the file 
 test("an invalid value is rejected", async () => {
   await expect(load({ OPENCODE_RECALL_LOG_LEVEL: "loud" })).rejects.toThrow()
   await expect(load({ OPENCODE_RECALL_EMBEDDING_DTYPE: "auto" })).rejects.toThrow()
+  // A branch or tag can move to other weights under an unchanged recipe.
+  for (const revision of ["main", "v1.0", "ea104dac"])
+    await expect(load({ OPENCODE_RECALL_EMBEDDING_REVISION: revision })).rejects.toThrow("full 40-character commit hash")
   await expect(load({ OPENCODE_RECALL_CHUNK_OVERLAP: "1200" })).rejects.toThrow("chunkChars")
 })
 

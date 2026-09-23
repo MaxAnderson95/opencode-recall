@@ -29,8 +29,11 @@ export const Dtype = Schema.Literals(["fp32", "fp16", "q8", "int8", "uint8", "q4
 /** The model fields an operator chooses. Runtime, mean pooling, and normalization are this binary's. */
 export const ModelChoice = Schema.Struct({
   model: Schema.String.check(Schema.isNonEmpty()),
-  /** The Hugging Face commit the model files are fetched at, so `main` moving cannot change a space. */
-  revision: Schema.String.check(Schema.isNonEmpty()),
+  /**
+   * The full Hugging Face commit the model files are fetched at. A branch or tag is refused: it can
+   * move to other weights while the recorded recipe, and so the space's identity, stays the same.
+   */
+  revision: Schema.String.check(Schema.isPattern(/^[0-9a-f]{40}$/, { message: "expected a full 40-character commit hash" })),
   dtype: Dtype,
   dims: Schema.Int.check(Schema.isGreaterThan(0)),
   queryPrefix: Schema.String,
@@ -60,6 +63,23 @@ export const modelOf = (choice: ModelChoice) =>
 const BATCH = 8
 
 const failed = (cause: unknown) => new Failed({ message: cause instanceof Error ? cause.message : String(cause), cause })
+
+/**
+ * One vector per text from a pooled `[texts, dims]` tensor. Fails unless the tensor has exactly
+ * that shape: a model wider than the configured `dims` would otherwise hand each text a slice of
+ * its neighbour's vector, which has the right length and so passes every later check.
+ */
+export const splitRows = (tensor: { readonly data: unknown; readonly dims: readonly number[] }, texts: number, dims: number) => {
+  const { data } = tensor
+  if (!(data instanceof Float32Array))
+    return Effect.fail(failed(new Error(`embedding model returned ${Object.prototype.toString.call(data)}, not a Float32Array`)))
+  const [rows, width, ...rest] = tensor.dims
+  if (rows !== texts || width !== dims || rest.length || data.length !== texts * dims)
+    return Effect.fail(
+      failed(new Error(`embedding model returned a [${tensor.dims.join(", ")}] tensor for ${texts} texts; expected [${texts}, ${dims}]`)),
+    )
+  return Effect.succeed(Array.from({ length: texts }, (_, j) => data.slice(j * dims, (j + 1) * dims)))
+}
 
 /**
  * The chosen model (by default `bge-small-en-v1.5`) on ONNX Runtime, in-process. The model loads
@@ -93,11 +113,9 @@ export const onnx = (cacheDir: string, choice: ModelChoice = BGE_SMALL) =>
             try: () => pipe(batch, { pooling: model.pooling, normalize: model.normalize }),
             catch: failed,
           })
-          const { data } = tensor
-          if (!(data instanceof Float32Array))
-            return yield* failed(new Error(`embedding model returned ${data.constructor.name}, not Float32Array`))
-          for (let j = 0; j < batch.length; j++) vectors.push(data.slice(j * model.dims, (j + 1) * model.dims))
+          const split = splitRows(tensor, batch.length, model.dims)
           tensor.dispose()
+          vectors.push(...(yield* split))
         }
         return vectors
       }, serial.withPermit)
