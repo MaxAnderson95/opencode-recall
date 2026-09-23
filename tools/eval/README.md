@@ -26,6 +26,19 @@ bun run baseline   # BM25-only, semantic-only, and hybrid over the frozen corpus
 
 Configuration is environment variables, all optional: `EVAL_OPENCODE_DB` (only ever opened read-only; point it at a copy to avoid reading the live file) and `EVAL_DATA_DIR`. Model files are cached in `<data>/models`.
 
+## Checking a refactor for retrieval parity
+
+A change that should not move retrieval, such as a refactor, can be checked without a full freeze. `src/parity.ts` builds a small archive (200 sessions of at most 60 messages, covering the first 40 labels whose relevant sessions fit) through a real `serve` process of a given checkout, embeds it with the real model, and records the ranked sessions and hits for those labels in `lexical`, `semantic`, and `hybrid` mode. It talks to the hub only through its CLI and HTTP API, so the same script runs against the checkout before and after the change:
+
+```sh
+sqlite3 -readonly ~/.local/share/opencode/opencode.db ".backup $TMP/opencode.db"
+bun src/parity.ts <before-checkout> $TMP/opencode.db data/labels.json <models dir> $TMP/before $TMP/before.json
+bun src/parity.ts <after-checkout> $TMP/opencode.db data/labels.json <models dir> $TMP/after $TMP/after.json
+cmp <(jq -S .results $TMP/before.json) <(jq -S .results $TMP/after.json)
+```
+
+The models directory is copied into each work directory, so a model already downloaded at the pinned revision is reused. On an M5 Pro one run embeds about 1,600 chunks in under a minute. The outputs hold private session ids and must stay out of the repository like `data/`.
+
 ## Reading the results
 
 `data/` is git-ignored and must stay that way. Mined labels contain verbatim query text from private sessions, including internal system and account names, and the frozen archive holds whole transcripts. Regenerate them locally; never commit them.
