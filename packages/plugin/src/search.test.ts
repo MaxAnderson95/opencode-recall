@@ -3,44 +3,35 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { ToolContext } from "@opencode/plugin/promise/tool"
-import { createClient } from "@opencode-recall/protocol"
-import { openArchive } from "../../hub/src/archive/index.ts"
+import { makeClient } from "@opencode-recall/protocol"
+import { Effect, Layer, Option } from "effect"
 import { fakeEmbedder } from "../../hub/src/fake-embedder.ts"
-import { createLog } from "../../hub/src/log.ts"
-import { serve } from "../../hub/src/serve.ts"
-import type { HubConfig } from "./config.ts"
-import { sourceDb, type SourceDb } from "./fixture.ts"
-import { searchTool } from "./search.ts"
-import { compactionBoundary, readSnapshot } from "./source.ts"
+import { PluginConfig } from "./config.ts"
+import { sourceDb, startHub, type SourceDb } from "./fixture.ts"
+import { SearchTool } from "./search.ts"
+import { Source, readSnapshot } from "./source.ts"
 
 let dataDir: string
-let hub: ReturnType<typeof serve>
+let hub: Awaited<ReturnType<typeof startHub>>
 let laptop: SourceDb
-let config: HubConfig
+let config: PluginConfig.Hub
 let embedder: ReturnType<typeof fakeEmbedder>
 
-function issueToken(name: string): string {
-  const admin = openArchive(join(dataDir, "archive.db"), fakeEmbedder())
-  const token = admin.issueToken(name)
-  admin.close()
-  return token
-}
-
 async function upload(source: SourceDb, sessionId: string, token: string) {
-  await createClient({ url: hub.url.href, token }).snapshot(readSnapshot(source.db, sessionId)!)
+  await Effect.runPromise(makeClient({ url: hub.url.href, token }).snapshot(readSnapshot(source.db, sessionId)!))
 }
 
 beforeEach(async () => {
   dataDir = mkdtempSync(join(tmpdir(), "recall-search-"))
   embedder = fakeEmbedder()
-  hub = serve({ dataDir, listen: "127.0.0.1:0", logLevel: "error" }, createLog("error", () => {}), embedder)
-  config = { url: hub.url.href, token: issueToken("laptop") }
+  hub = await startHub(dataDir, embedder)
+  config = { url: hub.url.href, token: hub.issueToken("laptop") }
 
   // The desktop uploads one session and goes offline; the hub's copy is all that remains.
   const desktop = sourceDb()
   desktop.addSession("ses_remote", { title: "Fixing the ingress", time: 100 })
   desktop.addMessage("ses_remote", "user", { text: "the needle broke the ingress" }, 101)
-  await upload(desktop, "ses_remote", issueToken("desktop"))
+  await upload(desktop, "ses_remote", hub.issueToken("desktop"))
   desktop.close()
 
   laptop = sourceDb()
@@ -59,9 +50,20 @@ afterEach(async () => {
 
 const context = { sessionID: "ses_self" } as unknown as ToolContext
 
-async function run(input: object, loadConfig: () => Promise<HubConfig | null> = async () => config): Promise<string> {
-  const tool = searchTool({ loadConfig, compactionBoundary: (id) => compactionBoundary(laptop.db, id) })
-  const { content } = await tool.execute(input, context)
+const tool = (hubConfig: Option.Option<PluginConfig.Hub>) =>
+  Effect.runPromise(
+    SearchTool.make().pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(PluginConfig.Service, { hub: Effect.succeed(hubConfig) }),
+          Source.fromDatabase(laptop.db),
+        ),
+      ),
+    ),
+  )
+
+async function run(input: object, hubConfig: Option.Option<PluginConfig.Hub> = Option.some(config)): Promise<string> {
+  const { content } = await (await tool(hubConfig)).execute(input, context)
   if (typeof content !== "string") throw new Error("expected text content")
   return content
 }
@@ -83,14 +85,14 @@ test("filters reach the hub", async () => {
 })
 
 test("an unconfigured or unreachable hub is reported as not having looked", async () => {
-  expect(await run({ query: "needle" }, async () => null)).toStartWith("recall could not look")
+  expect(await run({ query: "needle" }, Option.none())).toStartWith("recall could not look")
   await hub.stop()
   expect(await run({ query: "needle" })).toStartWith("recall could not look: the hub request failed")
 })
 
 test("hybrid results carry semantic hits once the hub has embedded the chunks", async () => {
-  const client = createClient(config)
-  for (let s = await client.status(); s.embeddedChunks < s.chunks; s = await client.status()) await Bun.sleep(5)
+  const status = () => Effect.runPromise(makeClient(config).status())
+  for (let s = await status(); s.embeddedChunks < s.chunks; s = await status()) await Bun.sleep(5)
 
   // BM25 does not stem, so only the semantic branch connects "needles" to "needle".
   expect(await run({ query: "needles", mode: "lexical" })).toStartWith('No matches for "needles" (lexical, scope=all)')

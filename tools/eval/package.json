@@ -6,5 +6,8 @@
     "mine": "bun src/mine.ts",
     "freeze": "bun src/freeze.ts",
     "baseline": "bun src/baseline.ts"
+  },
+  "dependencies": {
+    "effect": "4.0.0-rc.117"
   }
 }

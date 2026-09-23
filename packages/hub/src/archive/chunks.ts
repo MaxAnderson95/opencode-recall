@@ -12,7 +12,7 @@ export type ChunkParams = Pick<SpaceRecipe, "chunkChars" | "chunkOverlap" | "tur
 
 /** The parts of a session chunking reads; only non-blank text parts are embedded. */
 export type ChunkSource = Pick<Session, "parentId"> & {
-  messages: (Pick<Message, "id" | "type" | "timeCreated"> & { parts: Pick<Part, "kind" | "text">[] })[]
+  messages: readonly (Pick<Message, "id" | "type" | "timeCreated"> & { parts: readonly Pick<Part, "kind" | "text">[] })[]
 }
 
 export type Chunk = {

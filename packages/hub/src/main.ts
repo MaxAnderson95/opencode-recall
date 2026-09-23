@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
-import type { Archive } from "./archive/index.ts"
-import { loadConfig } from "./config.ts"
-import { createLog } from "./log.ts"
-import { openDataArchive, serve } from "./serve.ts"
+import { Cause, Effect, Fiber, Layer } from "effect"
+import { HubConfig } from "./config.ts"
+import { Log } from "./log.ts"
+import { Hub } from "./serve.ts"
 import { TOKEN_USAGE, runToken } from "./token.ts"
 
 const [command, ...args] = process.argv.slice(2)
@@ -11,33 +11,45 @@ if (command !== "serve" && command !== "token") {
   process.exit(2)
 }
 
-const config = await loadConfig()
-const log = createLog(config.logLevel)
-
-if (command === "token") {
-  let archive: Archive
-  try {
-    archive = openDataArchive(config).archive
-  } catch (e) {
-    console.error(e instanceof Error ? e.message : String(e))
-    process.exit(1)
-  }
-  const code = runToken(archive, args, { stdout: console.log, stderr: console.error })
-  archive.close()
-  process.exit(code)
+const messageOf = (cause: Cause.Cause<unknown>) => {
+  const error = Cause.squash(cause)
+  return error instanceof Error ? error.message : String(error)
 }
 
-let hub: ReturnType<typeof serve>
-try {
-  hub = serve(config, log)
-} catch (e) {
-  log("error", "startup failed", { error: e instanceof Error ? e.message : String(e) })
+const loaded = await Effect.runPromiseExit(HubConfig.load)
+if (loaded._tag === "Failure") {
+  console.error(messageOf(loaded.cause))
   process.exit(1)
 }
+const config = Layer.succeed(HubConfig.Service, loaded.value)
+
+if (command === "token") {
+  const exit = await Effect.runPromiseExit(
+    runToken(args).pipe(Effect.provide(Hub.dataArchive.pipe(Layer.provide(Hub.dataEmbedder), Layer.provide(config)))),
+  )
+  if (exit._tag === "Failure") console.error(messageOf(exit.cause))
+  process.exit(exit._tag === "Success" ? exit.value : 1)
+}
+
+const log = Log.layer(loaded.value.logLevel)
+
+const hub = Effect.runFork(
+  Layer.launch(Hub.layer().pipe(Layer.provide(config))).pipe(
+    Effect.catchCause((cause) =>
+      Cause.hasInterruptsOnly(cause)
+        ? Effect.void
+        : Effect.logError("startup failed").pipe(
+            Effect.annotateLogs({ error: messageOf(cause) }),
+            Effect.andThen(Effect.sync(() => process.exit(1))),
+          ),
+    ),
+    Effect.provide(log),
+  ),
+)
 
 for (const signal of ["SIGINT", "SIGTERM"] as const)
   process.on(signal, async () => {
-    log("info", "shutting down", { signal })
-    await hub.stop()
+    await Effect.runPromise(Effect.logInfo("shutting down").pipe(Effect.annotateLogs({ signal }), Effect.provide(log)))
+    await Effect.runPromise(Fiber.interrupt(hub))
     process.exit(0)
   })

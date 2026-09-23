@@ -11,6 +11,6 @@
   "dependencies": {
     "@huggingface/transformers": "4.3.0",
     "@opencode-recall/protocol": "workspace:*",
-    "zod": "4.6.5"
+    "effect": "4.0.0-rc.117"
   }
 }

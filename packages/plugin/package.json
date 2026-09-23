@@ -6,7 +6,7 @@
   "engines": { "opencode": ">=2.0.14" },
   "dependencies": {
     "@opencode-recall/protocol": "workspace:*",
-    "zod": "4.6.5"
+    "effect": "4.0.0-rc.117"
   },
   "peerDependencies": {
     "@opencode/plugin": "2.0.14"
