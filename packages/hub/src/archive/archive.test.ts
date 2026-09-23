@@ -474,6 +474,35 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     expect(await archive.embedPending(32)).toBe(2)
   })
 
+  test.each(["replaced", "deleted"])(
+    "a session %s while its batch is being embedded gives the batch's vectors to no other chunk",
+    async (how) => {
+      const fake = fakeEmbedder()
+      let gate = Promise.resolve()
+      const archive = open(path(), { model: fake.model, embed: async (texts) => (await gate, fake.embed(texts)) })
+      const laptop = sourceOf(archive)
+      archive.putSnapshot(single("ses_a", "zebra stripes"), laptop)
+      // Load the matrix, so a stale vector would also reach it.
+      await archive.search({ query: "zebra", limit: 8, mode: "semantic" }, 0)
+      let release = () => {}
+      gate = new Promise<void>((resolve) => (release = resolve))
+      const inFlight = archive.embedPending(32)
+
+      if (how === "replaced") archive.putSnapshot(session("ses_a", ["walrus tusks"], { revision: 2, lastActivity: 20 }), laptop)
+      else {
+        archive.putTombstone({ sessionId: "ses_a", revision: 2, timeDeleted: 20 }, laptop)
+        archive.putSnapshot(single("ses_b", "walrus tusks"), laptop)
+      }
+      release()
+      await inFlight
+
+      expect(archive.status()).toMatchObject({ chunks: 2, embeddedChunks: 0 })
+      expect(await archive.embedPending(32)).toBe(2)
+      const { sessions } = await archive.search({ query: "walrus", limit: 8, mode: "semantic" }, 0)
+      expect(sessions.map((s) => s.hits[0]!.snippet)).toEqual(["USER: «walrus» tusks"])
+    },
+  )
+
   test("a grown session keeps the vectors of its unchanged chunks and embeds only the new ones", async () => {
     const embedder = fakeEmbedder()
     const archive = open(path(), embedder)

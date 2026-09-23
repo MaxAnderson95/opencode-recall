@@ -103,7 +103,9 @@ export const migrations: readonly string[] = [
     time_created INTEGER NOT NULL
   );
   CREATE TABLE chunks (
-    id INTEGER PRIMARY KEY,
+    -- AUTOINCREMENT: an embedding batch in flight names its chunks by id, and a chunk replaced
+    -- meanwhile must not pass its id to different text.
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     chunk_set_id INTEGER NOT NULL REFERENCES chunk_sets(id) ON DELETE CASCADE,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,

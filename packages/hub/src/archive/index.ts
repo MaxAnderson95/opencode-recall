@@ -249,7 +249,8 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
     `INSERT INTO chunks (chunk_set_id, session_id, message_id, window_index, scope, time_created, hash, text)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   )
-  // A chunk deleted while its batch was being embedded gets no vector.
+  // A chunk deleted while its batch was being embedded gets no vector. Chunk ids are never reused
+  // (AUTOINCREMENT), so an id that still exists names the very text that was embedded.
   const insertVector = db.prepare(
     `INSERT OR IGNORE INTO vectors (chunk_id, space_id, embedding)
      SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM chunks WHERE id = ?)`,
