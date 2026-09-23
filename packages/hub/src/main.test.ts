@@ -6,6 +6,7 @@ import { join } from "node:path"
 import { divergenceRemedy, type Snapshot } from "@opencode-recall/protocol"
 import { Effect, Option } from "effect"
 import { Archive, SCHEMA_VERSION } from "./archive/index.ts"
+import { migrations } from "./archive/migrations.ts"
 import { fakeLayer } from "./fake-embedder.ts"
 
 const dirs: string[] = []
@@ -35,12 +36,16 @@ test("a migration that fails leaves the archive at its old version with everythi
   const dataDir = mkdtempSync(join(tmpdir(), "recall-hub-"))
   dirs.push(dataDir)
   const path = join(dataDir, "archive.db")
-  Effect.runSync(Effect.scoped(Effect.flatMap(Archive.make(path), (a) => a.issueToken("laptop"))).pipe(Effect.provide(fakeLayer())))
-  // Claiming one version fewer makes the last migration run again: its first table is created,
-  // then its second already exists, so the migration fails partway through.
-  const before = new Database(path)
-  before.run("DROP TABLE divergences")
-  before.run(`PRAGMA user_version = ${SCHEMA_VERSION - 1}`)
+  const failing = migrations.findIndex((sql) => sql.includes("CREATE INDEX chunks_session_set_idx"))
+  const upgraded = failing - 1
+  // An archive holding a token, two migrations behind one whose index already exists: the first
+  // pending migration applies, then that one fails, so the failure comes partway through.
+  const before = new Database(path, { create: true })
+  for (const sql of migrations.slice(0, upgraded)) before.run(sql)
+  before.run(`PRAGMA user_version = ${upgraded}`)
+  before.run("INSERT INTO sources (id, name, time_created) VALUES (1, 'laptop', 1)")
+  before.run("INSERT INTO tokens (source_id, hash, time_created) VALUES (1, x'00', 1)")
+  before.run("CREATE INDEX chunks_session_set_idx ON chunks(session_id)")
   before.close()
 
   const proc = Bun.spawn(["bun", join(import.meta.dir, "main.ts"), "serve"], {
@@ -54,7 +59,7 @@ test("a migration that fails leaves the archive at its old version with everythi
   expect(last.error).toContain("already exists")
 
   const after = new Database(path, { readonly: true })
-  expect(after.query("PRAGMA user_version").get()).toEqual({ user_version: SCHEMA_VERSION - 1 })
+  expect(after.query("PRAGMA user_version").get()).toEqual({ user_version: upgraded })
   expect(after.query("SELECT count(*) AS n FROM tokens").get()).toEqual({ n: 1 })
   expect(after.query("SELECT name FROM sqlite_master WHERE name = 'divergences'").get()).toBeNull()
   after.close()
