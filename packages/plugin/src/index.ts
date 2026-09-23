@@ -65,10 +65,17 @@ export default Plugin.define({
     const runtime = ManagedRuntime.make(
       events(ctx).pipe(Layer.provide(Uploader.layer()), Layer.provideMerge(services), Layer.provideMerge(log)),
     )
-    const tool = await runtime.runPromise(SearchTool.make())
-    await ctx.tool.transform((tools) => {
-      tools.add(tool)
-    })
+    // Building the runtime starts the uploader and the event subscription, so a failed setup,
+    // which returns no cleanup to the host, must release them itself.
+    try {
+      const tool = await runtime.runPromise(SearchTool.make())
+      await ctx.tool.transform((tools) => {
+        tools.add(tool)
+      })
+    } catch (e) {
+      await runtime.dispose()
+      throw e
+    }
     return () => runtime.dispose()
   },
 })
