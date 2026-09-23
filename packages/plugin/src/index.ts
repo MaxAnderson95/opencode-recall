@@ -8,6 +8,7 @@ import { InspectTool } from "./inspect.ts"
 import { SearchTool } from "./search.ts"
 import { Source } from "./source.ts"
 import { Storage } from "./storage.ts"
+import { SummarizeTool } from "./summarize.ts"
 import { Uploader } from "./uploader.ts"
 
 type Context = Parameters<Parameters<typeof Plugin.define>[0]["setup"]>[0]
@@ -70,13 +71,14 @@ export default Plugin.define({
     // Building the runtime starts the uploader and the event subscription, so a failed setup,
     // which returns no cleanup to the host, must release them itself.
     try {
-      const [search, inspect, expand] = await runtime.runPromise(
-        Effect.all([SearchTool.make(), InspectTool.make(), ExpandTool.make()]),
+      const [search, inspect, expand, summarize] = await runtime.runPromise(
+        Effect.all([SearchTool.make(), InspectTool.make(), ExpandTool.make(), SummarizeTool.make(ctx.generate)]),
       )
       await ctx.tool.transform((tools) => {
         tools.add(search)
         tools.add(inspect)
         tools.add(expand)
+        tools.add(summarize)
       })
     } catch (e) {
       await runtime.dispose()

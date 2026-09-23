@@ -18,14 +18,17 @@ import type {
   SearchResult,
   Snapshot,
   SpaceRecipe,
+  SummaryGet,
+  SummaryPut,
   Tombstone,
+  Transcript,
   WindowMessage,
 } from "@opencode-recall/protocol"
 import { Context, Effect, Layer, Option, Schema, type Scope } from "effect"
 import { Embedder, type EmbeddingModel } from "../embedder.ts"
 import { RENDERING_VERSION, renderChunks, type ChunkSource } from "./chunks.ts"
 import { SEGMENTED, migrations } from "./migrations.ts"
-import { clean, ftsQuery, fuse, makeSnippet, queryTokens, segments } from "./text.ts"
+import { clean, cut, ftsQuery, fuse, makeSnippet, middleOut, queryTokens, segments, transcriptBlock } from "./text.ts"
 import { createMatrix, type Matrix, type VectorRow } from "./vectors.ts"
 
 export const SCHEMA_VERSION = migrations.length
@@ -39,6 +42,9 @@ export type TokenInfo = { id: number; source: string; timeCreated: number }
 
 /** How `putSnapshot` resolved a snapshot against the copy the archive holds (§5 acceptance). */
 export type PutResult = "archived" | "rewound" | "unchanged" | "stale_revision" | "hash_divergence" | "tombstoned"
+
+/** Whether `putSummary` cached a summary, or refused it because the archive moved past its content. */
+export type SummaryPutResult = "stored" | "stale_revision"
 
 /** The archive was migrated by a newer binary; it was left untouched. */
 export class NewerSchema extends Schema.TaggedError<NewerSchema>()("Archive.NewerSchema", {
@@ -95,6 +101,20 @@ export interface Interface {
   readonly inspect: (inspect: Inspect, callerSourceId: number) => Effect.Effect<Responses["inspect"]>
   /** A window of the named session's messages, centered on `expand.messageId` or ending the session. */
   readonly expand: (expand: Expand, callerSourceId: number) => Effect.Effect<Responses["expand"]>
+  /**
+   * The named session rendered whole, one block per message with its text cut to
+   * `transcript.maxChars`, then middle-out truncated to `transcript.budget` characters, with the
+   * content hash it was read at and counts of what was cut.
+   */
+  readonly transcript: (transcript: Transcript, callerSourceId: number) => Effect.Effect<Responses["transcript"]>
+  /** The summary cached under the key for the content the archive holds now for the named session. */
+  readonly getSummary: (key: SummaryGet, callerSourceId: number) => Effect.Effect<Responses["summary.get"]>
+  /**
+   * Cache a summary under its key, recording the held revision. `stale_revision`, storing nothing,
+   * unless the archive holds exactly `summary.contentHash` for the session. Accepting a snapshot or
+   * a tombstone for a session drops every summary cached for it.
+   */
+  readonly putSummary: (summary: SummaryPut) => Effect.Effect<SummaryPutResult>
   /**
    * Embed up to `limit` chunks waiting in the active space's queue, oldest first, and return how
    * many were taken from it (0 once it is empty, or when the embedder does not match the active
@@ -510,6 +530,16 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
     `SELECT kind, text, tool_name AS tool, tool_title AS title, status, error FROM parts
      WHERE message_id = ? ORDER BY ordinal`,
   )
+  const selectSummary = db.prepare(
+    `SELECT summary, time_created AS timeCreated FROM summaries
+     WHERE session_id = $sessionId AND content_hash = (SELECT content_hash FROM sessions WHERE id = $sessionId)
+       AND provider = $provider AND model = $model AND variant = $variant AND focus = $focus AND recipe = $recipe`,
+  )
+  const upsertSummary = db.prepare(
+    `INSERT INTO summaries (session_id, content_hash, provider, model, variant, focus, recipe, revision, summary, time_created)
+     VALUES ($sessionId, $contentHash, $provider, $model, $variant, $focus, $recipe, $revision, $summary, $timeCreated)
+     ON CONFLICT DO UPDATE SET revision = excluded.revision, summary = excluded.summary, time_created = excluded.time_created`,
+  )
   const selectSegmentText = db.prepare("SELECT text FROM segment_text WHERE id = ?")
   const countSessions = db.prepare("SELECT count(*) AS n FROM sessions")
   const selectTombstone = db.prepare("SELECT time_deleted AS timeDeleted FROM tombstones WHERE session_id = ?")
@@ -751,33 +781,98 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
       : result
   })
 
+  type MessageRow = { messageId: string; type: Message["type"]; time: number }
+
+  /** A stored message cut down for reading; `clipped` when its text was longer than `maxChars`. */
+  function readMessage(m: MessageRow, maxChars: number): { message: WindowMessage; clipped: boolean } {
+    type PartRow = { kind: Part["kind"]; text: string; tool: string | null; title: string | null; status: string | null; error: string | null }
+    const parts = selectWindowParts.all(m.messageId) as PartRow[]
+    const texts = parts.filter((p) => p.kind === "text").map((p) => p.text)
+    const tools = parts.flatMap((p) =>
+      p.kind === "tool" && p.tool !== null
+        ? [
+            {
+              tool: p.tool,
+              title: clean(p.title ?? "", TOOL_TITLE_CHARS),
+              status: p.status ?? "unknown",
+              ...(p.error !== null && { error: clean(p.error, TOOL_ERROR_CHARS) }),
+            },
+          ]
+        : [],
+    )
+    const text = texts.length ? cut(texts.join("\n"), maxChars) : { text: "", cut: false }
+    return { message: { ...m, text: text.text, tools }, clipped: text.cut }
+  }
+
   const expandTx = db.transaction((f: Expand, callerSourceId: number): Responses["expand"] => {
     const resolved = resolveSession(f.session, callerSourceId)
     if (!resolved) return { kind: "missing" }
-    type Row = { messageId: string; type: Message["type"]; time: number }
-    const messages = selectMessages.all(resolved.session.sessionId) as Row[]
+    const messages = selectMessages.all(resolved.session.sessionId) as MessageRow[]
     const found = f.messageId === undefined ? -1 : messages.findIndex((m) => m.messageId === f.messageId)
     const center = found >= 0 ? found : messages.length - 1
     const start = Math.max(0, Math.min(center - Math.floor(f.window / 2), messages.length - f.window))
-    const window = messages.slice(start, start + f.window).map((m): WindowMessage => {
-      type PartRow = { kind: Part["kind"]; text: string; tool: string | null; title: string | null; status: string | null; error: string | null }
-      const parts = selectWindowParts.all(m.messageId) as PartRow[]
-      const texts = parts.filter((p) => p.kind === "text").map((p) => p.text)
-      const tools = parts.flatMap((p) =>
-        p.kind === "tool" && p.tool !== null
-          ? [
-              {
-                tool: p.tool,
-                title: clean(p.title ?? "", TOOL_TITLE_CHARS),
-                status: p.status ?? "unknown",
-                ...(p.error !== null && { error: clean(p.error, TOOL_ERROR_CHARS) }),
-              },
-            ]
-          : [],
-      )
-      return { ...m, text: texts.length ? clean(texts.join("\n"), f.maxChars) : "", tools }
-    })
+    const window = messages.slice(start, start + f.window).map((m) => readMessage(m, f.maxChars).message)
     return { kind: "window", ...resolved, total: messages.length, start, messages: window }
+  })
+
+  const transcriptTx = db.transaction((f: Transcript, callerSourceId: number): Responses["transcript"] => {
+    const resolved = resolveSession(f.session, callerSourceId)
+    if (!resolved) return { kind: "missing" }
+    const { sessionId } = resolved.session
+    const messages = selectMessages.all(sessionId) as MessageRow[]
+    const blocks: { text: string; clipped: boolean }[] = []
+    for (const m of messages) {
+      const { message, clipped } = readMessage(m, f.maxChars)
+      const text = transcriptBlock(message)
+      if (text !== null) blocks.push({ text, clipped })
+    }
+    const { text, dropped } = middleOut(
+      blocks.map((b) => b.text),
+      f.budget,
+      (omitted, total) => `[... ${omitted} of ${total} messages omitted ...]`,
+    )
+    const kept = blocks.filter((_, i) => i < dropped.from || i >= dropped.to)
+    return {
+      kind: "transcript",
+      ...resolved,
+      contentHash: (selectHeld.get(sessionId) as Held).contentHash,
+      messages: messages.length,
+      omitted: dropped.to - dropped.from,
+      clipped: kept.filter((b) => b.clipped).length,
+      text,
+    }
+  })
+
+  const summaryKey = (f: SummaryGet | SummaryPut) => ({
+    provider: f.provider,
+    model: f.model,
+    variant: f.variant ?? "",
+    focus: f.focus,
+    recipe: f.recipe,
+  })
+
+  const summaryGetTx = db.transaction((f: SummaryGet, callerSourceId: number): Responses["summary.get"] => {
+    const resolved = resolveSession(f.session, callerSourceId)
+    if (!resolved) return { kind: "missing" }
+    const cached = selectSummary.get({ sessionId: resolved.session.sessionId, ...summaryKey(f) }) as {
+      summary: string
+      timeCreated: number
+    } | null
+    return cached ? { kind: "cached", ...resolved, ...cached } : { kind: "absent", ...resolved }
+  })
+
+  const summaryPutTx = db.transaction((f: SummaryPut): SummaryPutResult => {
+    const held = selectHeld.get(f.sessionId) as Held | null
+    if (held?.contentHash !== f.contentHash) return "stale_revision"
+    upsertSummary.run({
+      sessionId: f.sessionId,
+      contentHash: f.contentHash,
+      ...summaryKey(f),
+      revision: held.revision,
+      summary: f.summary,
+      timeCreated: Date.now(),
+    })
+    return "stored"
   })
 
   const putSnapshot = Effect.fn("Archive.putSnapshot")(function* (snapshot: Snapshot, sourceId: number) {
@@ -822,6 +917,15 @@ function bind(db: Database, migration: { from: number; to: number }, embedder: E
     inspect,
     expand: Effect.fn("Archive.expand")(function* (f: Expand, callerSourceId: number) {
       return expandTx(f, callerSourceId)
+    }),
+    transcript: Effect.fn("Archive.transcript")(function* (f: Transcript, callerSourceId: number) {
+      return transcriptTx(f, callerSourceId)
+    }),
+    getSummary: Effect.fn("Archive.getSummary")(function* (f: SummaryGet, callerSourceId: number) {
+      return summaryGetTx(f, callerSourceId)
+    }),
+    putSummary: Effect.fn("Archive.putSummary")(function* (f: SummaryPut) {
+      return summaryPutTx.immediate(f)
     }),
     embedPending,
     issueToken: Effect.fn("Archive.issueToken")(function* (source: string) {
