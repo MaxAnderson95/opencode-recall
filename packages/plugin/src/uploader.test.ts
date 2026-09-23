@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { PROTOCOL_VERSION, createClient, type ErrorBody, type ErrorCode } from "@opencode-recall/protocol"
 import { openArchive, type Archive } from "../../hub/src/archive/index.ts"
+import { fakeEmbedder } from "../../hub/src/fake-embedder.ts"
 import { DEFAULT_LIMITS, createHandler, type Limits } from "../../hub/src/server.ts"
 import { loadHubConfig } from "./config.ts"
 import { sourceDb, type SourceDb } from "./fixture.ts"
@@ -60,7 +61,7 @@ function startHub(limits: Limits = DEFAULT_LIMITS) {
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "recall-uploader-"))
   configFile = join(dir, "recall.json")
-  archive = openArchive(join(dir, "archive.db"))
+  archive = openArchive(join(dir, "archive.db"), fakeEmbedder())
   intercept = (req, forward) => forward(req)
   outcomes = []
   verbs = []
@@ -150,7 +151,7 @@ test("a lost acknowledgement is retried and the retry is a no-op", async () => {
   await until(() => outcomes.length === 2)
   expect(outcomes).toEqual(["archived", "unchanged"])
   await until(() => pending() === 0)
-  expect(archive.status()).toEqual({ sessions: 1 })
+  expect(archive.status()).toMatchObject({ sessions: 1 })
 })
 
 test("a change made while an upload is in flight is still uploaded afterwards", async () => {
@@ -196,7 +197,7 @@ test("two plugin instances uploading the same session converge on one correct co
   await Bun.sleep(30)
   expect(archivedTexts()).toEqual(["first", "two", "three", "four"])
   expect(outcomes.every((o) => o === "archived" || o === "unchanged")).toBe(true)
-  expect(archive.status()).toEqual({ sessions: 1 })
+  expect(archive.status()).toMatchObject({ sessions: 1 })
 })
 
 test("an old acknowledgement never removes another instance's newer work", async () => {
@@ -267,7 +268,7 @@ test("an oversize snapshot is rejected as payload_too_large and not retried", as
   await until(() => pending() === 0)
   await Bun.sleep(50)
   expect(outcomes).toEqual(["payload_too_large"])
-  expect(archive.status()).toEqual({ sessions: 0 })
+  expect(archive.status()).toMatchObject({ sessions: 0 })
 })
 
 test.each<[ErrorCode | number, "retried" | "dropped"]>([
@@ -293,7 +294,7 @@ test.each<[ErrorCode | number, "retried" | "dropped"]>([
   await until(() => pending() === 0)
   await Bun.sleep(50)
   expect(requests).toBe(expected === "retried" ? 2 : 1)
-  expect(archive.status()).toEqual({ sessions: expected === "retried" ? 1 : 0 })
+  expect(archive.status()).toMatchObject({ sessions: expected === "retried" ? 1 : 0 })
 })
 
 test("invalid_token pauses the queue without losing work, and a fixed config file resumes it", async () => {
@@ -307,7 +308,7 @@ test("invalid_token pauses the queue without losing work, and a fixed config fil
   expect(uploader.pausedBy).toStartWith("invalid_token")
   uploader.enqueue("ses_b")
   await Bun.sleep(30)
-  expect(archive.status()).toEqual({ sessions: 0 })
+  expect(archive.status()).toMatchObject({ sessions: 0 })
   expect([...entries.keys()].map((key) => key.split("/")[1]).sort()).toEqual(["ses_a", "ses_b"])
 
   configure()
@@ -382,7 +383,7 @@ test("deleting a session tombstones it, and a later upload from before the delet
 
   const error = await clientFor("desktop").snapshot(stale).catch((e: unknown) => e)
   expect(error).toMatchObject({ code: "tombstoned", status: 409 })
-  expect(archive.status()).toEqual({ sessions: 0 })
+  expect(archive.status()).toMatchObject({ sessions: 0 })
 })
 
 test("a session deleted before its queued upload sends a tombstone instead of the upload", async () => {
@@ -461,7 +462,7 @@ test("a session changed while the plugin was not running is uploaded on the next
   await start(storage).reconcile()
   await until(() => outcomes.length === 3)
   expect(archivedTexts()).toEqual(["first", "while down"])
-  expect(archive.status()).toEqual({ sessions: 2 })
+  expect(archive.status()).toMatchObject({ sessions: 2 })
 })
 
 test("a dropped event is caught by the periodic sweep without asking the hub", async () => {
@@ -555,7 +556,7 @@ test("sessions the hub holds that this host no longer reports stay in the archiv
   source.remove("ses_b")
   await uploader.reconcile()
   await Bun.sleep(60)
-  expect(archive.status()).toEqual({ sessions: 2 })
+  expect(archive.status()).toMatchObject({ sessions: 2 })
   expect(archive.manifest().tombstones).toEqual([])
   expect(verbs).not.toContain("tombstone")
 })

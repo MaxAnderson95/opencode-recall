@@ -7,6 +7,8 @@
 const ANSI_RE =
   /[\u001b\u009b](?:\][^\u0007\u001b]*(?:\u0007|\u001b\\)|\[[0-9;?]*[0-9A-ORZcf-nqry=><]|[()#][0-9A-Za-z])/g
 
+export const stripAnsi = (text: string) => text.replace(ANSI_RE, "")
+
 const TOKEN_RE = /[\p{L}\p{N}_./@-]+/gu
 
 export function queryTokens(query: string): string[] {
@@ -67,7 +69,7 @@ export function segments(text: string, size: number): { start: number; length: n
 
 /** Render a highlighted excerpt around the densest cluster of query terms. */
 export function makeSnippet(text: string, tokens: string[], width = 220, open = "«", close = "»"): string {
-  const flat = text.replace(ANSI_RE, "").replace(/\s+/g, " ").trim()
+  const flat = stripAnsi(text).replace(/\s+/g, " ").trim()
   if (!flat) return ""
   const lower = flat.toLowerCase()
   const wanted = [...new Set(tokens.map((t) => t.toLowerCase()).filter(Boolean))]

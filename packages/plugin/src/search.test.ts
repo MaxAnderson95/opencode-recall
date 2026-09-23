@@ -5,6 +5,7 @@ import { join } from "node:path"
 import type { ToolContext } from "@opencode/plugin/promise/tool"
 import { createClient } from "@opencode-recall/protocol"
 import { openArchive } from "../../hub/src/archive/index.ts"
+import { fakeEmbedder } from "../../hub/src/fake-embedder.ts"
 import { createLog } from "../../hub/src/log.ts"
 import { serve } from "../../hub/src/serve.ts"
 import type { HubConfig } from "./config.ts"
@@ -16,9 +17,10 @@ let dataDir: string
 let hub: ReturnType<typeof serve>
 let laptop: SourceDb
 let config: HubConfig
+let embedder: ReturnType<typeof fakeEmbedder>
 
 function issueToken(name: string): string {
-  const admin = openArchive(join(dataDir, "archive.db"))
+  const admin = openArchive(join(dataDir, "archive.db"), fakeEmbedder())
   const token = admin.issueToken(name)
   admin.close()
   return token
@@ -30,7 +32,8 @@ async function upload(source: SourceDb, sessionId: string, token: string) {
 
 beforeEach(async () => {
   dataDir = mkdtempSync(join(tmpdir(), "recall-search-"))
-  hub = serve({ dataDir, listen: "127.0.0.1:0", logLevel: "error" }, createLog("error", () => {}))
+  embedder = fakeEmbedder()
+  hub = serve({ dataDir, listen: "127.0.0.1:0", logLevel: "error" }, createLog("error", () => {}), embedder)
   config = { url: hub.url.href, token: issueToken("laptop") }
 
   // The desktop uploads one session and goes offline; the hub's copy is all that remains.
@@ -83,4 +86,27 @@ test("an unconfigured or unreachable hub is reported as not having looked", asyn
   expect(await run({ query: "needle" }, async () => null)).toStartWith("recall could not look")
   await hub.stop()
   expect(await run({ query: "needle" })).toStartWith("recall could not look: the hub request failed")
+})
+
+test("hybrid results carry semantic hits once the hub has embedded the chunks", async () => {
+  const client = createClient(config)
+  for (let s = await client.status(); s.embeddedChunks < s.chunks; s = await client.status()) await Bun.sleep(5)
+
+  // BM25 does not stem, so only the semantic branch connects "needles" to "needle".
+  expect(await run({ query: "needles", mode: "lexical" })).toStartWith('No matches for "needles" (lexical, scope=all)')
+  const output = await run({ query: "needles" })
+  expect(output).toContain("Fixing the ingress")
+  expect(output).toContain("matches(lex=0,sem=1)")
+  expect(output).toMatch(/\[semantic 0\.\d\d · Conversation context \(mixed origins\)\] USER: the needle broke the ingress/)
+  expect(await run({ query: "needles", mode: "semantic", scope: "user-messages" })).toContain("· Top-level user message] the needle")
+})
+
+test("an unavailable embedder is named: hybrid falls back to lexical and semantic mode could not look", async () => {
+  embedder.down = true
+  const hybrid = await run({ query: "needle" })
+  expect(hybrid).toStartWith("semantic search is unavailable (embedding model unavailable); these results are lexical only.\n")
+  expect(hybrid).toContain("Fixing the ingress")
+  expect(await run({ query: "needle", mode: "semantic" })).toStartWith(
+    "recall could not look: semantic search is unavailable (embedding model unavailable).",
+  )
 })

@@ -12,6 +12,7 @@ import type { HubConfig } from "./config.ts"
 const Args = z.object({
   query: z.string(),
   scope: z.enum(["all", "user-messages"]).optional(),
+  mode: z.enum(["hybrid", "lexical", "semantic"]).optional(),
   directory: z.string().optional(),
   source: z.string().optional(),
   since: z.string().optional(),
@@ -31,6 +32,11 @@ const INPUT = {
       enum: ["all", "user-messages"],
       description:
         "Default all. Use user-messages to search top-level user text, excluding known synthetic context and child assignments.",
+    },
+    mode: {
+      type: "string",
+      enum: ["hybrid", "lexical", "semantic"],
+      description: "hybrid (default) fuses both; lexical = exact terms only; semantic = meaning only",
     },
     directory: {
       type: "string",
@@ -64,7 +70,9 @@ function fmtDate(ms: number): string {
 const home = homedir()
 const shortDir = (dir: string) => (home && dir.startsWith(home) ? "~" + dir.slice(home.length) : dir)
 
-function via(hit: SearchHit, session: SearchResult): string {
+function via(hit: SearchHit, session: SearchResult, scope: Search["scope"]): string {
+  if (hit.branch === "semantic")
+    return `semantic ${hit.score.toFixed(2)} · ${scope === "user-messages" ? "Top-level user message" : "Conversation context (mixed origins)"}`
   const origin =
     hit.kind === "tool"
       ? "Tool output"
@@ -79,14 +87,14 @@ function via(hit: SearchHit, session: SearchResult): string {
 }
 
 /** The ranked sessions as the model reads them. */
-function render(sessions: SearchResult[], callerSessionId: string): string {
+function render(sessions: SearchResult[], scope: Search["scope"], callerSessionId: string): string {
   const lines = sessions.flatMap((s, i) => {
     const origin = `from ${s.source || "an unknown host"}${s.ownSource ? " (this host)" : ""}, archived revision ${s.revision}`
     const self = s.sessionId === callerSessionId ? " ← THIS session, before its last compaction" : ""
     return [
       `${i + 1}. ${s.title || "(untitled)"} — ${fmtDate(s.timeUpdated)} · ${shortDir(s.directory)} · ${origin}${self}`,
-      `   session_id=${s.sessionId} message_id=${s.hits[0]?.messageId} matches(lex=${s.lexicalMatches})`,
-      ...s.hits.map((h) => `   [${via(h, s)}] ${h.snippet}`),
+      `   session_id=${s.sessionId} message_id=${s.hits[0]?.messageId} matches(lex=${s.lexicalMatches},sem=${s.semanticMatches})`,
+      ...s.hits.map((h) => `   [${via(h, s, scope)}] ${h.snippet}`),
     ]
   })
   return lines.join("\n")
@@ -104,7 +112,7 @@ export function searchTool({ loadConfig, compactionBoundary, fetch }: Options): 
   return {
     name: "recall_search",
     description:
-      "Search ALL past OpenCode conversations from every host sharing this recall hub (every project, full history) with lexical FTS5/BM25 search over messages, reasoning, and tool outputs. Use when the user references a previous discussion ('do you remember', 'we discussed', 'in another session'), or when past decisions, fixes, commands, or error messages would help. Also searches THIS session's history from before its last compaction, useful for recovering details lost to context compaction. Results name the host each session came from and its archived revision; the newest turn of a session may not be archived yet.",
+      "Search ALL past OpenCode conversations from every host sharing this recall hub (every project, full history) with hybrid lexical (FTS5/BM25 over messages, reasoning, and tool outputs) + semantic (embedding) search. Use when the user references a previous discussion ('do you remember', 'we discussed', 'in another session'), or when past decisions, fixes, commands, or error messages would help. Also searches THIS session's history from before its last compaction, useful for recovering details lost to context compaction. Results name the host each session came from and its archived revision; the newest turn of a session may not be archived yet.",
     input: INPUT,
     options: { codemode: false },
     async execute(input, ctx) {
@@ -118,8 +126,10 @@ export function searchTool({ loadConfig, compactionBoundary, fetch }: Options): 
             "recall could not look: no hub is configured. Set OPENCODE_RECALL_HUB_URL and OPENCODE_RECALL_TOKEN, or hub.url and hub.token in recall.json. This is not an empty result.",
         }
 
+      const mode = args.data.mode ?? "hybrid"
       const search: Search = {
         query,
+        mode,
         scope: args.data.scope,
         since: parseWhen(args.data.since),
         until: parseWhen(args.data.until),
@@ -131,17 +141,23 @@ export function searchTool({ loadConfig, compactionBoundary, fetch }: Options): 
         exclude: { sessionId: ctx.sessionID, before: compactionBoundary(ctx.sessionID) },
       }
       let sessions: SearchResult[]
+      let semanticUnavailable: string | undefined
       try {
-        ;({ sessions } = await createClient({ ...config, fetch }).search(search))
+        ;({ sessions, semanticUnavailable } = await createClient({ ...config, fetch }).search(search))
       } catch (e) {
         const reason = e instanceof HubError ? `${e.code}: ${e.message}` : e instanceof Error ? e.message : String(e)
         return { content: `recall could not look: the hub request failed (${reason}). This is not an empty result.` }
       }
+      if (semanticUnavailable !== undefined && mode === "semantic")
+        return {
+          content: `recall could not look: semantic search is unavailable (${semanticUnavailable}). Retry with mode=lexical or hybrid. This is not an empty result.`,
+        }
+      const note = semanticUnavailable === undefined ? "" : `semantic search is unavailable (${semanticUnavailable}); these results are lexical only.\n`
       if (!sessions.length)
         return {
-          content: `No matches for "${query}" (lexical, scope=${search.scope ?? "all"}). Try fewer or different keywords, or drop filters.`,
+          content: `${note}No matches for "${query}" (${mode}, scope=${search.scope ?? "all"}). Try mode=semantic for fuzzy recall, fewer or different keywords, or drop filters.`,
         }
-      return { content: render(sessions, ctx.sessionID), metadata: { title: `recall: ${query}` } }
+      return { content: note + render(sessions, search.scope, ctx.sessionID), metadata: { title: `recall: ${query}` } }
     },
   }
 }
