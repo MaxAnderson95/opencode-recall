@@ -1,0 +1,9 @@
+# Only what the hub image is built from; eval corpora hold private session text.
+*
+!package.json
+!bun.lock
+!packages/protocol
+!packages/hub
+!packages/plugin/package.json
+!tools/eval/package.json
+**/node_modules
