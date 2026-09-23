@@ -4,12 +4,15 @@ import { Cause, Console, Effect, Fiber, Layer } from "effect"
 import { Archive } from "./archive/index.ts"
 import { HubConfig } from "./config.ts"
 import { Log } from "./log.ts"
+import { REINDEX_USAGE, Reindex } from "./reindex.ts"
 import { Hub } from "./serve.ts"
 import { TOKEN_USAGE, runToken } from "./token.ts"
 
 const [command, ...args] = process.argv.slice(2)
-if (command !== "serve" && command !== "token" && command !== "status") {
-  console.error(`usage: opencode-recall-hub serve\n       opencode-recall-hub status\n       ${TOKEN_USAGE}`)
+if (command !== "serve" && command !== "token" && command !== "status" && command !== "reindex") {
+  console.error(
+    `usage: opencode-recall-hub serve\n       opencode-recall-hub status\n       ${REINDEX_USAGE}\n       ${TOKEN_USAGE}`,
+  )
   process.exit(2)
 }
 
@@ -44,6 +47,14 @@ if (command === "token" || command === "status") {
 }
 
 const log = Log.layer(loaded.value.logLevel)
+
+if (command === "reindex") {
+  const exit = await Effect.runPromiseExit(
+    Reindex.run(args).pipe(Effect.provide(Reindex.layer().pipe(Layer.provide(config))), Effect.provide(log)),
+  )
+  if (exit._tag === "Failure") console.error(messageOf(exit.cause))
+  process.exit(exit._tag === "Success" ? exit.value : 1)
+}
 
 const hub = Effect.runFork(
   Layer.launch(Hub.layer().pipe(Layer.provide(config))).pipe(
