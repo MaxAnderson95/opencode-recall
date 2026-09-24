@@ -1,8 +1,9 @@
 import { homedir } from "node:os"
 import { isAbsolute, join, relative, resolve as resolvePath, sep } from "node:path"
+import { normalizeFingerprint } from "@opencode-recall/protocol"
 import { Config, Context, Effect, Layer, Option, Schema } from "effect"
 
-export const Hub = Schema.Struct({ url: Schema.String, token: Schema.String })
+export const Hub = Schema.Struct({ url: Schema.String, token: Schema.String, certSha256: Schema.optionalKey(Schema.String) })
 export interface Hub extends Schema.Schema.Type<typeof Hub> {}
 
 const NonEmptyString = Schema.String.check(Schema.isNonEmpty())
@@ -21,7 +22,13 @@ export const DEFAULT_SUMMARY_MODEL: SummaryModel = { providerID: "openai", model
 // Other sections (`index`, from today's plugin) share the file. Hub values are checked only after the
 // environment is applied, so a placeholder the environment overrides cannot invalidate the result.
 const File = Schema.Struct({
-  hub: Schema.optionalKey(Schema.Struct({ url: Schema.optionalKey(Schema.Unknown), token: Schema.optionalKey(Schema.Unknown) })),
+  hub: Schema.optionalKey(
+    Schema.Struct({
+      url: Schema.optionalKey(Schema.Unknown),
+      token: Schema.optionalKey(Schema.Unknown),
+      certSha256: Schema.optionalKey(Schema.Unknown),
+    }),
+  ),
   summary: Schema.optionalKey(Schema.Struct({ model: Schema.optionalKey(Schema.Unknown) })),
   index: Schema.optionalKey(Schema.Struct({ excludeDirectories: Schema.optionalKey(Schema.Unknown) })),
 })
@@ -47,21 +54,37 @@ const readFile = Effect.fnUntraced(function* (path: string) {
 })
 
 /**
- * Resolve the hub address and token: `OPENCODE_RECALL_HUB_URL` and `OPENCODE_RECALL_TOKEN`, read
- * through the current `ConfigProvider`, win over `hub.url` and `hub.token` in the file at `path`.
- * `None` while either is missing or empty.
+ * Resolve the hub address, token, and certificate pin: `OPENCODE_RECALL_HUB_URL`,
+ * `OPENCODE_RECALL_TOKEN`, and `OPENCODE_RECALL_HUB_CERT_SHA256`, read through the current
+ * `ConfigProvider`, win over `hub.url`, `hub.token`, and `hub.certSha256` in the file at `path`.
+ * `None` while the address or token is missing or empty. A pin that is not a SHA-256 fingerprint,
+ * or one set for an `http` address, is invalid rather than ignored, since ignoring it would send the
+ * token without the protection it asked for.
  */
 const resolve = Effect.fnUntraced(function* (path: string) {
   const { hub } = yield* readFile(path)
-  const env = yield* Config.all({ url: optional("OPENCODE_RECALL_HUB_URL"), token: optional("OPENCODE_RECALL_TOKEN") }).pipe(
-    Effect.mapError(invalid),
-  )
+  const env = yield* Config.all({
+    url: optional("OPENCODE_RECALL_HUB_URL"),
+    token: optional("OPENCODE_RECALL_TOKEN"),
+    certSha256: optional("OPENCODE_RECALL_HUB_CERT_SHA256"),
+  }).pipe(Effect.mapError(invalid))
   const url = env.url || hub?.url
   const token = env.token || hub?.token
+  const pin = env.certSha256 || hub?.certSha256
   const from = (variable: string, fromEnv: string | undefined, fromFile: unknown) => (fromEnv ? variable : fromFile ? path : "not set")
   const source = `hub.url: ${from("OPENCODE_RECALL_HUB_URL", env.url, hub?.url)}; hub.token: ${from("OPENCODE_RECALL_TOKEN", env.token, hub?.token)}`
   if (!url || !token) return { hub: Option.none<Hub>(), source }
-  return { hub: Option.some(yield* Schema.decodeUnknownEffect(Hub)({ url, token }).pipe(Effect.mapError(invalid))), source }
+  const decoded = yield* Schema.decodeUnknownEffect(Hub)({ url, token, ...(pin !== undefined && { certSha256: pin }) }).pipe(
+    Effect.mapError(invalid),
+  )
+  if (decoded.certSha256 === undefined) return { hub: Option.some(decoded), source }
+  const certSha256 = normalizeFingerprint(decoded.certSha256)
+  if (!certSha256) return yield* invalid(`hub.certSha256 ${JSON.stringify(decoded.certSha256)} is not a SHA-256 fingerprint`)
+  if (!decoded.url.startsWith("https://")) return yield* invalid(`hub.certSha256 is set, but hub.url ${decoded.url} is not https`)
+  return {
+    hub: Option.some({ ...decoded, certSha256 }),
+    source: `${source}; hub.certSha256: ${from("OPENCODE_RECALL_HUB_CERT_SHA256", env.certSha256, hub?.certSha256)}`,
+  }
 })
 
 export const load = Effect.fn("PluginConfig.load")(function* (path: string) {

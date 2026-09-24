@@ -92,7 +92,7 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
-const writeConfig = (hubConfig: { url?: string; token?: string }, excludeDirectories: unknown = []) =>
+const writeConfig = (hubConfig: { url?: string; token?: string; certSha256?: string }, excludeDirectories: unknown = []) =>
   writeFileSync(configFile, JSON.stringify({ index: { excludeDirectories }, hub: hubConfig }))
 
 /** Point the config at the hub as "laptop", excluding `excludeDirectories`; later calls keep the same token. */
@@ -403,6 +403,19 @@ test("the environment overrides the config file's hub URL and token", async () =
 
   writeFileSync(configFile, JSON.stringify({ hub: { url: 7, token: "from-file" } }))
   await expect(loadHubConfig({}, configFile)).rejects.toThrow()
+})
+
+test("a certificate pin is normalized, the environment overrides it, and a malformed or http pin is invalid", async () => {
+  const hex = "4cd31df7134c2d5c32c00d3b5acf6fe4ffa595b5b78c4636b967f9a6771a35f3"
+  const pin = hex.toUpperCase().match(/../g)!.join(":")
+  writeConfig({ url: "https://file", token: "t", certSha256: hex })
+  expect(await loadHubConfig({}, configFile)).toEqual({ url: "https://file", token: "t", certSha256: pin })
+  expect(await loadHubConfig({ OPENCODE_RECALL_HUB_CERT_SHA256: pin.toLowerCase() }, configFile)).toMatchObject({ certSha256: pin })
+
+  writeConfig({ url: "https://file", token: "t", certSha256: "abc" })
+  await expect(loadHubConfig({}, configFile)).rejects.toThrow("not a SHA-256 fingerprint")
+  writeConfig({ url: "http://file", token: "t", certSha256: hex })
+  await expect(loadHubConfig({}, configFile)).rejects.toThrow("is not https")
 })
 
 const clientFor = (name: string) => makeClient({ url: hub.url.href, token: sync(archive.issueToken(name)) })
