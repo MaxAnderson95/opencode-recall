@@ -146,6 +146,18 @@ test("summarizer worker sessions are invisible to the uploader", () => {
   expect(readSession(source.db, "ses_w")).toBeNull()
 })
 
+test("a session OpenCode migrated from v1 with no events is invisible until its first event", () => {
+  // The v1 migration records an empty session's event counter as -1, which is no revision at all.
+  source.addSession("ses_e")
+  source.db.run("INSERT OR REPLACE INTO event_sequence (aggregate_id, seq) VALUES ('ses_e', -1)")
+  expect(readPosition(source.db, "ses_e")).toBeNull()
+  expect([...readPositions(source.db).keys()]).toEqual(["ses_a"])
+  expect(readSnapshot(source.db, "ses_e")).toBeNull()
+
+  source.db.run("UPDATE event_sequence SET seq = 0 WHERE aggregate_id = 'ses_e'")
+  expect(readPosition(source.db, "ses_e")).toMatchObject({ revision: 0 })
+})
+
 test("a snapshot carries the event counter as its revision and the newest activity", () => {
   expect(readSnapshot(source.db, "ses_a")).toMatchObject({
     revision: 5,

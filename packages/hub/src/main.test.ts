@@ -99,7 +99,18 @@ test("token issue prints the token once, list shows it by source without its val
   expect((await hub(dataDir, "token", "bogus")).code).toBe(2)
 })
 
-test("reindex exits with a clear error while serve runs, and runs once serve has stopped", async () => {
+test("token issue refuses a source that looks like a flag instead of issuing a token for it", async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), "recall-hub-"))
+  dirs.push(dataDir)
+  for (const flag of ["--help", "-h"]) {
+    const refused = await hub(dataDir, "token", "issue", flag)
+    expect(refused.code).toBe(2)
+    expect(refused.stdout).toBe("")
+  }
+  expect((await hub(dataDir, "token", "list")).stdout.split("\n")).toHaveLength(1)
+})
+
+test("serve loads the vectors before it listens, and reindex refuses while it runs and runs once it stops", async () => {
   const dataDir = mkdtempSync(join(tmpdir(), "recall-hub-"))
   dirs.push(dataDir)
   const serve = Bun.spawn(["bun", join(import.meta.dir, "main.ts"), "serve"], {
@@ -109,11 +120,15 @@ test("reindex exits with a clear error while serve runs, and runs once serve has
   })
   try {
     const reader = serve.stdout.getReader()
-    for (let out = ""; !out.includes('"msg":"listening"'); ) {
+    let out = ""
+    while (!out.includes('"msg":"listening"')) {
       const { value, done } = await reader.read()
       if (done) throw new Error(`serve exited before listening: ${out}`)
       out += new TextDecoder().decode(value)
     }
+    // The first semantic search must not wait for the vectors to load.
+    expect(out.indexOf('"msg":"vectors loaded"')).toBeGreaterThan(-1)
+    expect(out.indexOf('"msg":"vectors loaded"')).toBeLessThan(out.indexOf('"msg":"listening"'))
     const refused = await hub(dataDir, "reindex")
     expect(refused.code).toBe(1)
     expect(refused.stderr).toContain(`${dataDir} is held by another opencode-recall-hub process (serve or reindex); stop it first`)
