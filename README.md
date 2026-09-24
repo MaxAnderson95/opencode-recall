@@ -28,7 +28,7 @@ Every result names the host its session came from, so you can tell your laptop's
 - A Linux machine with Docker to run the hub, reachable from every host. The image is published for amd64 and arm64.
 - About 1 GB of memory for the hub, and disk for the archive, about 1.5 GB for 4,500 sessions.
 
-The hub speaks plain HTTP with bearer tokens. Run it on a private network, a Tailscale tailnet, or behind a TLS reverse proxy. Never expose it to the internet.
+The hub speaks plain HTTP with bearer tokens. Run it on a private network, a Tailscale tailnet, or behind a TLS reverse proxy (see [HTTPS with a pinned certificate](#https-with-a-pinned-certificate)). Never expose it to the internet.
 
 ## Install the hub
 
@@ -37,7 +37,7 @@ Create a directory for the hub and its data, and a `compose.yaml` in it:
 ```yaml
 services:
   hub:
-    image: ghcr.io/maxanderson95/opencode-recall-hub:v0.1.0
+    image: ghcr.io/maxanderson95/opencode-recall-hub:v0.1.1
     container_name: opencode-recall-hub
     restart: unless-stopped
     user: "1000:1000"
@@ -58,6 +58,56 @@ curl http://localhost:7438/readyz
 `/readyz` answers `{"ready":true,...}` once the embedding model has loaded, usually within a few seconds. With Docker enabled at boot, `restart: unless-stopped` brings the hub back after a reboot.
 
 A Linux binary is also attached to each [release](https://github.com/MaxAnderson95/opencode-recall/releases) if you would rather not use Docker. See [docs/operations.md](docs/operations.md).
+
+### HTTPS with a pinned certificate
+
+To encrypt traffic without a certificate authority, put a TLS proxy with a long-lived self-signed certificate in front of the hub and pin that certificate on every host. The plugin then trusts exactly that certificate, so no one else's certificate is accepted in its place and there is nothing to renew.
+
+Generate a ten-year certificate beside `compose.yaml` and print its fingerprint:
+
+```sh
+mkdir tls
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
+  -subj "/CN=recall-hub" -addext "subjectAltName=DNS:recall-hub.example" \
+  -keyout tls/hub.key -out tls/hub.crt
+openssl x509 -in tls/hub.crt -noout -fingerprint -sha256
+```
+
+Then serve the hub only through [Caddy](https://caddyserver.com):
+
+```yaml
+services:
+  hub:
+    image: ghcr.io/maxanderson95/opencode-recall-hub:v0.1.1
+    container_name: opencode-recall-hub
+    restart: unless-stopped
+    user: "1000:1000"
+    volumes:
+      - ./data:/data
+  tls:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "7438:7438"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./tls:/tls:ro
+```
+
+with this `Caddyfile`:
+
+```
+{
+	auto_https off
+}
+
+:7438 {
+	tls /tls/hub.crt /tls/hub.key
+	reverse_proxy hub:7438
+}
+```
+
+On each host, use `https://` in `hub.url` and set `hub.certSha256` to the fingerprint. Admin commands still run in the `opencode-recall-hub` container.
 
 ## Connect a host
 
@@ -98,6 +148,7 @@ The plugin reads `~/.config/opencode/recall.json` (under `$XDG_CONFIG_HOME` when
 | --- | --- | --- |
 | `hub.url` | `OPENCODE_RECALL_HUB_URL` | Hub address |
 | `hub.token` | `OPENCODE_RECALL_TOKEN` | This host's token |
+| `hub.certSha256` | `OPENCODE_RECALL_HUB_CERT_SHA256` | SHA-256 fingerprint of the hub's TLS certificate, hex with or without colons. With it set, an `https` hub must present exactly that certificate. Requires an `https` URL. |
 | `summary.model` | `OPENCODE_RECALL_SUMMARY_MODEL` | Model `recall_summarize` uses when a call names none, default `openai/gpt-5.6-luna` at `low`. In the file, `{ "providerID": ..., "modelID": ..., "variant": ... }`; in the environment, `provider/model` or `provider/model/variant`. |
 | `index.excludeDirectories` | | Absolute or `~/` paths whose sessions never leave this host. Adding a directory also deletes its sessions from the hub. |
 | | `OPENCODE_RECALL_SOURCE_DB` | OpenCode's database, default `$XDG_DATA_HOME/opencode/opencode.db` |

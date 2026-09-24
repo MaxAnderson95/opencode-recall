@@ -1,3 +1,5 @@
+import { isIP } from "node:net"
+import { connect, type PeerCertificate } from "node:tls"
 import { Effect, Option, Schema } from "effect"
 
 /**
@@ -517,6 +519,12 @@ export type ClientOptions = {
   url: string
   /** Bearer token issued by the hub's `token issue`; it identifies this host's source. */
   token: string
+  /**
+   * The SHA-256 fingerprint of the hub's TLS certificate, as {@link normalizeFingerprint} returns
+   * it. When set, an `https` hub must present exactly that certificate, whoever signed it, so a
+   * self-signed certificate is safe to use. Ignored for `http`.
+   */
+  certSha256?: string
   fetch?: (url: string, init: RequestInit) => Promise<Response>
 }
 
@@ -540,23 +548,77 @@ const ErrorEnvelope = Schema.Struct({
 
 const messageOf = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause))
 
+/** `fingerprint` as `AA:BB:...`, the form Node's `fingerprint256` uses, or `undefined` if it is not a SHA-256 hex digest. */
+export function normalizeFingerprint(fingerprint: string): string | undefined {
+  const hex = fingerprint.replace(/[\s:]/g, "").toUpperCase()
+  return /^[0-9A-F]{64}$/.test(hex) ? hex.match(/../g)!.join(":") : undefined
+}
+
+const mismatch = (got: string | undefined, pin: string) =>
+  new Error(`the hub's TLS certificate ${got ?? "(none)"} does not match the pinned ${pin}`)
+
+// Bun's fetch skips `checkServerIdentity` when `rejectUnauthorized` is false, so a pin cannot be
+// checked on an unverified connection. Instead the pinned certificate is read once over a bare TLS
+// handshake, kept only if its fingerprint is the pin, and made the sole trusted CA: every later
+// handshake must then present that certificate, and `checkServerIdentity` checks the pin again in
+// place of the hostname. Keyed by pin, since a fingerprint names exactly one certificate.
+const pinnedCertificates = new Map<string, Promise<string>>()
+
+const readCertificate = (url: URL, pin: string, signal: AbortSignal) =>
+  new Promise<string>((resolve, reject) => {
+    const socket = connect(
+      {
+        host: url.hostname,
+        port: Number(url.port || 443),
+        servername: isIP(url.hostname) ? undefined : url.hostname,
+        rejectUnauthorized: false,
+      },
+      () => {
+        const cert = socket.getPeerCertificate()
+        socket.end()
+        if (cert.fingerprint256 !== pin) return reject(mismatch(cert.fingerprint256, pin))
+        resolve(`-----BEGIN CERTIFICATE-----\n${cert.raw.toString("base64").replace(/.{64}/g, "$&\n")}\n-----END CERTIFICATE-----\n`)
+      },
+    )
+    socket.once("error", reject)
+    socket.setTimeout(10_000, () => socket.destroy(new Error("TLS handshake with the hub timed out")))
+    signal.addEventListener("abort", () => socket.destroy(new Error("aborted")), { once: true })
+  })
+
+const pinnedTls = async (url: URL, pin: string, signal: AbortSignal) => {
+  let pem = pinnedCertificates.get(pin)
+  if (!pem) {
+    pem = readCertificate(url, pin, signal)
+    pinnedCertificates.set(pin, pem)
+    pem.catch(() => pinnedCertificates.delete(pin))
+  }
+  return {
+    ca: await pem,
+    checkServerIdentity: (_host: string, cert: PeerCertificate) => (cert.fingerprint256 === pin ? undefined : mismatch(cert.fingerprint256, pin)),
+  }
+}
+
 /**
  * Typed client for the hub's `POST /v1/<verb>` API. Bodies are gzip-encoded, since Bun's `fetch`
  * never compresses a request on its own. A non-2xx answer fails with {@link HubError}; anything
- * that is not an answer fails with {@link TransportError}. Interrupting a call aborts its request.
+ * that is not an answer fails with {@link TransportError}, including an `https` hub whose certificate
+ * does not match `certSha256`. Interrupting a call aborts its request.
  */
-export function makeClient({ url, token, fetch: fetcher = fetch }: ClientOptions): Client {
+export function makeClient({ url, token, certSha256, fetch: fetcher = fetch }: ClientOptions): Client {
   const base = url.replace(/\/+$/, "")
+  const parsed = new URL(base)
+  const pin = parsed.protocol === "https:" ? certSha256 : undefined
 
   const call = Effect.fnUntraced(function* <V extends Verb>(verb: V, input: Omit<Request<V>, "protocolVersion">) {
     const transport = (cause: unknown) => new TransportError({ message: messageOf(cause), cause })
     const res = yield* Effect.tryPromise({
-      try: (signal) =>
+      try: async (signal) =>
         fetcher(`${base}/v1/${verb}`, {
           method: "POST",
           headers: { "content-type": "application/json", "content-encoding": "gzip", authorization: `Bearer ${token}` },
           body: Bun.gzipSync(JSON.stringify({ protocolVersion: PROTOCOL_VERSION, ...input })),
           signal,
+          ...(pin && { tls: await pinnedTls(parsed, pin, signal) }),
         }),
       catch: transport,
     })

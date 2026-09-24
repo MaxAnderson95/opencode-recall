@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { HubError, PROTOCOL_VERSION, makeClient, type Snapshot } from "@opencode-recall/protocol"
 import { Effect, Exit, Layer, Scope } from "effect"
 import { Archive, SCHEMA_VERSION } from "./archive/index.ts"
@@ -210,6 +213,41 @@ test("the client sends gzip-encoded bodies with Content-Encoding set", async () 
   expect(seen!.headers.get("content-encoding")).toBe("gzip")
   const body = new Uint8Array(await seen!.arrayBuffer())
   expect(JSON.parse(new TextDecoder().decode(Bun.gunzipSync(body)))).toMatchObject({ contentHash: "hash-1" })
+})
+
+/** A self-signed certificate made with `openssl`, and its SHA-256 fingerprint as `AA:BB:...`. */
+function selfSigned(dir: string, name: string) {
+  const [cert, key] = [join(dir, `${name}.crt`), join(dir, `${name}.key`)]
+  const openssl = (...args: string[]) => {
+    const out = Bun.spawnSync(["openssl", ...args], { stderr: "pipe" })
+    if (!out.success) throw new Error(out.stderr.toString())
+    return out.stdout.toString()
+  }
+  openssl("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-days", "1", "-subj", `/CN=${name}`, "-keyout", key, "-out", cert)
+  const fingerprint = openssl("x509", "-in", cert, "-noout", "-fingerprint", "-sha256").trim().split("=")[1]!
+  return { cert: Bun.file(cert), key: Bun.file(key), fingerprint }
+}
+
+test("a pinned client reaches only the hub presenting the pinned certificate, on every connection", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "recall-tls-"))
+  const [real, evil, other] = [selfSigned(dir, "real"), selfSigned(dir, "evil"), selfSigned(dir, "other")]
+  const serve = ({ cert, key }: typeof real) => Bun.serve({ port: 0, hostname: "127.0.0.1", tls: { cert, key }, fetch: handler })
+  const [realHub, evilHub] = [serve(real), serve(evil)]
+  const client = (hub: typeof realHub, certSha256?: string) => makeClient({ url: hub.url.href, token, certSha256 })
+  try {
+    expect(await run(client(realHub, real.fingerprint).status())).toMatchObject({ sessions: 0 })
+    // The real certificate is already trusted for this pin, so an impostor fails the handshake itself.
+    expect(await failure(client(evilHub, real.fingerprint).status())).toMatchObject({ _tag: "TransportError" })
+    expect(await failure(client(evilHub, other.fingerprint).status())).toMatchObject({
+      _tag: "TransportError",
+      message: expect.stringContaining("does not match the pinned"),
+    })
+    expect(await failure(client(realHub).status())).toMatchObject({ _tag: "TransportError" })
+  } finally {
+    realHub.stop(true)
+    evilHub.stop(true)
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test.each([
