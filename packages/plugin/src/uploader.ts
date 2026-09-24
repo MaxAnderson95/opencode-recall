@@ -495,6 +495,11 @@ export const layer = ({
         const held = new Map(manifest.sessions.map((s) => [s.sessionId, s]))
         const tombstones = new Map(manifest.tombstones.map((t) => [t.sessionId, t]))
         const acked = yield* acknowledged
+        const queued = new Map<string, { key: string; position: Position }[]>()
+        for (const { key, value } of yield* scanKept(DIRTY, Position)) {
+          const sessionId = key.slice(DIRTY.length, key.lastIndexOf("/"))
+          queued.set(sessionId, [...(queued.get(sessionId) ?? []), { key, position: value }])
+        }
 
         for (const [sessionId, { position: local, directory }] of newestFirst(yield* source.positions())) {
           const tombstone = tombstones.get(sessionId)
@@ -513,8 +518,11 @@ export const layer = ({
                 hubCopy.extractorVersion >= EXTRACTOR_VERSION &&
                 (later(local, hubCopy) <= 0 ||
                   Option.getOrUndefined(yield* source.snapshot(sessionId))?.contentHash === hubCopy.contentHash))
-          if (current) yield* recordAcked(sessionId, local, acked.get(sessionId))
-          else yield* markDirty(sessionId, local)
+          if (current) {
+            // Work queued by an earlier run, such as a backfill cut short, would re-send what the hub holds.
+            for (const { key, position } of queued.get(sessionId) ?? []) if (later(position, local) <= 0) yield* storage.remove(key)
+            yield* recordAcked(sessionId, local, acked.get(sessionId))
+          } else yield* markDirty(sessionId, local)
         }
 
         reconcileOnResume = false

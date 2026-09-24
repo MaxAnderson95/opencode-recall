@@ -178,6 +178,11 @@ export interface Interface {
   readonly authenticate: (token: string) => Effect.Effect<Option.Option<Source>>
   /** Counts, the active space, and the recorded rewinds and standing divergences, in one read. */
   readonly status: () => Effect.Effect<Responses["status"]>
+  /**
+   * Load the active space's vectors into memory now rather than on the first semantic search,
+   * which would otherwise wait for them: 27 s from a cold disk at 77,000 vectors.
+   */
+  readonly loadVectors: () => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode-recall/hub/Archive") {}
@@ -263,7 +268,7 @@ export const SOURCE_COUNTS = `SELECT coalesce(src.name, '') AS source, count(*) 
          WHERE m.session_id = s.id)), 0) AS searchable,
        coalesce(sum(EXISTS (SELECT 1 FROM chunks c WHERE c.session_id = s.id AND c.chunk_set_id = $setId)
          AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.session_id = s.id AND c.chunk_set_id = $setId
-           AND NOT EXISTS (SELECT 1 FROM vectors v WHERE v.chunk_id = c.id AND v.space_id = $spaceId))), 0) AS embedded
+           AND NOT EXISTS (SELECT 1 FROM vectors v INDEXED BY vectors_chunk_space_idx WHERE v.chunk_id = c.id AND v.space_id = $spaceId))), 0) AS embedded
      FROM sessions s LEFT JOIN sources src ON src.id = s.source_id
      GROUP BY s.source_id ORDER BY source`
 
@@ -485,7 +490,7 @@ function bind(
   const selectPending = db.prepare(
     `SELECT c.id AS chunkId, c.session_id AS sessionId, c.message_id AS messageId, c.time_created AS time, c.scope, c.text
      FROM chunks c
-     WHERE c.chunk_set_id = ? AND NOT EXISTS (SELECT 1 FROM vectors v WHERE v.chunk_id = c.id AND v.space_id = ?)
+     WHERE c.chunk_set_id = ? AND NOT EXISTS (SELECT 1 FROM vectors v INDEXED BY vectors_chunk_space_idx WHERE v.chunk_id = c.id AND v.space_id = ?)
      ORDER BY c.id LIMIT ?`,
   )
   const selectSpaceVectors = db.prepare(
@@ -536,7 +541,7 @@ function bind(
 
   const countPending = db.prepare(
     `SELECT count(*) AS n FROM chunks c
-     WHERE c.chunk_set_id = ? AND NOT EXISTS (SELECT 1 FROM vectors v WHERE v.chunk_id = c.id AND v.space_id = ?)`,
+     WHERE c.chunk_set_id = ? AND NOT EXISTS (SELECT 1 FROM vectors v INDEXED BY vectors_chunk_space_idx WHERE v.chunk_id = c.id AND v.space_id = ?)`,
   )
   const countInactiveChunks = db.prepare(
     `SELECT count(*) AS n FROM chunks WHERE chunk_set_id IN
@@ -1143,6 +1148,9 @@ function bind(
     }),
     status: Effect.fn("Archive.status")(function* () {
       return statusTx()
+    }),
+    loadVectors: Effect.fn("Archive.loadVectors")(function* () {
+      vectors()
     }),
   })
 }

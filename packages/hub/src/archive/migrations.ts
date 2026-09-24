@@ -173,6 +173,12 @@ export const migrations: readonly string[] = [
   CREATE INDEX chunks_session_set_idx ON chunks(session_id, chunk_set_id);
   DROP INDEX chunks_session_idx;
   `,
+  // Each vector row holds its embedding inline, so probing the primary key for "has this chunk a
+  // vector" reads a page per chunk: 1.8 s for 77,000 chunks on the Linux host. This index holds
+  // the key alone. SQLite still prefers the primary key, so the probes name it with INDEXED BY.
+  `
+  CREATE INDEX vectors_chunk_space_idx ON vectors(chunk_id, space_id);
+  `,
 ]
 
 /** The first schema version with segments; parts archived before it are segmented on migration. */

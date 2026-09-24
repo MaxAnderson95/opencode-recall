@@ -1,7 +1,7 @@
 import { mkdirSync } from "node:fs"
 import { join } from "node:path"
 import type { SpaceRecipe } from "@opencode-recall/protocol"
-import { Context, Effect, Layer, Option, Schema } from "effect"
+import { Context, Duration, Effect, Layer, Option, Schema } from "effect"
 import { Archive } from "./archive/index.ts"
 import { HubConfig } from "./config.ts"
 import { EmbedQueue } from "./embed-queue.ts"
@@ -76,6 +76,9 @@ const listen = Layer.effect(
         "the configured vector space differs from the active one; serving the active one and embedding nothing into the configured one until `reindex` is run",
       ).pipe(Effect.annotateLogs({ active: activeSpace.recipe, configured: configuredRecipe(config) }))
 
+    const [loadTime] = yield* Effect.timed(archive.loadVectors())
+    yield* Effect.logInfo("vectors loaded").pipe(Effect.annotateLogs({ ms: Duration.toMillis(loadTime) }))
+
     const embedding = yield* EmbedQueue.Service
     const fetch = yield* makeHandler({ onArchived: embedding.kick })
     const separator = config.listen.lastIndexOf(":")
@@ -106,8 +109,8 @@ export const archive = (embedder: EmbedderLayer | undefined, fallback: EmbedderL
   )
 
 /**
- * Take the data directory, open and migrate the archive, reclaim an interrupted reindex, resume
- * embedding its queue, then listen. Releasing it stops the server, then the embedding worker,
+ * Take the data directory, open and migrate the archive, reclaim an interrupted reindex, load the
+ * active space's vectors, resume embedding its queue, then listen. Releasing it stops the server, then the embedding worker,
  * then closes the archive and lets the data directory go. Fails to build if another `serve` or a
  * `reindex` holds the data directory, or the archive cannot be opened.
  */

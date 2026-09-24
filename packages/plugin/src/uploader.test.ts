@@ -639,6 +639,28 @@ test("an interrupted backfill resumes without re-uploading the sessions it compl
   expect(await second.state()).toMatchObject({ local: 5, answered: 5 })
 })
 
+test("reconciliation clears work-list entries for sessions the hub already holds, instead of re-sending them", async () => {
+  configure()
+  for (const id of ["ses_b", "ses_c"]) {
+    source.addSession(id)
+    source.addMessage(id, "user", { text: id }, 101)
+  }
+  const first = await start()
+  for (const id of ["ses_a", "ses_b", "ses_c"]) await first.enqueue(id)
+  await until(() => outcomes.length === 3)
+  await first.stop()
+  outcomes = []
+
+  // Work queued by an earlier run that never sent it, such as a plugin disabled mid-backfill.
+  const { storage, pending } = memoryStorage()
+  for (const id of ["ses_a", "ses_b", "ses_c"]) await storage.set(`dirty/${id}/101-2`, readPosition(source.db, id)!)
+  const uploader = await start(storage, { uploadIntervalMs: 10_000 })
+  await uploader.reconcile()
+  await until(() => pending() === 0)
+  expect(pending()).toBe(0)
+  expect(outcomes.filter((o) => o === "unchanged").length).toBeLessThanOrEqual(1)
+})
+
 test("a session tombstoned on the hub but still present locally is not re-uploaded on every sweep", async () => {
   configure()
   await Effect.runPromise(clientFor("desktop").tombstone({ sessionId: "ses_a", revision: 9, timeDeleted: 200, reason: "deleted" }))

@@ -14,7 +14,8 @@ export const runToken = Effect.fn("Token.run")(function* (args: readonly string[
   switch (action) {
     case "issue": {
       const source = arg?.trim()
-      if (!source) return yield* usage
+      // A leading dash is a mistyped flag such as `--help`, and the token would be printed for it.
+      if (!source || source.startsWith("-")) return yield* usage
       yield* Console.log(yield* archive.issueToken(source))
       yield* Console.error(`issued a token for source "${source}"; it is shown only once`)
       return 0

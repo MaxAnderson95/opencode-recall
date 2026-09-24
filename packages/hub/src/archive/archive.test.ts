@@ -901,6 +901,10 @@ test("per-source status finds each session's chunks through an index on session 
     "SEARCH c USING COVERING INDEX chunks_session_set_idx (session_id=? AND chunk_set_id=?)",
     "SEARCH c USING COVERING INDEX chunks_session_set_idx (session_id=? AND chunk_set_id=?)",
   ])
+  // The primary key carries each embedding inline; probing it reads a page per chunk.
+  expect(plan.map((row) => row.detail).filter((detail) => /\bv\b/.test(detail))).toEqual([
+    "SEARCH v USING COVERING INDEX vectors_chunk_space_idx (chunk_id=? AND space_id=?)",
+  ])
 })
 
 describe("archive (file-backed only)", () => {

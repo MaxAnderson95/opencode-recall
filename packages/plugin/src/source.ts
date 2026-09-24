@@ -32,15 +32,17 @@ const isMessageType = Schema.is(MessageType)
 // Summarizer workers are never uploaded, so they are invisible to everything that reads a session.
 const UPLOADED = `substr(coalesce(s.title, ''), 1, ${WORKER_PREFIX.length}) <> '${WORKER_PREFIX}'`
 
-const POSITIONS = `SELECT s.id AS sessionId, s.directory,
+// OpenCode's v1 migration records a session with no events at -1, which is no revision yet: the
+// session has nothing to upload until its first event makes it 0.
+const POSITIONS = `SELECT * FROM (SELECT s.id AS sessionId, s.directory,
     coalesce((SELECT seq FROM event_sequence WHERE aggregate_id = s.id), 0) AS revision,
     max(s.time_updated, coalesce((SELECT max(time_created) FROM session_message WHERE session_id = s.id), 0))
       AS lastActivity
-  FROM session_v2 s WHERE ${UPLOADED}`
+  FROM session_v2 s WHERE ${UPLOADED}) WHERE revision >= 0`
 
 /** The session's current position, or `null` if the database does not hold it or it is never uploaded. */
 export function readPosition(db: Database, sessionId: string): Position | null {
-  const row = db.query(`${POSITIONS} AND s.id = ?`).get(sessionId) as PositionRow | null
+  const row = db.query(`${POSITIONS} AND sessionId = ?`).get(sessionId) as PositionRow | null
   return row && { revision: row.revision, lastActivity: row.lastActivity }
 }
 
