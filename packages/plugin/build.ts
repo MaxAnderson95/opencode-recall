@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 /**
  * Build the plugin as a standalone package OpenCode can install from Git: `<outDir>/index.js` with
- * the workspace's protocol package bundled in, and a `package.json` that keeps `effect` and
- * `@opencode/plugin` as ordinary dependencies. OpenCode installs a Git plugin with npm, which cannot
+ * the workspace's protocol package and pinned Effect runtime bundled in, and `@opencode/plugin`
+ * supplied by the host. OpenCode installs a Git plugin with npm, which cannot
  * resolve `workspace:*`, so the source directory cannot be installed as it is.
  * Usage: `bun packages/plugin/build.ts <version> [outDir]`, default `dist/plugin`.
  */
@@ -20,7 +20,8 @@ const result = await Bun.build({
   entrypoints: [join(import.meta.dir, "index.ts")],
   outdir: outDir,
   target: "bun",
-  external: ["effect", "@opencode/plugin"],
+  // OpenCode redirects external Effect imports to its own version, which may lack APIs we use.
+  external: ["@opencode/plugin"],
 })
 if (!result.success) {
   for (const log of result.logs) console.error(log)
@@ -37,7 +38,6 @@ await Bun.write(
       type: "module",
       main: "./index.js",
       engines: source.engines,
-      dependencies: { effect: source.dependencies.effect },
       peerDependencies: source.peerDependencies,
     },
     null,

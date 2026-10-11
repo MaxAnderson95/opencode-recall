@@ -107,3 +107,13 @@ test("setup registers all five tools and adds the recall instructions to every a
   expect(text).toContain('**"Could not look" is not "nothing found".**')
   await cleanup!()
 })
+
+test("the installable package bundles its pinned Effect runtime instead of importing OpenCode's", async () => {
+  const out = join(dir, "plugin-package")
+  const build = Bun.spawnSync([process.execPath, join(import.meta.dir, "../build.ts"), "0.0.0", out])
+  expect(build.exitCode).toBe(0)
+  const bundle = await Bun.file(join(out, "index.js")).text()
+  expect(/^import\s.*from\s*["']effect(?:\/[^"']*)?["']/m.test(bundle)).toBe(false)
+  const manifest = await Bun.file(join(out, "package.json")).json()
+  expect(manifest.dependencies?.effect).toBeUndefined()
+})
