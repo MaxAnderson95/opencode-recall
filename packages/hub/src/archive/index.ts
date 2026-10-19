@@ -277,6 +277,27 @@ export const SOURCE_COUNTS = `SELECT coalesce(src.name, '') AS source, count(*) 
      FROM sessions s LEFT JOIN sources src ON src.id = s.source_id
      GROUP BY s.source_id ORDER BY source`
 
+/** Sessions a ref names: the session with that id first, then those with that slug, newest first. */
+export const SESSIONS_BY_REF = `SELECT s.id AS sessionId, s.slug, s.title, s.directory, s.parent_id AS parentId,
+       s.time_created AS timeCreated, s.time_updated AS timeUpdated, coalesce(src.name, '') AS source,
+       s.source_id IS ? AS ownSource, s.revision
+     FROM sessions s LEFT JOIN sources src ON src.id = s.source_id
+     WHERE s.id = ? OR s.slug = ? ORDER BY s.id = ? DESC, s.time_updated DESC LIMIT 5`
+
+// Reading renders only a text part's text. A tool part's text is its output, up to 16,000
+// characters, and reasoning is never shown, so neither is loaded.
+const READ_PART_COLUMNS = `p.kind, CASE WHEN p.kind = 'text' THEN p.text END AS text,
+       p.tool_name AS tool, p.tool_title AS title, p.status, p.error`
+
+/**
+ * Every part of a session in transcript order; a message without parts is one row of null part
+ * columns. `m.rowid` tells the planner each message is distinct, so parts come in index order
+ * instead of through a sort per message.
+ */
+export const TRANSCRIPT_ROWS = `SELECT m.id AS messageId, m.type, m.time_created AS time, ${READ_PART_COLUMNS}
+     FROM messages m LEFT JOIN parts p ON p.message_id = m.id
+     WHERE m.session_id = ? ORDER BY m.ordinal, m.rowid, p.ordinal`
+
 /** At most this many characters (UTF-16 code units) per FTS row. */
 const SEGMENT_CHARS = 8_000
 /** Candidates each branch ranks before fusion. */
@@ -691,12 +712,7 @@ function bind(
        coalesce(src.name, '') AS source, s.source_id IS ? AS ownSource, s.revision
      FROM sessions s LEFT JOIN sources src ON src.id = s.source_id WHERE s.id = ?`,
   )
-  const selectSessionsByRef = db.prepare(
-    `SELECT s.id AS sessionId, s.slug, s.title, s.directory, s.parent_id AS parentId, s.time_created AS timeCreated,
-       s.time_updated AS timeUpdated, coalesce(src.name, '') AS source, s.source_id IS ? AS ownSource, s.revision
-     FROM sessions s LEFT JOIN sources src ON src.id = s.source_id
-     WHERE s.id = ? OR s.slug = ? ORDER BY s.id = ? DESC, s.time_updated DESC LIMIT 5`,
-  )
+  const selectSessionsByRef = db.prepare(SESSIONS_BY_REF)
   const selectMessages = db.prepare(
     "SELECT id AS messageId, type, time_created AS time FROM messages WHERE session_id = ? ORDER BY ordinal",
   )
@@ -706,10 +722,8 @@ function bind(
      JOIN parts p ON p.message_id = m.id AND p.kind = 'text'
      WHERE m.session_id = ? AND m.type = 'user' ORDER BY m.ordinal, p.ordinal`,
   )
-  const selectWindowParts = db.prepare(
-    `SELECT kind, text, tool_name AS tool, tool_title AS title, status, error FROM parts
-     WHERE message_id = ? ORDER BY ordinal`,
-  )
+  const selectWindowParts = db.prepare(`SELECT ${READ_PART_COLUMNS} FROM parts p WHERE p.message_id = ? ORDER BY p.ordinal`)
+  const selectTranscriptRows = db.prepare(TRANSCRIPT_ROWS)
   const selectSummary = db.prepare(
     `SELECT summary, time_created AS timeCreated, omitted, clipped FROM summaries
      WHERE session_id = $sessionId AND content_hash = (SELECT content_hash FROM sessions WHERE id = $sessionId)
@@ -999,12 +1013,15 @@ function bind(
   })
 
   type MessageRow = { messageId: string; type: Message["type"]; time: number }
+  type PartRow = { tool: string | null; title: string | null; status: string | null; error: string | null } & (
+    | { kind: "text"; text: string }
+    | { kind: Exclude<Part["kind"], "text">; text: null }
+  )
+  type TranscriptRow = MessageRow & (PartRow | { kind: null })
 
   /** A stored message cut down for reading; `clipped` when its text was longer than `maxChars`. */
-  function readMessage(m: MessageRow, maxChars: number): { message: WindowMessage; clipped: boolean } {
-    type PartRow = { kind: Part["kind"]; text: string; tool: string | null; title: string | null; status: string | null; error: string | null }
-    const parts = selectWindowParts.all(m.messageId) as PartRow[]
-    const texts = parts.filter((p) => p.kind === "text").map((p) => p.text)
+  function readMessage(m: MessageRow, parts: PartRow[], maxChars: number): { message: WindowMessage; clipped: boolean } {
+    const texts = parts.flatMap((p) => (p.kind === "text" ? [p.text] : []))
     const tools = parts.flatMap((p) =>
       p.kind === "tool" && p.tool !== null
         ? [
@@ -1028,7 +1045,9 @@ function bind(
     const found = f.messageId === undefined ? -1 : messages.findIndex((m) => m.messageId === f.messageId)
     const center = found >= 0 ? found : messages.length - 1
     const start = Math.max(0, Math.min(center - Math.floor(f.window / 2), messages.length - f.window))
-    const window = messages.slice(start, start + f.window).map((m) => readMessage(m, f.maxChars).message)
+    const window = messages
+      .slice(start, start + f.window)
+      .map((m) => readMessage(m, selectWindowParts.all(m.messageId) as PartRow[], f.maxChars).message)
     return { kind: "window", ...resolved, total: messages.length, start, messages: window }
   })
 
@@ -1036,13 +1055,25 @@ function bind(
     const resolved = resolveSession(f.session, callerSourceId)
     if (!resolved) return { kind: "missing" }
     const { sessionId } = resolved.session
-    const messages = selectMessages.all(sessionId) as MessageRow[]
     const blocks: { text: string; clipped: boolean }[] = []
-    for (const m of messages) {
-      const { message, clipped } = readMessage(m, f.maxChars)
+    let messages = 0
+    let current: { message: MessageRow; parts: PartRow[] } | undefined
+    const render = () => {
+      if (!current) return
+      const { message, clipped } = readMessage(current.message, current.parts, f.maxChars)
       const text = transcriptBlock(message)
       if (text !== null) blocks.push({ text, clipped })
     }
+    // Middle-out truncation keeps the tail, so every message is read; rows stream and only blocks are kept.
+    for (const row of selectTranscriptRows.iterate(sessionId) as Iterable<TranscriptRow>) {
+      if (current?.message.messageId !== row.messageId) {
+        render()
+        current = { message: { messageId: row.messageId, type: row.type, time: row.time }, parts: [] }
+        messages++
+      }
+      if (row.kind !== null) current.parts.push(row)
+    }
+    render()
     const { text, dropped } = middleOut(
       blocks.map((b) => b.text),
       f.budget,
@@ -1053,7 +1084,7 @@ function bind(
       kind: "transcript",
       ...resolved,
       contentHash: (selectHeld.get(sessionId) as Held).contentHash,
-      messages: messages.length,
+      messages,
       omitted: dropped.to - dropped.from,
       clipped: kept.filter((b) => b.clipped).length,
       text,

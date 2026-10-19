@@ -18,7 +18,7 @@ import { Effect, Exit, Option, Scope, type Types } from "effect"
 import { Embedder } from "../embedder.ts"
 import { fakeEmbedder } from "../fake-embedder.ts"
 import { DEFAULT_CHUNKING, type ChunkParams } from "./chunks.ts"
-import { Archive, SCHEMA_VERSION, SOURCE_COUNTS } from "./index.ts"
+import { Archive, SCHEMA_VERSION, SESSIONS_BY_REF, SOURCE_COUNTS, TRANSCRIPT_ROWS } from "./index.ts"
 import { SEGMENTED, migrations } from "./migrations.ts"
 
 /** The first schema version with vector spaces. */
@@ -852,16 +852,22 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     draft.session.messages[9]!.parts.push(
       { kind: "reasoning", text: "hidden thoughts" },
       { kind: "tool", tool: "bash", title: "git push", status: "error", error: "rejected", text: "bash git push\nrejected", searchable: true },
+      { kind: "text", text: "and after" },
     )
-    draft.session.messages.push({ id: "ses_a_msg_10", type: "assistant", timeCreated: 20, parts: [{ kind: "reasoning", text: "only thoughts" }] })
+    draft.session.messages.push(
+      { id: "ses_a_msg_10", type: "assistant", timeCreated: 20, parts: [{ kind: "reasoning", text: "only thoughts" }] },
+      { id: "ses_a_msg_11", type: "assistant", timeCreated: 21, parts: [] },
+    )
     archive.putSnapshot(draft, sourceOf(archive))
 
     const whole = archive.transcript({ session: "slug", budget: 100_000, maxChars: 4_000 })
     if (whole.kind !== "transcript") throw new Error(`expected a transcript, got ${whole.kind}`)
-    expect(whole).toMatchObject({ session: { sessionId: "ses_a" }, contentHash: draft.contentHash, messages: 11, omitted: 0, clipped: 0 })
+    expect(whole).toMatchObject({ session: { sessionId: "ses_a" }, contentHash: draft.contentHash, messages: 12, omitted: 0, clipped: 0 })
     expect(whole.text).toStartWith(`── user @ 1970-01-01 00:00Z (ses_a_msg_0)\nmessage 0 word`)
     expect(whole.text).toContain("(ses_a_msg_9)\n[tool bash] git push (failed: rejected)\nmessage 9 word")
+    expect(whole.text).toEndWith("word and after")
     expect(whole.text).not.toContain("thoughts")
+    expect(whole.text).not.toContain("bash git push")
 
     const cut = archive.transcript({ session: "ses_a", budget: 1_000, maxChars: 100 })
     if (cut.kind !== "transcript") throw new Error(`expected a transcript, got ${cut.kind}`)
@@ -966,6 +972,24 @@ test("per-source status finds each session's chunks through an index on session 
   // The primary key carries each embedding inline; probing it reads a page per chunk.
   expect(plan.map((row) => row.detail).filter((detail) => /\bv\b/.test(detail))).toEqual([
     "SEARCH v USING COVERING INDEX vectors_chunk_space_idx (chunk_id=? AND space_id=?)",
+  ])
+})
+
+test("a session ref is looked up through the id and slug indexes, and a transcript reads its parts in index order", () => {
+  const db = new Database(":memory:")
+  for (const sql of migrations) db.run(sql)
+  const plan = (sql: string, ...params: (string | number)[]) =>
+    (db.query(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as { detail: string }[]).map((row) => row.detail)
+  const byRef = plan(SESSIONS_BY_REF, 1, "x", "x", "x")
+  const transcript = plan(TRANSCRIPT_ROWS, "x")
+  db.close()
+  expect(byRef.filter((detail) => /\bs\b/.test(detail))).toEqual([
+    "SEARCH s USING INDEX sqlite_autoindex_sessions_1 (id=?)",
+    "SEARCH s USING INDEX sessions_slug_idx (slug=?)",
+  ])
+  expect(transcript).toEqual([
+    "SEARCH m USING INDEX messages_session_idx (session_id=?)",
+    "SEARCH p USING INDEX parts_message_idx (message_id=?) LEFT-JOIN",
   ])
 })
 
