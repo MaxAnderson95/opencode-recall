@@ -111,7 +111,7 @@ docker logs recall-hub 2>&1 | grep '"msg":"memory"' | tail -1
 | `matrix.capacity`, `.live`, `.removed` | rows the vector matrix has room for, rows it holds, and removed rows still occupying slots until its next compaction |
 | `matrix.allocatedMB`, `.writtenMB` | the matrix's allocation, and the bytes of the rows written to it so far |
 
-Resident memory beyond the JS heap and the matrix is native: ONNX Runtime, SQLite, Bun, and allocator pages freed but not returned to the kernel.
+Every `MB` is 10^6 bytes; `/proc` reports its kB fields in 1,024-byte units, which the report converts. Resident memory beyond the JS heap and the matrix is native: ONNX Runtime, SQLite, Bun, and allocator pages freed but not returned to the kernel.
 
 ### Production host
 
@@ -119,12 +119,12 @@ GUHQPMAXDEVBOX01 (4 CPUs, 7.4 GiB of memory) running v0.1.2, which predates the 
 
 | | |
 | --- | --- |
-| `VmRSS` | 1,109 MB |
-| `RssAnon` | 1,038 MB |
-| `RssFile` | 71 MB |
-| `VmHWM` | 1,391 MB |
+| `VmRSS` | 1,135 MB |
+| `RssAnon` | 1,062 MB |
+| `RssFile` | 73 MB |
+| `VmHWM` | 1,424 MB |
 
-The largest mappings in `/proc/<pid>/smaps`: one anonymous mapping of 983,548 kB with 518 MB resident; two 1 GiB anonymous reservations with 248 MB and 194 MB resident; the `[heap]` segment at 78 MB; the executable and `libonnxruntime.so.1` at 43 MB and 24 MB, file-backed. The 983,548 kB mapping is within one 4 KiB page of the size of a vector matrix with room for 655,696 rows of 384 dimensions, more than seven times the 85,257 live vectors. That attribution is inferred from the size alone; the `matrix` fields of a report from a deployed build will confirm or refute it.
+The largest mappings in `/proc/<pid>/smaps`: one anonymous mapping of 983,548 KiB (1,007 MB) with 530 MB resident; two 1 GiB anonymous reservations with 254 MB and 199 MB resident; the `[heap]` segment at 80 MB; the executable and `libonnxruntime.so.1` at 44 MB and 25 MB, file-backed. The 983,548 KiB mapping is within one 4 KiB page of the size of a vector matrix with room for 655,696 rows of 384 dimensions, more than seven times the 85,257 live vectors. That attribution is inferred from the size alone; the `matrix` fields of a report from a deployed build will confirm or refute it.
 
 ### Local run on a copy of the production archive
 
