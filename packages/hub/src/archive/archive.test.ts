@@ -50,6 +50,8 @@ function handle(archive: Archive.Interface, scope: Scope.Closeable) {
     getSummary: (key: SummaryGet, callerSourceId = 0) => Effect.runSync(archive.getSummary(key, callerSourceId)),
     putSummary: (summary: SummaryPut) => Effect.runSync(archive.putSummary(summary)),
     embedPending: (limit: number) => Effect.runPromise(archive.embedPending(limit)),
+    loadVectors: () => Effect.runSync(archive.loadVectors()),
+    vectorStats: () => Option.getOrThrow(Effect.runSync(archive.vectorStats())),
     reclaim: () => Effect.runSync(archive.reclaim()),
     rebuild: () => Option.getOrNull(Effect.runSync(archive.rebuild())),
     issueToken: (source: string) => Effect.runSync(archive.issueToken(source)),
@@ -663,6 +665,26 @@ describe.each(backends)("archive ($name)", ({ path }) => {
 
     archive.putTombstone({ sessionId: "ses_a", revision: 3, timeDeleted: 30, reason: "deleted" }, laptop)
     expect(await semantic("walrus")).toEqual(["ses_b"])
+  })
+
+  test("the matrix loads with room for exactly its vectors, and re-ingesting sessions reuses their slots", async () => {
+    const archive = open(path())
+    const laptop = sourceOf(archive)
+    const held = ["ses_a", "ses_b", "ses_c"]
+    const texts = (id: string) => Array.from({ length: 6 }, (_, i) => `${id} turn ${i} about walrus migration`)
+    for (const id of held) archive.putSnapshot(session(id, texts(id)), laptop)
+    while (await archive.embedPending(32));
+    archive.loadVectors()
+    const loaded = archive.vectorStats()
+    expect(loaded).toEqual({ dims: 64, capacity: archive.status().embeddedChunks, slots: archive.status().embeddedChunks, live: archive.status().embeddedChunks })
+
+    for (let round = 1; round <= 20; round++)
+      for (const id of held)
+        archive.putSnapshot(session(id, texts(id), { revision: 6 + round, lastActivity: 100 + round, contentHash: `${id}@${round}` }), laptop)
+    expect(archive.status()).toMatchObject({ chunks: loaded.live, embeddedChunks: loaded.live })
+    expect(archive.vectorStats()).toEqual(loaded)
+    const { sessions } = await archive.search({ query: "walrus migration", limit: 8, mode: "semantic" }, 0)
+    expect(ids(sessions)).toEqual(held)
   })
 
   test("every filter narrows the semantic branch before its candidate cut", async () => {
