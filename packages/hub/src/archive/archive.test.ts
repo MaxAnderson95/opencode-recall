@@ -589,15 +589,47 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     expect(await archive.search({ query: "needle", limit: 8, mode: "lexical" }, 0)).not.toHaveProperty("semanticUnavailable")
   })
 
-  test("embedding rejects and leaves the chunks queued while the embedder fails", async () => {
+  test("embedding rejects and leaves the batch queued while the embedder fails or answers short, then retries it", async () => {
     const embedder = fakeEmbedder()
-    const archive = open(path(), embedder)
-    archive.putSnapshot(single("ses_a", "the needle"), sourceOf(archive))
+    let short = false
+    const archive = open(path(), { ...embedder, embed: (texts) => (short ? Effect.succeed([]) : embedder.embed(texts)) })
+    const laptop = sourceOf(archive)
+    archive.putSnapshot(single("ses_a", "the needle"), laptop)
+    archive.putSnapshot(single("ses_b", "the haystack"), laptop)
+    expect(archive.status()).toMatchObject({ chunks: 4, embeddedChunks: 0 })
+    // One batch embedded first, so the retried batch is not the first the archive ever took.
+    expect(await archive.embedPending(1)).toBe(1)
+
     embedder.down = true
-    await expect(archive.embedPending(32)).rejects.toThrow("embedding model unavailable")
-    expect(archive.status()).toMatchObject({ chunks: 2, embeddedChunks: 0 })
+    await expect(archive.embedPending(1)).rejects.toThrow("embedding model unavailable")
     embedder.down = false
+    short = true
+    await expect(archive.embedPending(1)).rejects.toBeInstanceOf(Archive.BadVectors)
+    expect(archive.status()).toMatchObject({ chunks: 4, embeddedChunks: 1 })
+
+    short = false
+    expect(await archive.embedPending(32)).toBe(3)
+    expect(archive.status()).toMatchObject({ chunks: 4, embeddedChunks: 4 })
+  })
+
+  test("chunks written after earlier batches are embedded, including those written while a batch is embedding", async () => {
+    const fake = fakeEmbedder()
+    let gate = Promise.resolve()
+    const archive = open(path(), { ...fake, embed: (texts) => Effect.promise(() => gate).pipe(Effect.andThen(fake.embed(texts))) })
+    const laptop = sourceOf(archive)
+    archive.putSnapshot(single("ses_a", "zebra stripes"), laptop)
+    let release = () => {}
+    gate = new Promise<void>((resolve) => (release = resolve))
+    const inFlight = archive.embedPending(1)
+    archive.putSnapshot(single("ses_b", "walrus tusks"), laptop)
+    release()
+    expect(await inFlight).toBe(1)
+
+    expect(await archive.embedPending(32)).toBe(3)
+    expect(await archive.embedPending(32)).toBe(0)
+    archive.putSnapshot(single("ses_c", "yak fur"), laptop)
     expect(await archive.embedPending(32)).toBe(2)
+    expect(archive.status()).toMatchObject({ chunks: 6, embeddedChunks: 6 })
   })
 
   test.each(["replaced", "deleted"])(
@@ -1258,13 +1290,21 @@ describe("archive (file-backed only)", () => {
   })
 
   test("activating refuses while any chunk of the new space is unembedded, and the old space stays active", async () => {
-    const archive = open(await seeded(), fakeEmbedder(), SMALL)
+    const embedder = fakeEmbedder()
+    const archive = open(await seeded(), embedder, SMALL)
     const rebuild = archive.rebuild()!
     await Effect.runPromise(rebuild.embedNext(1))
+    embedder.down = true
+    await expect(Effect.runPromise(rebuild.embedNext(1))).rejects.toThrow("embedding model unavailable")
     const refused = await Effect.runPromise(Effect.flip(rebuild.activate))
     expect(refused).toBeInstanceOf(Archive.Incomplete)
     expect(refused.pending).toBe(rebuild.chunks - 1)
     expect(archive.status()).toMatchObject({ chunks: 2, activeSpace: { recipe: { chunkChars: 1200 } } })
+
+    // The failed batch is retried, so the rest completes the space.
+    embedder.down = false
+    expect(await embedAll(rebuild)).toBe(rebuild.chunks - 1)
+    await Effect.runPromise(rebuild.activate)
   })
 
   test("an abandoned rebuild leaves the old space serving until it is reclaimed, and never piles up", async () => {
