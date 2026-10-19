@@ -65,7 +65,7 @@ const listen = Layer.effect(
     const config = yield* HubConfig.Service
     const archive = yield* Archive.Service
     const reclaimed = yield* archive.reclaim()
-    const { activeSpace, chunks, embeddedChunks } = yield* archive.status()
+    const { activeSpace, chunks, embeddedChunks } = yield* archive.space()
     yield* Effect.logInfo("archive opened").pipe(
       Effect.annotateLogs({ path: archivePath(config), schemaFrom: archive.migration.from, schemaTo: archive.migration.to }),
     )

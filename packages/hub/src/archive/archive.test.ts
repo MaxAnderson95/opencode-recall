@@ -59,6 +59,7 @@ function handle(archive: Archive.Interface, scope: Scope.Closeable) {
     revokeToken: (id: number) => Effect.runSync(archive.revokeToken(id)),
     authenticate: (token: string) => Option.getOrNull(Effect.runSync(archive.authenticate(token))),
     status: () => Effect.runSync(archive.status()),
+    space: () => Effect.runSync(archive.space()),
     close: () => Effect.runSync(Scope.close(scope, Exit.void)),
   }
 }
@@ -566,6 +567,7 @@ describe.each(backends)("archive ($name)", ({ path }) => {
 
     expect(await archive.embedPending(32)).toBe(2)
     expect(archive.status()).toMatchObject({ chunks: 2, embeddedChunks: 2 })
+    expect(archive.space()).toEqual({ chunks: 2, embeddedChunks: 2, activeSpace: archive.status().activeSpace })
     // Only the `all`-scope chunk competes; the `user-messages` one answers that scope alone.
     expect((await archive.search({ query: "needle", limit: 8 }, 0)).sessions[0]!.semanticMatches).toBe(1)
     expect(await archive.embedPending(32)).toBe(0)
@@ -1113,11 +1115,13 @@ describe("archive (file-backed only)", () => {
     db.run(
       "INSERT INTO parts (message_id, ordinal, kind, text, searchable) VALUES ('msg_old', 1, 'tool', 'hidden needle', 0)",
     )
+    db.run("INSERT INTO parts (message_id, ordinal, kind, text) VALUES ('msg_old', 2, 'text', 'later haystack')")
     db.close()
 
     const archive = open(path)
     expect(archive.migration.from).toBe(SEGMENTED - 1)
     expect((await search(archive, "needle"))[0]!.hits.map((h) => h.snippet)).toEqual(["legacy «needle»"])
+    expect((await search(archive, "haystack"))[0]!.hits.map((h) => h.snippet)).toEqual(["later «haystack»"])
     expect(await search(archive, "hidden")).toEqual([])
   })
 

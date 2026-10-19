@@ -49,6 +49,8 @@ export type PutResult = "archived" | "rewound" | "unchanged" | "stale_revision" 
 /** Whether `putSummary` cached a summary, or refused it because the archive moved past its content. */
 export type SummaryPutResult = "stored" | "stale_revision"
 
+export type SpaceStatus = Pick<Responses["status"], "activeSpace" | "chunks" | "embeddedChunks">
+
 /** The archive was migrated by a newer binary; it was left untouched. */
 export class NewerSchema extends Schema.TaggedError<NewerSchema>()("Archive.NewerSchema", {
   message: Schema.String,
@@ -181,6 +183,8 @@ export interface Interface {
   readonly authenticate: (token: string) => Effect.Effect<Option.Option<Source>>
   /** Counts, the active space, and the recorded rewinds and standing divergences, in one read. */
   readonly status: () => Effect.Effect<Responses["status"]>
+  /** The part of `status` that describes the active space, without its per-source scan of every session. */
+  readonly space: () => Effect.Effect<SpaceStatus>
   /**
    * Load the active space's vectors into memory now rather than on the first semantic search,
    * which would otherwise wait for them: 27 s from a cold disk at 77,000 vectors.
@@ -255,8 +259,10 @@ function migrate(db: Database): Effect.Effect<{ from: number; to: number }, Newe
         for (const sql of migrations.slice(from)) db.run(sql)
         if (from > 0 && from < SEGMENTED) {
           const segment = segmenter(db)
-          const rows = db.query("SELECT id, text FROM parts WHERE searchable = 1").all() as { id: number; text: string }[]
-          for (const { id, text } of rows) segment(id, text)
+          // Streamed: every searchable part at once is hundreds of megabytes. The loop writes only
+          // segments and fts, never parts, so the open read is unaffected by it.
+          const rows = db.query<{ id: number; text: string }, []>("SELECT id, text FROM parts WHERE searchable = 1")
+          for (const { id, text } of rows.iterate()) segment(id, text)
         }
         // PRAGMA takes no bound parameters; SCHEMA_VERSION is a compile-time integer.
         db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`)
@@ -1125,12 +1131,16 @@ function bind(
       ),
     }),
   )
+  const spaceStatus = (): SpaceStatus => ({
+    chunks: (countChunks.get(space.setId) as { n: number }).n,
+    embeddedChunks: (countVectors.get(space.id) as { n: number }).n,
+    activeSpace: { recipe: space.recipe, matchesConfigured },
+  })
+  const spaceTx = db.transaction(spaceStatus)
   const statusTx = db.transaction(
     (): Responses["status"] => ({
       sessions: (countSessions.get() as { n: number }).n,
-      chunks: (countChunks.get(space.setId) as { n: number }).n,
-      embeddedChunks: (countVectors.get(space.id) as { n: number }).n,
-      activeSpace: { recipe: space.recipe, matchesConfigured },
+      ...spaceStatus(),
       sources: selectSourceCounts.all({ setId: space.setId, spaceId: space.id }) as Responses["status"]["sources"],
       summaries: (countSummaries.get() as { n: number }).n,
       divergences: selectDivergences.all() as Responses["status"]["divergences"],
@@ -1181,6 +1191,9 @@ function bind(
     }),
     status: Effect.fn("Archive.status")(function* () {
       return statusTx()
+    }),
+    space: Effect.fn("Archive.space")(function* () {
+      return spaceTx()
     }),
     loadVectors: Effect.fn("Archive.loadVectors")(function* () {
       vectors()

@@ -32,12 +32,16 @@ export type Limits = {
   compressedBytes: number
   /** Largest body accepted after gzip decoding. */
   decompressedBytes: number
-  /** Snapshots read and applied at once; one more is answered with `rate_limited`. */
+  /**
+   * Snapshots read and applied at once; one more is answered with `rate_limited`. Archive writes
+   * run one at a time regardless, so each permit past the first only lets another body be read
+   * meanwhile, at the cost of another snapshot's worth of peak memory.
+   */
   concurrentIngest: number
 }
 
 const MiB = 1024 * 1024
-export const DEFAULT_LIMITS: Limits = { compressedBytes: 32 * MiB, decompressedBytes: 64 * MiB, concurrentIngest: 4 }
+export const DEFAULT_LIMITS: Limits = { compressedBytes: 32 * MiB, decompressedBytes: 64 * MiB, concurrentIngest: 2 }
 
 class TooLarge extends Error {}
 
@@ -63,10 +67,11 @@ function capped(max: number) {
 }
 
 /**
- * Read a request body as text, decoding gzip, without ever buffering more than the caps allow.
- * An over-cap body is rejected, never truncated.
+ * Parse a request body as JSON, decoding gzip, without ever buffering more than the caps allow.
+ * An over-cap body is rejected, never truncated. The body is parsed from the decoded stream, so
+ * no copy of its text outlives the parse.
  */
-const readBody = Effect.fnUntraced(function* (req: Request, limits: Limits) {
+const readJson = Effect.fnUntraced(function* (req: Request, limits: Limits) {
   const encoding = req.headers.get("content-encoding")?.toLowerCase() ?? "identity"
   if (encoding !== "identity" && encoding !== "gzip")
     return yield* reject("invalid_request", `unsupported content-encoding: ${encoding}`)
@@ -83,8 +88,13 @@ const readBody = Effect.fnUntraced(function* (req: Request, limits: Limits) {
     stream = stream.pipeThrough(new DecompressionStream("gzip") as ReadableWritablePair<Uint8Array, Uint8Array>)
   const decoded = stream.pipeThrough(capped(limits.decompressedBytes))
   return yield* Effect.tryPromise({
-    try: () => new Response(decoded).text(),
-    catch: (e) => (e instanceof TooLarge ? tooLarge() : reject("invalid_request", "body could not be decoded")),
+    try: (): Promise<unknown> => new Response(decoded).json(),
+    catch: (e) =>
+      e instanceof TooLarge
+        ? tooLarge()
+        : e instanceof SyntaxError
+          ? reject("invalid_request", "body is not valid JSON")
+          : reject("invalid_request", "body could not be decoded"),
   })
 })
 
@@ -151,8 +161,12 @@ export const makeHandler = Effect.fnUntraced(function* ({
         case "rewound":
           yield* Effect.logWarning("snapshot accepted as a rewind").pipe(Effect.annotateLogs(fields))
           break
-        default:
-          yield* Effect.logInfo(`snapshot ${result}`).pipe(
+        case "unchanged":
+          // A no-op upload is routine, so it stays out of the info-level log.
+          yield* Effect.logDebug("snapshot unchanged").pipe(Effect.annotateLogs(fields))
+          break
+        case "archived":
+          yield* Effect.logInfo("snapshot archived").pipe(
             Effect.annotateLogs({ ...fields, messages: snapshot.session.messages.length }),
           )
       }
@@ -194,11 +208,7 @@ export const makeHandler = Effect.fnUntraced(function* ({
     )
 
   const read = Effect.fnUntraced(function* (req: Request, verb: Verb, source: Source) {
-    const text = yield* readBody(req, limits)
-    const body = yield* Effect.try({
-      try: (): unknown => JSON.parse(text),
-      catch: () => reject("invalid_request", "body is not valid JSON"),
-    })
+    const body = yield* readJson(req, limits)
     const envelope = yield* Schema.decodeUnknownEffect(Envelope)(body).pipe(
       Effect.mapError((e) => reject("invalid_request", e.message)),
     )
