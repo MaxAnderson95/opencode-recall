@@ -1,6 +1,6 @@
 import { heapStats } from "bun:jsc"
 import { readFileSync } from "node:fs"
-import { Effect } from "effect"
+import { Effect, Schedule } from "effect"
 import { Archive } from "./archive/index.ts"
 import { Embedder } from "./embedder.ts"
 
@@ -54,11 +54,16 @@ export const report = Effect.fn("Memory.report")(function* (point: string) {
 
 /**
  * Until its scope closes, log a {@link report} at `point: "ready"` once the embedding model has
- * loaded, and at `point: "signal"` on every SIGUSR2.
+ * loaded, and at `point: "signal"` on every SIGUSR2. It waits on the model's state rather than
+ * loading it, so a load that fails and is retried later still gets its report.
  */
 export const watch = Effect.gen(function* () {
   const embedder = yield* Embedder.Service
-  yield* embedder.load.pipe(Effect.andThen(report("ready")), Effect.ignore, Effect.forkScoped)
+  yield* embedder.state.pipe(
+    Effect.repeat({ schedule: Schedule.spaced("1 second"), until: (state) => state._tag === "Loaded" }),
+    Effect.andThen(report("ready")),
+    Effect.forkScoped,
+  )
   const context = yield* Effect.context<Archive.Service>()
   const handler = () => Effect.runForkWith(context)(report("signal"))
   yield* Effect.acquireRelease(
