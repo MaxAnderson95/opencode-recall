@@ -612,6 +612,14 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     expect(archive.status()).toMatchObject({ chunks: 4, embeddedChunks: 4 })
   })
 
+  test("a batch of zero chunks takes nothing and skips none of the queue", async () => {
+    const archive = open(path())
+    archive.putSnapshot(single("ses_a", "the needle"), sourceOf(archive))
+    expect(await archive.embedPending(0)).toBe(0)
+    expect(await archive.embedPending(8)).toBe(2)
+    expect(archive.status()).toMatchObject({ chunks: 2, embeddedChunks: 2 })
+  })
+
   test("chunks written after earlier batches are embedded, including those written while a batch is embedding", async () => {
     const fake = fakeEmbedder()
     let gate = Promise.resolve()
@@ -1293,6 +1301,7 @@ describe("archive (file-backed only)", () => {
     const embedder = fakeEmbedder()
     const archive = open(await seeded(), embedder, SMALL)
     const rebuild = archive.rebuild()!
+    expect(await Effect.runPromise(rebuild.embedNext(0))).toBe(0)
     await Effect.runPromise(rebuild.embedNext(1))
     embedder.down = true
     await expect(Effect.runPromise(rebuild.embedNext(1))).rejects.toThrow("embedding model unavailable")

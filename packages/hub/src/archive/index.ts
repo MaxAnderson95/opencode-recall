@@ -538,12 +538,16 @@ function bind(
   /** Embed up to `limit` of `target`'s unembedded chunks, oldest first; `stored` are the vectors written. */
   const embedInto = Effect.fnUntraced(function* (target: Space, limit: number) {
     type Pending = VectorRow & { text: string }
+    // LIMIT 0 finds no rows even with chunks waiting, which would pass the cursor over them.
+    if (limit === 0) return { taken: 0, stored: [] }
     const pending = (selectPending.all(target.setId, target.pendingFrom, target.id, limit) as Pending[]).map(
       ({ text, ...row }) => ({ row, text }),
     )
+    // Overlapping calls on one space may finish out of order, so the cursor only ever moves up.
+    const advance = (to: number) => void (target.pendingFrom = Math.max(target.pendingFrom, to))
     if (!pending.length) {
       // Nothing waits now, and any chunk written later gets a higher id than every one held.
-      target.pendingFrom = (selectLastChunkId.get(target.setId) as { id: number }).id + 1
+      advance((selectLastChunkId.get(target.setId) as { id: number }).id + 1)
       return { taken: 0, stored: [] }
     }
     const embedded = yield* embedder.embed(pending.map((p) => p.text))
@@ -553,7 +557,7 @@ function bind(
       })
     const stored = storeVectors.immediate(target, pending.map((p) => p.row), embedded)
     // Only once the batch commits: every chunk it took now has a vector or was deleted meanwhile.
-    target.pendingFrom = pending.at(-1)!.row.chunkId + 1
+    advance(pending.at(-1)!.row.chunkId + 1)
     return { taken: pending.length, stored }
   })
 
