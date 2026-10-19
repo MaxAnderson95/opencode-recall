@@ -639,13 +639,12 @@ function bind(
     const scope = f.scope ?? "all"
     const accept = (r: VectorRow) =>
       r.scope === scope &&
-      (f.sessionId === undefined || r.sessionId === f.sessionId) &&
       (f.since === undefined || r.time >= f.since) &&
       (f.until === undefined || r.time <= f.until) &&
       !(f.exclude && r.sessionId === f.exclude.sessionId && r.time >= f.exclude.before) &&
       (!allowed || allowed.has(r.sessionId))
     return vectors()
-      .scan(query, accept, CANDIDATES)
+      .scan(query, accept, CANDIDATES, f.sessionId)
       .map(({ row, score }) => ({
         branch: "semantic",
         sessionId: row.sessionId,
