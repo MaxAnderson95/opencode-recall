@@ -29,7 +29,7 @@ import { Embedder, type EmbeddingModel } from "../embedder.ts"
 import { DEFAULT_CHUNKING, RENDERING_VERSION, renderChunks, type ChunkParams, type ChunkSource } from "./chunks.ts"
 import { SEGMENTED, migrations } from "./migrations.ts"
 import { clean, cut, ftsQuery, fuse, makeSnippet, middleOut, queryTokens, segments, transcriptBlock } from "./text.ts"
-import { createMatrix, type Matrix, type VectorRow } from "./vectors.ts"
+import { createMatrix, type Matrix, type MatrixStats, type VectorRow } from "./vectors.ts"
 
 export const SCHEMA_VERSION = migrations.length
 
@@ -183,6 +183,8 @@ export interface Interface {
    * which would otherwise wait for them: 27 s from a cold disk at 77,000 vectors.
    */
   readonly loadVectors: () => Effect.Effect<void>
+  /** The in-memory vector matrix's size, or `undefined` before it is loaded. */
+  readonly matrixStats: () => Effect.Effect<MatrixStats | undefined>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode-recall/hub/Archive") {}
@@ -1151,6 +1153,9 @@ function bind(
     }),
     loadVectors: Effect.fn("Archive.loadVectors")(function* () {
       vectors()
+    }),
+    matrixStats: Effect.fn("Archive.matrixStats")(function* () {
+      return matrix?.stats()
     }),
   })
 }

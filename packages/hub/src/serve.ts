@@ -7,6 +7,7 @@ import { HubConfig } from "./config.ts"
 import { EmbedQueue } from "./embed-queue.ts"
 import { Embedder, type EmbeddingModel } from "./embedder.ts"
 import { HubLock } from "./lock.ts"
+import { Memory } from "./memory.ts"
 import { makeHandler } from "./server.ts"
 
 export const archivePath = (config: HubConfig.Settings) => join(config.dataDir, "archive.db")
@@ -89,6 +90,7 @@ const listen = Layer.effect(
       (server) => Effect.promise(() => server.stop()),
     )
     yield* Effect.logInfo("listening").pipe(Effect.annotateLogs({ url: server.url.href }))
+    yield* Memory.watch
     return { url: server.url }
   }),
 )
@@ -110,7 +112,8 @@ export const archive = (embedder: EmbedderLayer | undefined, fallback: EmbedderL
 
 /**
  * Take the data directory, open and migrate the archive, reclaim an interrupted reindex, load the
- * active space's vectors, resume embedding its queue, then listen. Releasing it stops the server, then the embedding worker,
+ * active space's vectors, resume embedding its queue, then listen and start logging memory reports
+ * (see {@link Memory.watch}). Releasing it stops the server, then the embedding worker,
  * then closes the archive and lets the data directory go. Fails to build if another `serve` or a
  * `reindex` holds the data directory, or the archive cannot be opened.
  */

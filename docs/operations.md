@@ -91,12 +91,56 @@ A hub never runs against an archive a newer binary migrated: it logs `archive sc
 
 ## Memory
 
-The budget is about 1 GB (SPEC §7). It has been measured once, not on the production Linux host: in a linux/arm64 container under OrbStack on an M5 Pro, limited with `--memory 1g`, against a synthetic archive at the measured production scale (4,200 sessions, 75,600 chunks with 384-dimension vectors under the real recipe, a 1.05 GB `archive.db`) and the real model. The load was 400 hybrid searches, four at a time, while 40 twelve-message snapshots were ingested and embedded.
+The budget is about 1 GB (SPEC §7). The production hub is over it.
 
-| point | hub process RSS |
+### Taking a memory report
+
+`serve` logs one `memory` line at `point: "ready"` once the embedding model has loaded, and one at `point: "signal"` each time it receives SIGUSR2. The numbers come from the serving process itself; the `status` subcommand opens the archive directly and cannot see them. Each report forces a full garbage collection first.
+
+```sh
+docker kill --signal USR2 recall-hub
+docker logs recall-hub 2>&1 | grep '"msg":"memory"' | tail -1
+```
+
+| field | meaning |
 | --- | --- |
-| ready, model loaded, no search yet | 207 MB |
-| peak during the load (`VmHWM`) | 661 MB |
-| after the load | 525 MB |
+| `rssMB`, `gcRssMB` | resident memory before and after the forced GC |
+| `anonMB`, `fileMB`, `hwmMB` | `RssAnon`, `RssFile`, and the peak `VmHWM` from `/proc/self/status` (Linux only) |
+| `heapMB`, `heapCapacityMB` | the JS heap's live objects and capacity after the GC, excluding the next row |
+| `externalMB` | memory JSC tracks outside its heap: array buffers, the vector matrix among them |
+| `matrix.capacity`, `.live`, `.removed` | rows the vector matrix has room for, rows it holds, and removed rows still occupying slots until its next compaction |
+| `matrix.allocatedMB`, `.writtenMB` | the matrix's allocation, and the bytes of the rows written to it so far |
 
-The container's page cache filled the rest of the 1 GiB limit and was reclaimed as needed; the kernel recorded no OOM event. Re-measure on the production host before treating these as its budget.
+Resident memory beyond the JS heap and the matrix is native: ONNX Runtime, SQLite, Bun, and allocator pages freed but not returned to the kernel.
+
+### Production host
+
+GUHQPMAXDEVBOX01 (4 CPUs, 7.4 GiB of memory) running v0.1.2, which predates the `memory` report, read from `/proc` on 2026-10-19 after 25 days of uptime. The archive held 5,007 sessions and 85,257 chunks, all embedded, in a 1.95 GB `archive.db`.
+
+| | |
+| --- | --- |
+| `VmRSS` | 1,109 MB |
+| `RssAnon` | 1,038 MB |
+| `RssFile` | 71 MB |
+| `VmHWM` | 1,391 MB |
+
+The largest mappings in `/proc/<pid>/smaps`: one anonymous mapping of 983,548 kB with 518 MB resident; two 1 GiB anonymous reservations with 248 MB and 194 MB resident; the `[heap]` segment at 78 MB; the executable and `libonnxruntime.so.1` at 43 MB and 24 MB, file-backed. The 983,548 kB mapping is within one 4 KiB page of the size of a vector matrix with room for 655,696 rows of 384 dimensions, more than seven times the 85,257 live vectors. That attribution is inferred from the size alone; the `matrix` fields of a report from a deployed build will confirm or refute it.
+
+### Local run on a copy of the production archive
+
+A build of this tree in a linux/arm64 container under OrbStack on an M5 Pro, pinned to 4 CPUs, against a copy of the production archive's 2026-10-19 backup. The replays re-sent each upload in the production hub's log, each session truncated to the message count the log recorded, at a later position than the one held.
+
+| point | `rssMB` | `anonMB` | `hwmMB` | `heapMB` | `externalMB` | matrix capacity / live / removed |
+| --- | --- | --- | --- | --- | --- | --- |
+| ready, model loaded | 356 | 294 | 437 | 22 | 214 | 131,072 / 85,257 / 0 |
+| after the first hybrid search | 391 | 328 | 437 | 22 | 214 | 131,072 / 85,257 / 0 |
+| after replaying the last 24 hours of uploads (125 snapshots) | 486 | 419 | 540 | 22 | 216 | 131,072 / 85,257 / 12,136 |
+| after replaying the first 3,206 uploads since production's last start (its log through 2026-10-02), 7,400 chunks embedded | 1,247 | 1,222 | 1,623 | 21 | 272 | 170,136 / 85,180 / 4,831 |
+
+The JS heap stays near 22 MB throughout. At the last point the matrix accounts for at most its 261 MB allocation, so at least 920 MB of anonymous memory is native and grew with ingest. ONNX Runtime ran one thread per host core in the container (15, not 4; it logged failed affinity calls), so native figures on the 4-CPU production host may differ.
+
+### Causes and the issues that address them
+
+- The vector matrix holds more than its live rows: capacity doubles on growth and removed rows keep their slots until a compaction. Locally 201 MB was allocated for 131 MB of live vectors; in production, the mapping above. #54.
+- Native memory grows with ingest while the JS heap does not: from 328 MB to 1,222 MB anonymous over 3,206 uploads. Candidates are each upload's body and parse buffers, up to four ingests at once, and the startup and migration reads (#71), ONNX Runtime's CPU memory arena and thread count (#72), and the full snapshots the plugin builds and sends (#62, #63). The report does not split native memory further.
+- Transcript and expand reads of whole columns (#59) were not exercised by the replays, which sent no `expand` or `transcript` requests.
