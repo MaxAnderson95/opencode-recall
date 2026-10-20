@@ -9,14 +9,14 @@
 import type { Context as PluginContext } from "@opencode/plugin/promise/plugin"
 import type { Info, ToolContext } from "@opencode/plugin/promise/tool"
 import type { SummaryGet } from "@opencode-recall/protocol"
-import { Clock, Effect, Result, Schema } from "effect"
+import { Clock, Effect, Result, Schema, Semaphore } from "effect"
 import { PluginConfig } from "./config.ts"
 import { Tools } from "./tools.ts"
 
 /** OpenCode's one-shot text generation, which `ctx.generate` provides. */
 export type Generate = Pick<PluginContext["generate"], "text">
 
-/** Sessions one call summarizes at most, and at once. */
+/** Sessions one call summarizes at most, and how many of them read a transcript and call the model at once. */
 export const BATCH_MAX = 24
 export const CONCURRENCY = 4
 
@@ -96,7 +96,13 @@ const messageOf = (cause: unknown) => (cause instanceof Error ? cause.message : 
 export const make = Effect.fnUntraced(function* (generate: Generate) {
   const config = yield* PluginConfig.Service
 
-  const summarize = Effect.fnUntraced(function* (ref: string, key: Key, refresh: boolean, tag: string) {
+  const summarize = Effect.fnUntraced(function* (
+    ref: string,
+    key: Key,
+    refresh: boolean,
+    tag: string,
+    permits: Semaphore.Semaphore,
+  ) {
     const suffix = key.focus ? ` · focus: ${key.focus}` : ""
     let session = ref
     if (!refresh) {
@@ -108,35 +114,46 @@ export const make = Effect.fnUntraced(function* (generate: Generate) {
       session = cached.session.sessionId
     }
 
-    const transcript = yield* Tools.withHub((hub) => hub.transcript({ session, budget: BUDGET, maxChars: MESSAGE_CHARS }))
-    if (transcript.kind === "missing") return Tools.notFound(ref)
-    if (!transcript.text) return `${Tools.header(transcript, ref, "summarizing")}\nNothing to summarize: the archived session has no transcript content.`
-    const s = transcript.session
-    const prompt = [
-      WORKER_SYSTEM,
-      "",
-      key.focus ? TASK_FOCUSED : TASK_GENERAL,
-      "",
-      ...(key.focus ? [`QUESTION: ${key.focus}`, ""] : []),
-      `SESSION: ${s.title} (${Tools.shortDir(s.directory)}, ${Tools.fmtDate(s.timeCreated)})`,
-      "TRANSCRIPT:",
-      transcript.text,
-    ].join("\n")
+    // The permit spans the transcript too, so a waiting session holds no transcript in memory.
+    const fresh = yield* permits.withPermit(
+      Effect.gen(function* () {
+        const transcript = yield* Tools.withHub((hub) => hub.transcript({ session, budget: BUDGET, maxChars: MESSAGE_CHARS }))
+        if (transcript.kind === "missing") return Tools.notFound(ref)
+        if (!transcript.text)
+          return `${Tools.header(transcript, ref, "summarizing")}\nNothing to summarize: the archived session has no transcript content.`
+        const s = transcript.session
+        const prompt = [
+          WORKER_SYSTEM,
+          "",
+          key.focus ? TASK_FOCUSED : TASK_GENERAL,
+          "",
+          ...(key.focus ? [`QUESTION: ${key.focus}`, ""] : []),
+          `SESSION: ${s.title} (${Tools.shortDir(s.directory)}, ${Tools.fmtDate(s.timeCreated)})`,
+          "TRANSCRIPT:",
+          transcript.text,
+        ].join("\n")
 
-    const started = yield* Clock.currentTimeMillis
-    const model = { providerID: key.provider, id: key.model, ...(key.variant !== undefined && { variant: key.variant }) }
-    const { text } = yield* Effect.tryPromise({
-      try: () => generate.text({ prompt, model }),
-      catch: (e) => new Failed({ message: messageOf(e) }),
-    }).pipe(
-      Effect.timeoutOrElse({
-        duration: TIMEOUT_MS,
-        orElse: () => Effect.fail(new Failed({ message: `the model did not answer within ${TIMEOUT_MS / 1000}s` })),
+        const started = yield* Clock.currentTimeMillis
+        const model = { providerID: key.provider, id: key.model, ...(key.variant !== undefined && { variant: key.variant }) }
+        // OpenCode's plugin adapter does not forward the signal yet (anomalyco/opencode#57135).
+        const { text } = yield* Effect.tryPromise({
+          try: (signal) => generate.text({ prompt, model }, { signal }),
+          catch: (e) => new Failed({ message: messageOf(e) }),
+        }).pipe(
+          Effect.timeoutOrElse({
+            duration: TIMEOUT_MS,
+            orElse: () => Effect.fail(new Failed({ message: `the model did not answer within ${TIMEOUT_MS / 1000}s` })),
+          }),
+        )
+        const summary = text.trim()
+        if (!summary) return yield* new Failed({ message: "the model returned no text" })
+        const secs = ((yield* Clock.currentTimeMillis) - started) / 1000
+        return { transcript, summary, secs }
       }),
     )
-    const summary = text.trim()
-    if (!summary) return yield* new Failed({ message: "the model returned no text" })
-    const secs = ((yield* Clock.currentTimeMillis) - started) / 1000
+    if (typeof fresh === "string") return fresh
+    const { transcript, summary, secs } = fresh
+    const s = transcript.session
 
     const { omitted, clipped } = transcript
     const put = { ...key, sessionId: s.sessionId, contentHash: transcript.contentHash, summary, omitted, clipped }
@@ -174,11 +191,12 @@ export const make = Effect.fnUntraced(function* (generate: Generate) {
     const key: Key = { provider, model, ...(variant && { variant }), focus: focus.trim(), recipe: RECIPE }
     const tag = `${provider}/${model}${variant ? `/${variant}` : ""}`
 
+    const permits = yield* Semaphore.make(CONCURRENCY)
     let done = 0
     const blocks = yield* Effect.forEach(
       ids,
       (ref) =>
-        summarize(ref, key, refresh, tag).pipe(
+        summarize(ref, key, refresh, tag, permits).pipe(
           Effect.catchTags({
             "Tools.CouldNotLook": (e) => Effect.succeed(`# ${ref}\n${e.message}`),
             "Summarize.Failed": (e) =>
@@ -193,7 +211,8 @@ export const make = Effect.fnUntraced(function* (generate: Generate) {
               : Effect.void
           }),
         ),
-      { concurrency: CONCURRENCY },
+      // Every session starts at once, so a cached summary never waits behind a model call.
+      { concurrency: "unbounded" },
     )
     if (blocks.length === 1) return { content: blocks[0]!, metadata: { title: `recall summary: ${ids[0]}` } }
     return { content: blocks.join("\n\n---\n\n"), metadata: { title: `recall summaries: ${blocks.length} sessions` } }
