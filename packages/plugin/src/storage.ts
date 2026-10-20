@@ -15,9 +15,12 @@ export interface Interface {
   readonly get: <A>(key: string, schema: Schema.Codec<A>) => Effect.Effect<A | undefined, Failed>
   readonly set: (key: string, value: Json) => Effect.Effect<void, Failed>
   readonly remove: (key: string) => Effect.Effect<void, Failed>
-  /** Every entry under `prefix`, across all pages. */
+  /** Every entry under `prefix`, read {@link PAGE} entries per call into OpenCode's database. */
   readonly scan: <A>(prefix: string, schema: Schema.Codec<A>) => Effect.Effect<{ key: string; value: A }[], Failed>
 }
+
+/** The most entries OpenCode's KV scan returns per call; it returns 100 when no limit is given. */
+export const PAGE = 1_000
 
 export class Service extends Context.Service<Service, Interface>()("@opencode-recall/plugin/Storage") {}
 
@@ -33,12 +36,12 @@ export const fromDomain = (domain: Domain) =>
       set: (key, value) => Effect.tryPromise({ try: () => domain.set(key, value), catch: failed }),
       remove: (key) => Effect.tryPromise({ try: () => domain.remove(key), catch: failed }),
       scan: Effect.fn("Storage.scan")(function* <A>(prefix: string, schema: Schema.Codec<A>) {
+        const decode = Schema.decodeUnknownExit(schema)
         const found: { key: string; value: A }[] = []
         let after: string | undefined
         do {
-          const page = yield* Effect.tryPromise({ try: () => domain.scan({ prefix, after }), catch: failed })
-          for (const { key, value } of page.entries)
-            found.push({ key, value: yield* Schema.decodeUnknownEffect(schema)(value).pipe(Effect.mapError(failed)) })
+          const page = yield* Effect.tryPromise({ try: () => domain.scan({ prefix, after, limit: PAGE }), catch: failed })
+          for (const { key, value } of page.entries) found.push({ key, value: yield* Effect.mapError(decode(value), failed) })
           after = page.next
         } while (after !== undefined)
         return found
