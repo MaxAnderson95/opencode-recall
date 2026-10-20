@@ -179,11 +179,6 @@ export const migrations: readonly string[] = [
   `
   CREATE INDEX vectors_chunk_space_idx ON vectors(chunk_id, space_id);
   `,
-  // A session ref is an id or a slug. With both indexed, SQLite answers "id = ? OR slug = ?" by
-  // probing each index; without this one it scanned every session.
-  `
-  CREATE INDEX sessions_slug_idx ON sessions(slug);
-  `,
 ]
 
 /** The first schema version with segments; parts archived before it are segmented on migration. */

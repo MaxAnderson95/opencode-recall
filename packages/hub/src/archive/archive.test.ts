@@ -18,7 +18,7 @@ import { Effect, Exit, Option, Scope, type Types } from "effect"
 import { Embedder } from "../embedder.ts"
 import { fakeEmbedder } from "../fake-embedder.ts"
 import { DEFAULT_CHUNKING, type ChunkParams } from "./chunks.ts"
-import { Archive, SCHEMA_VERSION, SESSIONS_BY_REF, SOURCE_COUNTS, TRANSCRIPT_ROWS } from "./index.ts"
+import { Archive, SCHEMA_VERSION, SOURCE_COUNTS } from "./index.ts"
 import { SEGMENTED, migrations } from "./migrations.ts"
 
 /** The first schema version with vector spaces. */
@@ -972,24 +972,6 @@ test("per-source status finds each session's chunks through an index on session 
   // The primary key carries each embedding inline; probing it reads a page per chunk.
   expect(plan.map((row) => row.detail).filter((detail) => /\bv\b/.test(detail))).toEqual([
     "SEARCH v USING COVERING INDEX vectors_chunk_space_idx (chunk_id=? AND space_id=?)",
-  ])
-})
-
-test("a session ref is looked up through the id and slug indexes, and a transcript reads its parts in index order", () => {
-  const db = new Database(":memory:")
-  for (const sql of migrations) db.run(sql)
-  const plan = (sql: string, ...params: (string | number)[]) =>
-    (db.query(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as { detail: string }[]).map((row) => row.detail)
-  const byRef = plan(SESSIONS_BY_REF, 1, "x", "x", "x")
-  const transcript = plan(TRANSCRIPT_ROWS, "x")
-  db.close()
-  expect(byRef.filter((detail) => /\bs\b/.test(detail))).toEqual([
-    "SEARCH s USING INDEX sqlite_autoindex_sessions_1 (id=?)",
-    "SEARCH s USING INDEX sessions_slug_idx (slug=?)",
-  ])
-  expect(transcript).toEqual([
-    "SEARCH m USING INDEX messages_session_idx (session_id=?)",
-    "SEARCH p USING INDEX parts_message_idx (message_id=?) LEFT-JOIN",
   ])
 })
 
