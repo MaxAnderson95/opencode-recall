@@ -1228,6 +1228,36 @@ describe("archive (file-backed only)", () => {
     }
   })
 
+  test("a snapshot repeating a held message's id fails and leaves the archive untouched, as a fresh ingest does", async () => {
+    const path = tempPath()
+    const archive = open(path)
+    const laptop = sourceOf(archive)
+    archive.putSnapshot(session("ses_a", ["original text", "answer"]), laptop)
+    await archive.embedPending(32)
+    const before = contents(path)
+    const transcript = archive.transcript({ session: "ses_a", maxChars: 1_000, budget: 10_000 })
+
+    // The held message unchanged first, then the same id with other text, or the other way round.
+    const [original, answer] = session("ses_a", ["original text", "answer"]).session.messages
+    const changed = { ...original!, parts: [{ kind: "text" as const, text: "changed duplicate text" }] }
+    for (const repeated of [
+      [original!, changed],
+      [changed, original!],
+      [original!, original!],
+    ]) {
+      const snapshot = session("ses_a", [], { revision: 9, lastActivity: 90, contentHash: "repeated" })
+      snapshot.session.messages = structuredClone([...repeated, answer!])
+      expect(() => archive.putSnapshot(snapshot, laptop)).toThrow("UNIQUE constraint failed: messages.id")
+      const fresh = open(tempPath())
+      expect(() => fresh.putSnapshot(snapshot, sourceOf(fresh))).toThrow("UNIQUE constraint failed: messages.id")
+    }
+
+    expect(contents(path)).toEqual(before)
+    expect(archive.transcript({ session: "ses_a", maxChars: 1_000, budget: 10_000 })).toEqual(transcript)
+    expect(archive.status()).toMatchObject({ chunks: 2, embeddedChunks: 2 })
+    expect(await search(archive, "duplicate")).toEqual([])
+  })
+
   test("an archive from before message hashes migrates, and its held sessions take a diffed snapshot", async () => {
     const embedder: Embedder.Interface = { ...fakeEmbedder(), embed: (texts) => Effect.succeed(texts.map(spread)) }
     const path = tempPath()

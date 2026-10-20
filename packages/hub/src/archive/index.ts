@@ -914,19 +914,22 @@ function bind(
       (selectHeldMessages.all(session.id) as { id: string; ordinal: number; hash: string }[]).map((m) => [m.id, m]),
     )
     const hashes = session.messages.map(messageHash)
-    /** Held messages the snapshot repeats unchanged, by id, with their held ordinal. */
-    const kept = new Map(
-      session.messages.flatMap((m, i) => {
-        const was = heldMessages.get(m.id)
-        return was && was.hash === hashes[i] ? [[m.id, was.ordinal] as const] : []
-      }),
-    )
+    /**
+     * Held messages the snapshot repeats unchanged, by id: the snapshot position of the one
+     * occurrence kept, and the held ordinal. Any other occurrence of a kept id is inserted, so a
+     * snapshot repeating an id fails on the primary key and rolls back, as a fresh ingest does.
+     */
+    const kept = new Map<string, { at: number; ordinal: number }>()
+    session.messages.forEach((m, i) => {
+      const was = heldMessages.get(m.id)
+      if (was && was.hash === hashes[i] && !kept.has(m.id)) kept.set(m.id, { at: i, ordinal: was.ordinal })
+    })
     deleteMessages([...heldMessages.keys()].filter((id) => !kept.has(id)))
     session.messages.forEach((message, ordinal) => {
       const hash = hashes[ordinal]!
-      const heldOrdinal = kept.get(message.id)
-      if (heldOrdinal !== undefined) {
-        if (heldOrdinal !== ordinal) updateOrdinal.run(ordinal, message.id)
+      const unchanged = kept.get(message.id)
+      if (unchanged?.at === ordinal) {
+        if (unchanged.ordinal !== ordinal) updateOrdinal.run(ordinal, message.id)
         return
       }
       insertMessage.run({
