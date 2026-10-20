@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test"
+import { heapStats } from "bun:jsc"
 import { Database } from "bun:sqlite"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -227,6 +228,52 @@ test("a cached snapshot drops deleted rows and re-reads a row written in the mil
   } finally {
     setSystemTime()
   }
+})
+
+test("a cached snapshot re-reads a row another connection rewrote in the same millisecond during the read", () => {
+  const path = join(dataDir, "opencode.db")
+  const writer = sourceDb(path)
+  writer.db.run("PRAGMA journal_mode = WAL")
+  writer.addSession("ses_w")
+  const reader = new Database(path, { readonly: true })
+  try {
+    setSystemTime(new Date(1_000))
+    writer.addMessage("ses_w", "user", { text: "draft" }, 1_000)
+    const snapshot = cachedSnapshots(reader)
+    const query = reader.query.bind(reader)
+    let queries = 0
+    // After the transaction's first query has fixed what it sees, the writer rewrites the row
+    // within the same millisecond, and the clock moves on before the rest of the read.
+    const spy = spyOn(reader, "query").mockImplementation((sql: string) => {
+      if (++queries === 2) {
+        writer.updateMessage("ses_w", "msg_ses_w_2", { text: "final" }, 1_000)
+        setSystemTime(new Date(1_001))
+      }
+      return query(sql)
+    })
+    expect(snapshot("ses_w")!.session.messages[0]!.parts).toEqual([{ kind: "text", text: "draft" }])
+    spy.mockRestore()
+    expect(snapshot("ses_w")!.session.messages[0]!.parts).toEqual([{ kind: "text", text: "final" }])
+  } finally {
+    setSystemTime()
+    reader.close()
+    writer.close()
+  }
+})
+
+test("a cached session holds only the text it kept from oversized tool output", () => {
+  source.addSession("ses_big")
+  for (let i = 0; i < 4; i++) {
+    const output = String.fromCharCode(97 + i).repeat(8 * 1024 * 1024)
+    source.addMessage("ses_big", "assistant", { content: [tool("bash", { status: "completed", input: {}, content: [{ type: "text", text: output }] })] }, 101 + i)
+  }
+  const snapshot = cachedSnapshots(source.db)
+  const heap = () => (Bun.gc(true), heapStats().heapSize)
+  const before = heap()
+  // Each row's extraction allocates its 8 MB output; only 16,000 characters of each are kept.
+  expect(snapshot("ses_big")!.session.messages.map((m) => m.parts[0]!.text.length)).toEqual([16_000, 16_000, 16_000, 16_000])
+  expect(heap() - before).toBeLessThan(4 * 1024 * 1024)
+  expect(snapshot("ses_big")).toEqual(readSnapshot(source.db, "ses_big"))
 })
 
 test("the snapshot cache evicts the least recently read session past its session and byte limits", () => {

@@ -123,17 +123,18 @@ export function cachedSnapshots(db: Database, limits: CacheLimits = CACHE_LIMITS
     entries.delete(sessionId)
   }
 
-  return (sessionId) =>
-    db.transaction(() => {
+  return (sessionId) => {
+    // A row written later in the millisecond the read started could carry this same
+    // `time_updated`, so only rows strictly older than the read are remembered. The clock is read
+    // before the transaction's first query, which is where SQLite fixes what the read sees.
+    const readAt = Date.now()
+    return db.transaction(() => {
       const cached = entries.get(sessionId)?.messages
       forget(sessionId)
       const position = readPosition(db, sessionId)
       const row = readSessionRow(db, sessionId)
       if (!position || !row) return null
 
-      // A row written later in the millisecond the read started could carry this same
-      // `time_updated`, so only rows strictly older than the read are remembered.
-      const readAt = Date.now()
       const rows = (
         db
           .query("SELECT id, type, time_created, time_updated FROM session_message WHERE session_id = ? ORDER BY seq")
@@ -149,8 +150,12 @@ export function cachedSnapshots(db: Database, limits: CacheLimits = CACHE_LIMITS
             )
             .all(sessionId, JSON.stringify(stale)) as (MessageRow & MessageMeta)[]
         ).flatMap((m): [string, Extracted][] => {
-          const message = toMessage(m)
-          return message ? [[m.id, { message, timeUpdated: m.time_updated, bytes: JSON.stringify(message).length * 2 }]] : []
+          const extracted = toMessage(m)
+          if (!extracted) return []
+          // Extraction slices strings out of ones as large as the row, and a slice keeps its whole
+          // source alive; the copy holds only the kept characters, so the byte count is honest.
+          const message = structuredClone(extracted)
+          return [[m.id, { message, timeUpdated: m.time_updated, bytes: JSON.stringify(message).length * 2 }]]
         }),
       )
 
@@ -173,6 +178,7 @@ export function cachedSnapshots(db: Database, limits: CacheLimits = CACHE_LIMITS
       }
       return toSnapshot(position, toSession(row, messages))
     })()
+  }
 }
 
 /** Time of the session's latest completed compaction, or 0 if it never compacted. */
