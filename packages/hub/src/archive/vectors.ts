@@ -7,8 +7,8 @@ export type VectorRow = { chunkId: number; sessionId: string; messageId: string;
 
 export type Matrix = ReturnType<typeof createMatrix>
 
-/** Rows the matrix has room for, rows it holds, and removed rows still occupying slots until the next compaction. */
-export type MatrixStats = { dims: number; capacity: number; live: number; removed: number }
+/** Rows the matrix has room for, slots in use (live rows and removed rows not yet compacted away), and live rows. */
+export type MatrixStats = { capacity: number; slots: number; live: number }
 
 export function createMatrix(dims: number) {
   let data = new Float32Array(0)
@@ -52,7 +52,7 @@ export function createMatrix(dims: number) {
       if (removed > 1024 && removed * 2 > rows.length) compact()
     },
 
-    stats: (): MatrixStats => ({ dims, capacity: data.length / dims, live: rows.length - removed, removed }),
+    stats: (): MatrixStats => ({ capacity: data.length / dims, slots: rows.length, live: rows.length - removed }),
 
     /** The `limit` best rows by dot product with `query` (the cosine, as both are normalized) among those `accept` keeps. */
     scan(query: Float32Array, accept: (row: VectorRow) => boolean, limit: number): { row: VectorRow; score: number }[] {

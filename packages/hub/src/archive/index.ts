@@ -38,6 +38,9 @@ const TOKEN_PREFIX = "opencode-recall_"
 /** One host. Outlives any single token, so rotating tokens never changes attribution. */
 export type Source = { id: number; name: string }
 
+/** The vector matrix's {@link MatrixStats}, with the dimension of its rows. */
+export type VectorStats = MatrixStats & { dims: number }
+
 export type TokenInfo = { id: number; source: string; timeCreated: number }
 
 /** How `putSnapshot` resolved a snapshot against the copy the archive holds (§5 acceptance). */
@@ -183,8 +186,8 @@ export interface Interface {
    * which would otherwise wait for them: 27 s from a cold disk at 77,000 vectors.
    */
   readonly loadVectors: () => Effect.Effect<void>
-  /** The in-memory vector matrix's size, or `undefined` before it is loaded. */
-  readonly matrixStats: () => Effect.Effect<MatrixStats | undefined>
+  /** The in-memory vector matrix's size, or none while it is not loaded. */
+  readonly vectorStats: () => Effect.Effect<Option.Option<VectorStats>>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode-recall/hub/Archive") {}
@@ -1154,8 +1157,8 @@ function bind(
     loadVectors: Effect.fn("Archive.loadVectors")(function* () {
       vectors()
     }),
-    matrixStats: Effect.fn("Archive.matrixStats")(function* () {
-      return matrix?.stats()
+    vectorStats: Effect.fn("Archive.vectorStats")(function* () {
+      return Option.fromNullishOr(matrix).pipe(Option.map((m) => ({ ...m.stats(), dims: space.recipe.dims })))
     }),
   })
 }

@@ -4,10 +4,14 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { divergenceRemedy, type Snapshot } from "@opencode-recall/protocol"
-import { Effect, Option } from "effect"
+import { Effect, Exit, Layer, Option, Scope } from "effect"
+import { TestClock } from "effect/testing"
 import { Archive, SCHEMA_VERSION } from "./archive/index.ts"
 import { migrations } from "./archive/migrations.ts"
+import { HubConfig } from "./config.ts"
 import { fakeLayer } from "./fake-embedder.ts"
+import { Log } from "./log.ts"
+import { Hub } from "./serve.ts"
 
 const dirs: string[] = []
 afterEach(() => {
@@ -141,6 +145,66 @@ test("serve loads the vectors before it listens, and reindex refuses while it ru
   expect(ran.code).toBe(0)
   expect(ran.stdout).toContain("nothing to reindex")
   expect((await hub(dataDir, "reindex", "extra")).code).toBe(2)
+})
+
+test("serve logs memory after loading the vectors, then every hour until it is released", async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), "recall-hub-"))
+  dirs.push(dataDir)
+  const lines: Record<string, unknown>[] = []
+  const memory = () => lines.filter((l) => l.msg === "memory")
+  const settings: HubConfig.Settings = { ...HubConfig.DEFAULTS, dataDir, listen: "127.0.0.1:0" }
+
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const embedded = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const archive = yield* Archive.make(join(dataDir, "archive.db"))
+          const source = Option.getOrThrow(yield* archive.authenticate(yield* archive.issueToken("laptop"))).id
+          for (const n of [1, 2, 3])
+            yield* archive.putSnapshot(
+              {
+                session: {
+                  id: `ses_${n}`,
+                  slug: "s",
+                  title: "t",
+                  directory: "/w",
+                  parentId: null,
+                  timeCreated: 1,
+                  timeUpdated: 2,
+                  messages: [{ id: `msg_${n}`, type: "user", timeCreated: 10, parts: [{ kind: "text", text: `deployment ${n}` }] }],
+                },
+                revision: 1,
+                lastActivity: 10,
+                contentHash: `h${n}`,
+                extractorVersion: 1,
+              },
+              source,
+            )
+          while (yield* archive.embedPending(32));
+          return (yield* archive.status()).embeddedChunks
+        }),
+      ).pipe(Effect.provide(fakeLayer()))
+      expect(embedded).toBeGreaterThan(0)
+
+      const scope = yield* Scope.make()
+      yield* Layer.buildWithScope(Hub.layer(fakeLayer()).pipe(Layer.provide(Layer.succeed(HubConfig.Service, settings))), scope)
+      const msgs = lines.map((l) => l.msg)
+      expect(msgs.indexOf("memory")).toBe(msgs.indexOf("vectors loaded") + 1)
+      expect(memory()).toHaveLength(1)
+      const [first] = memory()
+      expect(first).toMatchObject({ level: "info", matrixSlots: embedded, matrixLive: embedded })
+      expect(first!.matrixCapacity).toBeGreaterThanOrEqual(embedded)
+      expect(first!.matrixBytes).toBe((first!.matrixCapacity as number) * 64 * 4)
+      for (const field of ["rss", "jscHeapSize", "jscHeapCapacity", "jscExtraMemory", "jscObjects"])
+        expect(first![field]).toBeGreaterThan(0)
+
+      yield* TestClock.adjust("1 hour")
+      expect(memory()).toHaveLength(2)
+      yield* Scope.close(scope, Exit.void)
+      yield* TestClock.adjust("3 hours")
+      expect(memory()).toHaveLength(2)
+    }).pipe(Effect.provide(Layer.mergeAll(Log.layer("info", (line) => lines.push(JSON.parse(line))), TestClock.layer()))),
+  )
 })
 
 test("status prints the hub's view, naming a divergent session with its remedy", async () => {

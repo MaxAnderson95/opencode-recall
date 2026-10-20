@@ -1,7 +1,7 @@
 import { mkdirSync } from "node:fs"
 import { join } from "node:path"
 import type { SpaceRecipe } from "@opencode-recall/protocol"
-import { Context, Duration, Effect, Layer, Option, Schema } from "effect"
+import { Context, Duration, Effect, Layer, Option, Schedule, Schema } from "effect"
 import { Archive } from "./archive/index.ts"
 import { HubConfig } from "./config.ts"
 import { EmbedQueue } from "./embed-queue.ts"
@@ -79,6 +79,8 @@ const listen = Layer.effect(
 
     const [loadTime] = yield* Effect.timed(archive.loadVectors())
     yield* Effect.logInfo("vectors loaded").pipe(Effect.annotateLogs({ ms: Duration.toMillis(loadTime) }))
+    yield* Memory.report()
+    yield* Effect.schedule(Memory.report(), Schedule.spaced("1 hour")).pipe(Effect.forkScoped)
 
     const embedding = yield* EmbedQueue.Service
     const fetch = yield* makeHandler({ onArchived: embedding.kick })
@@ -90,7 +92,6 @@ const listen = Layer.effect(
       (server) => Effect.promise(() => server.stop()),
     )
     yield* Effect.logInfo("listening").pipe(Effect.annotateLogs({ url: server.url.href }))
-    yield* Memory.watch
     return { url: server.url }
   }),
 )
@@ -112,8 +113,8 @@ export const archive = (embedder: EmbedderLayer | undefined, fallback: EmbedderL
 
 /**
  * Take the data directory, open and migrate the archive, reclaim an interrupted reindex, load the
- * active space's vectors, resume embedding its queue, then listen and start logging memory reports
- * (see {@link Memory.watch}). Releasing it stops the server, then the embedding worker,
+ * active space's vectors, log a {@link Memory.report} and then one every hour, resume embedding its
+ * queue, then listen. Releasing it stops the server and the hourly report, then the embedding worker,
  * then closes the archive and lets the data directory go. Fails to build if another `serve` or a
  * `reindex` holds the data directory, or the archive cannot be opened.
  */
