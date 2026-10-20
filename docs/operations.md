@@ -142,21 +142,30 @@ A replay of production uploads against a copy of the 2026-10-19 09:15 backup, in
 | after the last 24 hours of uploads (125) | 486 | 540 | 22 | 216 | 131,072 / 85,257 / 12,136 |
 | after the first 3,206 uploads since production's last start, 7,400 chunks embedded | 1,247 | 1,623 | 21 | 272 | 170,136 / 85,180 / 4,831 |
 
-The table above measures the build before #54. With #54 the matrix is allocated at the loaded vector count, grows by a quarter during ingest, and gives a removed row's slot to the next added row. The same method and the same earlier report, in MB, run on 2026-10-19 with both builds side by side on separate 4-CPU sets against the same backup, with the production log through 18:30 UTC:
+The table above measures the build before #54. With #54 the matrix is allocated once at load with room for the vector count plus a tenth (at least 1,024 rows), each vector's bytes are copied once, a full matrix grows by a quarter (at least 1,024 rows), and a removed row's slot goes to the next added row.
 
-| point | build | RSS | `RssAnon` | `VmHWM` | JSC extra memory | matrix capacity / live / removed |
-| --- | --- | --- | --- | --- | --- | --- |
-| ready, model loaded | before | 391 | 327 | 439 | 214 | 131,072 / 85,257 / 0 |
-| | #54 | 390 | 326 | 391 | 143 | 85,257 / 85,257 / 0 |
-| after replaying the last 24 hours of uploads (152 snapshots; 141 more named sessions newer than the backup) | before | 492 | 424 | 569 | 212 | 131,072 / 85,257 / 15,292 |
-| | #54 | 430 | 392 | 502 | 142 | 85,257 / 85,257 / 0 |
-| about 630 uploads into the replay since production's last start, stopped after 12 minutes | before (628 uploads, 2,126 chunks embedded) | 1,314 | 1,294 | 1,319 | 212 | 131,072 / 84,957 / 29,682 |
-| | #54 (636 uploads, 2,085 chunks embedded) | 1,045 | 1,025 | 1,150 | 141 | 85,257 / 84,957 / 300 |
+Loading the backup's 85,257 vectors alone, without the model, in a `oven/bun:1.4.2-debian` linux/arm64 container under OrbStack pinned to 4 CPUs, on 2026-10-20. Each run resets `VmHWM` just before the load, reads it right after, then reads `VmRSS` after a forced collection and 5 seconds. MB, three runs per build:
 
-Pages of the matrix that were never written are not resident, so at ready the two builds' RSS is equal and the saving is the peak: the old load grew through the doubling copies. During ingest the old build keeps every removed row's pages resident until a compaction. In the last pair the matrices' written bytes differ by 45 MB (176 MB and 131 MB) while RSS differs by 269 MB; the rest of that gap is native memory, which this report does not attribute, from one sample of each build.
+| build | peak (`VmHWM`) | settled (`VmRSS`) | matrix capacity |
+| --- | --- | --- | --- |
+| before | 422, 445, 450 | 234, 236, 239 | 131,072 |
+| #54 | 339, 342, 346 | 235, 238, 240 | 93,783 |
+
+Pages of the matrix never written are not resident, so the settled RSS is the same; the saving at load is the peak, which the doubling copies raised by about 100 MB.
+
+During ingest the old build keeps removed rows resident until a compaction. A replay of production uploads on 2026-10-19 (method above, both builds side by side), with a first version of #54 that presized to exactly the vector count and otherwise matches it:
+
+| point | build | RSS | `VmHWM` | matrix capacity / live / removed |
+| --- | --- | --- | --- | --- |
+| after the last 24 hours of uploads (152) | before | 492 | 569 | 131,072 / 85,257 / 15,292 |
+| | #54, first version | 430 | 502 | 85,257 / 85,257 / 0 |
+| about 630 uploads since production's last start, stopped after 12 minutes | before | 1,314 | 1,319 | 131,072 / 84,957 / 29,682 |
+| | #54, first version | 1,045 | 1,150 | 85,257 / 84,957 / 300 |
+
+In the last pair the matrices' written bytes differ by 45 MB while RSS differs by 269 MB; the rest is native memory this report does not attribute, from one sample of each build.
 
 ### Causes and the issues that address them
 
-- The matrix's dead slots: before #54, removed rows kept their slots until half the matrix was dead, and capacity doubled on growth. #54 sizes the matrix to its live rows and gives a removed row's slot to the next added row; production readings with it are not yet taken.
+- The matrix's dead slots: before #54, removed rows kept their slots until half the matrix was dead, and capacity doubled on growth. #54 presizes the matrix at load, grows it by a quarter, and gives a removed row's slot to the next added row; production readings with it are not yet taken.
 - ONNX Runtime's CPU memory arena, which keeps the peak of the longest batches it has embedded. #72.
 - Upload parse residue: each snapshot's body and its parsed form, with up to four ingests at once. #71.
