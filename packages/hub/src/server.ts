@@ -68,8 +68,8 @@ function capped(max: number) {
 
 /**
  * Parse a request body as JSON, decoding gzip, without ever buffering more than the caps allow.
- * An over-cap body is rejected, never truncated. The body is parsed from the decoded stream, so
- * no copy of its text outlives the parse.
+ * An over-cap body is rejected, never truncated. The body is parsed from the decoded stream, not
+ * from a string: on Bun a value parsed from a string keeps the whole string reachable while it lives.
  */
 const readJson = Effect.fnUntraced(function* (req: Request, limits: Limits) {
   const encoding = req.headers.get("content-encoding")?.toLowerCase() ?? "identity"
@@ -161,12 +161,8 @@ export const makeHandler = Effect.fnUntraced(function* ({
         case "rewound":
           yield* Effect.logWarning("snapshot accepted as a rewind").pipe(Effect.annotateLogs(fields))
           break
-        case "unchanged":
-          // A no-op upload is routine, so it stays out of the info-level log.
-          yield* Effect.logDebug("snapshot unchanged").pipe(Effect.annotateLogs(fields))
-          break
-        case "archived":
-          yield* Effect.logInfo("snapshot archived").pipe(
+        default:
+          yield* Effect.logInfo(`snapshot ${result}`).pipe(
             Effect.annotateLogs({ ...fields, messages: snapshot.session.messages.length }),
           )
       }

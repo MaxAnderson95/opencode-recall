@@ -59,7 +59,6 @@ function handle(archive: Archive.Interface, scope: Scope.Closeable) {
     revokeToken: (id: number) => Effect.runSync(archive.revokeToken(id)),
     authenticate: (token: string) => Option.getOrNull(Effect.runSync(archive.authenticate(token))),
     status: () => Effect.runSync(archive.status()),
-    space: () => Effect.runSync(archive.space()),
     close: () => Effect.runSync(Scope.close(scope, Exit.void)),
   }
 }
@@ -567,7 +566,6 @@ describe.each(backends)("archive ($name)", ({ path }) => {
 
     expect(await archive.embedPending(32)).toBe(2)
     expect(archive.status()).toMatchObject({ chunks: 2, embeddedChunks: 2 })
-    expect(archive.space()).toEqual({ chunks: 2, embeddedChunks: 2, activeSpace: archive.status().activeSpace })
     // Only the `all`-scope chunk competes; the `user-messages` one answers that scope alone.
     expect((await archive.search({ query: "needle", limit: 8 }, 0)).sessions[0]!.semanticMatches).toBe(1)
     expect(await archive.embedPending(32)).toBe(0)

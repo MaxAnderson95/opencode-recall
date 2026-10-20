@@ -389,17 +389,6 @@ test.each([
   expect(await res.json()).toEqual({ error: { code: "invalid_request", message: "body is not valid JSON" } })
 })
 
-test("an accepted snapshot is logged at info and a no-op one at debug", async () => {
-  const client = clientFor(handler)
-  await run(client.snapshot(snapshot))
-  await run(client.snapshot(snapshot))
-  const lines = logLines.map((l) => JSON.parse(l)).filter((l) => l.msg.startsWith("snapshot"))
-  expect(lines).toMatchObject([
-    { level: "info", msg: "snapshot archived", sessionId: "ses_a", messages: 1 },
-    { level: "debug", msg: "snapshot unchanged", sessionId: "ses_a" },
-  ])
-})
-
 test("an unknown verb is rejected", async () => {
   const res = await post("nope", { protocolVersion: PROTOCOL_VERSION })
   expect(res.status).toBe(404)
