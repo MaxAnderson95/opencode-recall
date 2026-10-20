@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
 import { Database } from "bun:sqlite"
-import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs"
+import { chmodSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { PROTOCOL_VERSION, makeClient, type ErrorBody, type ErrorCode } from "@opencode-recall/protocol"
@@ -473,6 +473,12 @@ test("the config file is read again only when its mtime or size changes, so an e
   expect(await token()).toBe("bbbb")
   write("longer", stamped)
   expect(await token()).toBe("longer")
+  // A file that cannot be read is read again once it can, though chmod changes neither mtime nor size.
+  write("unreadable", stamped)
+  chmodSync(configFile, 0o000)
+  await expect(token()).rejects.toThrow()
+  chmodSync(configFile, 0o600)
+  expect(await token()).toBe("unreadable")
   rmSync(configFile)
   expect(await token()).toBeUndefined()
   await config.dispose()

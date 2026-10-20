@@ -49,15 +49,24 @@ export const filePath = optional("XDG_CONFIG_HOME").pipe(
 /** A read of the decoded file. */
 type Read = Effect.Effect<typeof File.Type, Invalid>
 
-const readFile = Effect.fnUntraced(function* (path: string) {
-  const file = Bun.file(path)
-  const json = (yield* Effect.tryPromise({ try: () => file.exists(), catch: invalid }))
-    ? yield* Effect.tryPromise({ try: () => file.json(), catch: invalid })
-    : {}
+const isMissing = (e: unknown) => e instanceof Error && "code" in e && e.code === "ENOENT"
+
+/** The file's text, or `undefined` when there is no file. */
+const readText = (path: string) =>
+  Effect.tryPromise({
+    try: () =>
+      Bun.file(path)
+        .text()
+        .catch((e) => (isMissing(e) ? undefined : Promise.reject(e))),
+    catch: invalid,
+  })
+
+const parse = Effect.fnUntraced(function* (text: string | undefined) {
+  const json = text === undefined ? {} : yield* Effect.try({ try: () => JSON.parse(text), catch: invalid })
   return yield* Schema.decodeUnknownEffect(File)(json).pipe(Effect.mapError(invalid))
 })
 
-const isMissing = (e: unknown) => e instanceof Error && "code" in e && e.code === "ENOENT"
+const readFile = (path: string) => Effect.flatMap(readText(path), parse)
 
 /** What identifies one version of the file: its mtime and size, or that it is missing. */
 const stamp = (path: string) =>
@@ -70,12 +79,19 @@ const stamp = (path: string) =>
     catch: invalid,
   })
 
-/** Reads the file at `path` again only when its stamp changes, keeping a read that failed as well as one that succeeded. */
+/**
+ * Reads and decodes the file at `path` again only when its stamp changes. Content that does not
+ * decode is kept like content that does, since only an edit can change it; a failed read of the
+ * file is not, since repairing it, such as with `chmod`, changes neither mtime nor size.
+ */
 const cachedRead = (path: string): Read => {
   let cached: { stamp: string; read: Exit.Exit<typeof File.Type, Invalid> } | undefined
   return Effect.gen(function* () {
     const current = yield* stamp(path)
-    if (cached?.stamp !== current) cached = { stamp: current, read: yield* Effect.exit(readFile(path)) }
+    if (cached?.stamp !== current) {
+      const text = yield* readText(path)
+      cached = { stamp: current, read: yield* Effect.exit(parse(text)) }
+    }
     return yield* cached.read
   })
 }
