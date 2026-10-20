@@ -23,6 +23,28 @@ import { SEGMENTED, migrations } from "./migrations.ts"
 
 /** The first schema version with vector spaces. */
 const SPACES = 7
+/** The first schema version whose vectors are a rowid table. */
+const ROWID_VECTORS = 12
+/** The first schema version whose FTS index is contentless-delete. */
+const CONTENTLESS_FTS = 13
+
+/** An in-memory database at the schema the last release before `version` left. */
+function migratedBefore(version: number): Database {
+  const db = new Database(":memory:")
+  for (const sql of migrations.slice(0, version - 1)) db.run(sql)
+  return db
+}
+const schema = (db: Database) => db.query("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name").all()
+const ddl = (db: Database, name: string) => (db.query("SELECT sql FROM sqlite_master WHERE name = ?").get(name) as { sql: string }).sql
+
+/** Put back the external-content FTS index of the releases before {@link CONTENTLESS_FTS}, built from the view. */
+function restoreExternalFts(db: Database) {
+  const previous = migratedBefore(CONTENTLESS_FTS)
+  db.run("DROP TABLE fts")
+  db.run(ddl(previous, "fts"))
+  db.run("INSERT INTO fts (fts) VALUES ('rebuild')")
+  previous.close()
+}
 
 const dirs: string[] = []
 const scopes: Scope.Closeable[] = []
@@ -1107,9 +1129,14 @@ describe("archive (file-backed only)", () => {
     archive.close()
 
     const db = new Database(path)
-    // Rank 1 compares the index against the content view, not just its own structure.
+    // A contentless index has no content to compare against, so this checks its structure alone;
+    // the rowids and matches below check what it holds.
     db.run("INSERT INTO fts (fts, rank) VALUES ('integrity-check', 1)")
     expect(db.query("SELECT count(*) AS n FROM segments").get()).toEqual({ n: 1 })
+    expect(db.query("SELECT rowid FROM fts ORDER BY rowid").values()).toEqual(db.query("SELECT id FROM segments ORDER BY id").values())
+    const matches = (word: string) => db.query("SELECT rowid FROM fts WHERE fts MATCH ?").values(word)
+    expect(matches("four")).toHaveLength(1)
+    for (const gone of ["two", "three", "five"]) expect(matches(gone)).toEqual([])
     db.close()
   })
 
@@ -1275,32 +1302,64 @@ describe("archive (file-backed only)", () => {
     const results = await Promise.all(queries.map(async (q) => (await first.search(q, 0)).sessions))
     first.close()
 
-    const schema = (db: Database) => db.query("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name").all()
-    const previous = new Database(":memory:")
-    for (const sql of migrations.slice(0, SCHEMA_VERSION - 1)) previous.run(sql)
+    const previous = migratedBefore(ROWID_VECTORS)
     const current = new Database(":memory:")
     for (const sql of migrations) current.run(sql)
-    const ddl = (name: string) => (previous.query("SELECT sql FROM sqlite_master WHERE name = ?").get(name) as { sql: string }).sql
 
-    // Put the vectors back in the previous layout, so the file is exactly what the last release left.
+    // Put the vectors and the FTS index back in the previous layout, so the file is exactly what
+    // the last release before rowid vectors left.
     const db = new Database(path)
     db.run("ALTER TABLE vectors RENAME TO vectors_current")
-    db.run(ddl("vectors"))
-    db.run(ddl("vectors_chunk_space_idx"))
+    db.run(ddl(previous, "vectors"))
+    db.run(ddl(previous, "vectors_chunk_space_idx"))
     db.run("INSERT INTO vectors SELECT chunk_id, space_id, embedding FROM vectors_current")
     db.run("DROP TABLE vectors_current")
-    db.run(`PRAGMA user_version = ${SCHEMA_VERSION - 1}`)
+    restoreExternalFts(db)
+    db.run(`PRAGMA user_version = ${ROWID_VECTORS - 1}`)
     expect(schema(db)).toEqual(schema(previous))
     const stored = () => db.query("SELECT chunk_id, space_id, embedding FROM vectors ORDER BY chunk_id, space_id").all()
     const before = stored()
     expect(before).toHaveLength(24)
 
     const archive = open(path, embedder)
-    expect(archive.migration).toEqual({ from: SCHEMA_VERSION - 1, to: SCHEMA_VERSION })
+    expect(archive.migration).toEqual({ from: ROWID_VECTORS - 1, to: SCHEMA_VERSION })
     expect(schema(db)).toEqual(schema(current))
     expect(stored()).toEqual(before)
     for (const [i, q] of queries.entries()) expect((await archive.search(q, 0)).sessions).toEqual(results[i]!)
     for (const handle of [db, previous, current]) handle.close()
+  })
+
+  test("the FTS index rebuilt as contentless-delete answers lexical searches as the external-content one did", async () => {
+    const path = tempPath()
+    const first = open(path)
+    const laptop = sourceOf(first)
+    first.putSnapshot(session("ses_a", ["deploy the gateway", "the gateway-api route failed on v1.2", "rollback plan"]), laptop)
+    first.putSnapshot(session("ses_b", ["gateway timeout during deploy", "retry the deploy with kyverno off"]), laptop)
+    first.putSnapshot(session("ses_c", ["kyverno policy notes"]), laptop)
+    first.putSnapshot(session("ses_c", ["kyverno policy and gateway-api notes", "v1.2 upgrade"], { revision: 5, lastActivity: 50 }), laptop)
+    first.putSnapshot(session("ses_d", ["nothing relevant here"]), laptop)
+    first.close()
+
+    // "rollback timeout" matches no one segment, so it takes the OR fallback.
+    const queries = ["gateway", "deploy", "deploy gateway", "rollback timeout", "gateway-api", "v1.2", "kyverno policy"]
+    const db = new Database(path)
+    restoreExternalFts(db)
+    const external = open(path)
+    expect(external.migration).toEqual({ from: SCHEMA_VERSION, to: SCHEMA_VERSION })
+    const before = await Promise.all(queries.map((q) => search(external, q)))
+    external.close()
+    expect(before.every((sessions) => sessions.length > 0)).toBe(true)
+    expect(ids(before[queries.indexOf("rollback timeout")]!)).toEqual(["ses_a", "ses_b"])
+
+    db.run(`PRAGMA user_version = ${CONTENTLESS_FTS - 1}`)
+    const previous = migratedBefore(CONTENTLESS_FTS)
+    expect(schema(db)).toEqual(schema(previous))
+    const archive = open(path)
+    expect(archive.migration).toEqual({ from: CONTENTLESS_FTS - 1, to: SCHEMA_VERSION })
+    for (const [i, q] of queries.entries()) expect(await search(archive, q)).toEqual(before[i]!)
+    expect(db.query("SELECT v FROM fts_config WHERE k = 'deletemerge'").get()).toEqual({ v: 50 })
+    expect(db.query("SELECT rowid FROM fts ORDER BY rowid").values()).toEqual(db.query("SELECT id FROM segments ORDER BY id").values())
+    for (const handle of [db, previous]) handle.close()
   })
 
   test("reopening an up-to-date archive applies no migrations and keeps its data", async () => {
