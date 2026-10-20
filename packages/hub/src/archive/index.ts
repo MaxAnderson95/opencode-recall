@@ -275,9 +275,14 @@ export const SOURCE_COUNTS = `SELECT coalesce(src.name, '') AS source, count(*) 
          WHERE m.session_id = s.id)), 0) AS searchable,
        coalesce(sum(EXISTS (SELECT 1 FROM chunks c WHERE c.session_id = s.id AND c.chunk_set_id = $setId)
          AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.session_id = s.id AND c.chunk_set_id = $setId
-           AND NOT EXISTS (SELECT 1 FROM vectors v INDEXED BY vectors_chunk_space_idx WHERE v.chunk_id = c.id AND v.space_id = $spaceId))), 0) AS embedded
+           AND NOT EXISTS (SELECT 1 FROM vectors v WHERE v.chunk_id = c.id AND v.space_id = $spaceId))), 0) AS embedded
      FROM sessions s LEFT JOIN sources src ON src.id = s.source_id
      GROUP BY s.source_id ORDER BY source`
+
+/** Every vector of space `?` with its chunk's provenance, in chunk order. */
+export const SPACE_VECTORS = `SELECT c.id AS chunkId, c.session_id AS sessionId, c.message_id AS messageId, c.time_created AS time, c.scope,
+       v.embedding
+     FROM vectors v JOIN chunks c ON c.id = v.chunk_id WHERE v.space_id = ? ORDER BY v.chunk_id`
 
 /** At most this many characters (UTF-16 code units) per FTS row. */
 const SEGMENT_CHARS = 8_000
@@ -507,15 +512,11 @@ function bind(
     `SELECT c.id AS chunkId, c.session_id AS sessionId, c.message_id AS messageId, c.time_created AS time, c.scope, c.text
      FROM chunks c
      WHERE c.chunk_set_id = ? AND c.id >= ?
-       AND NOT EXISTS (SELECT 1 FROM vectors v INDEXED BY vectors_chunk_space_idx WHERE v.chunk_id = c.id AND v.space_id = ?)
+       AND NOT EXISTS (SELECT 1 FROM vectors v WHERE v.chunk_id = c.id AND v.space_id = ?)
      ORDER BY c.id LIMIT ?`,
   )
   const selectLastChunkId = db.prepare("SELECT coalesce(max(id), 0) AS id FROM chunks WHERE chunk_set_id = ?")
-  const selectSpaceVectors = db.prepare(
-    `SELECT c.id AS chunkId, c.session_id AS sessionId, c.message_id AS messageId, c.time_created AS time, c.scope,
-       v.embedding
-     FROM vectors v JOIN chunks c ON c.id = v.chunk_id WHERE v.space_id = ? ORDER BY c.id`,
-  )
+  const selectSpaceVectors = db.prepare(SPACE_VECTORS)
   const selectChunkText = db.prepare("SELECT text FROM chunks WHERE id = ?")
   const countChunks = db.prepare("SELECT count(*) AS n FROM chunks WHERE chunk_set_id = ?")
   const countVectors = db.prepare("SELECT count(*) AS n FROM vectors WHERE space_id = ?")
@@ -572,7 +573,7 @@ function bind(
 
   const countPending = db.prepare(
     `SELECT count(*) AS n FROM chunks c
-     WHERE c.chunk_set_id = ? AND NOT EXISTS (SELECT 1 FROM vectors v INDEXED BY vectors_chunk_space_idx WHERE v.chunk_id = c.id AND v.space_id = ?)`,
+     WHERE c.chunk_set_id = ? AND NOT EXISTS (SELECT 1 FROM vectors v WHERE v.chunk_id = c.id AND v.space_id = ?)`,
   )
   const countInactiveChunks = db.prepare(
     `SELECT count(*) AS n FROM chunks WHERE chunk_set_id IN

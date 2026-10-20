@@ -18,7 +18,7 @@ import { Effect, Exit, Option, Scope, type Types } from "effect"
 import { Embedder } from "../embedder.ts"
 import { fakeEmbedder } from "../fake-embedder.ts"
 import { DEFAULT_CHUNKING, type ChunkParams } from "./chunks.ts"
-import { Archive, SCHEMA_VERSION, SOURCE_COUNTS } from "./index.ts"
+import { Archive, SCHEMA_VERSION, SOURCE_COUNTS, SPACE_VECTORS } from "./index.ts"
 import { SEGMENTED, migrations } from "./migrations.ts"
 
 /** The first schema version with vector spaces. */
@@ -969,9 +969,20 @@ test("per-source status finds each session's chunks through an index on session 
     "SEARCH c USING COVERING INDEX chunks_session_set_idx (session_id=? AND chunk_set_id=?)",
     "SEARCH c USING COVERING INDEX chunks_session_set_idx (session_id=? AND chunk_set_id=?)",
   ])
-  // The primary key carries each embedding inline; probing it reads a page per chunk.
+  // The table's leaves carry the embeddings; probing them reads a page per two chunks.
   expect(plan.map((row) => row.detail).filter((detail) => /\bv\b/.test(detail))).toEqual([
-    "SEARCH v USING COVERING INDEX vectors_chunk_space_idx (chunk_id=? AND space_id=?)",
+    "SEARCH v USING COVERING INDEX sqlite_autoindex_vectors_1 (chunk_id=? AND space_id=?)",
+  ])
+})
+
+test("loading a space's vectors walks the unique index in chunk order, never sorting the embeddings", () => {
+  const db = new Database(":memory:")
+  for (const sql of migrations) db.run(sql)
+  const plan = db.query(`EXPLAIN QUERY PLAN ${SPACE_VECTORS}`).all(1) as { detail: string }[]
+  db.close()
+  expect(plan.map((row) => row.detail)).toEqual([
+    "SCAN v USING INDEX sqlite_autoindex_vectors_1",
+    "SEARCH c USING INTEGER PRIMARY KEY (rowid=?)",
   ])
 })
 
@@ -1250,6 +1261,46 @@ describe("archive (file-backed only)", () => {
     await archive.embedPending(32)
     const { sessions } = await archive.search({ query: "needle", limit: 8, mode: "semantic" }, 0)
     expect(sessions[0]!.hits[0]!.snippet).toBe("USER: legacy «needle»")
+  })
+
+  test("vectors stored WITHOUT ROWID migrate with the same bytes, keys, and semantic results", async () => {
+    const embedder: Embedder.Interface = { ...fakeEmbedder(), embed: (texts) => Effect.succeed(texts.map(spread)) }
+    const path = tempPath()
+    const first = open(path, embedder)
+    const laptop = sourceOf(first)
+    for (const id of ["ses_a", "ses_b", "ses_c", "ses_d"])
+      first.putSnapshot(session(id, Array.from({ length: 6 }, (_, i) => `${id} message ${i}`)), laptop)
+    while (await first.embedPending(64));
+    const queries = ["ses_b message 3", "message 5", "ses_d"].map((query) => ({ query, limit: 25, mode: "semantic" }) as const)
+    const results = await Promise.all(queries.map(async (q) => (await first.search(q, 0)).sessions))
+    first.close()
+
+    const schema = (db: Database) => db.query("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name").all()
+    const previous = new Database(":memory:")
+    for (const sql of migrations.slice(0, SCHEMA_VERSION - 1)) previous.run(sql)
+    const current = new Database(":memory:")
+    for (const sql of migrations) current.run(sql)
+    const ddl = (name: string) => (previous.query("SELECT sql FROM sqlite_master WHERE name = ?").get(name) as { sql: string }).sql
+
+    // Put the vectors back in the previous layout, so the file is exactly what the last release left.
+    const db = new Database(path)
+    db.run("ALTER TABLE vectors RENAME TO vectors_current")
+    db.run(ddl("vectors"))
+    db.run(ddl("vectors_chunk_space_idx"))
+    db.run("INSERT INTO vectors SELECT chunk_id, space_id, embedding FROM vectors_current")
+    db.run("DROP TABLE vectors_current")
+    db.run(`PRAGMA user_version = ${SCHEMA_VERSION - 1}`)
+    expect(schema(db)).toEqual(schema(previous))
+    const stored = () => db.query("SELECT chunk_id, space_id, embedding FROM vectors ORDER BY chunk_id, space_id").all()
+    const before = stored()
+    expect(before).toHaveLength(24)
+
+    const archive = open(path, embedder)
+    expect(archive.migration).toEqual({ from: SCHEMA_VERSION - 1, to: SCHEMA_VERSION })
+    expect(schema(db)).toEqual(schema(current))
+    expect(stored()).toEqual(before)
+    for (const [i, q] of queries.entries()) expect((await archive.search(q, 0)).sessions).toEqual(results[i]!)
+    for (const handle of [db, previous, current]) handle.close()
   })
 
   test("reopening an up-to-date archive applies no migrations and keeps its data", async () => {

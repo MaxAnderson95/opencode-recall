@@ -89,6 +89,20 @@ Recovery from a failed migration:
 
 A hub never runs against an archive a newer binary migrated: it logs `archive schema version N is newer than this binary supports` and exits 1. So rolling back past a migration that succeeded means restoring the backup taken before the upgrade, and then accepting the restore's consequences above.
 
+### Upgrading to schema version 12
+
+Schema version 12 rebuilds the `vectors` table as a rowid table, so each embedding sits inline on its page instead of spilling into an overflow page (#60). The same release rebuilds the FTS index (#61). Both run before the listener opens, in the one startup transaction, and hold the archive's write lock until they finish: about 40 s locally for the two together, and likely 1 to 5 minutes on the production disk. Until then neither probe answers, searches fail, and the plugins retry their uploads. Take the backup first, as above.
+
+The vectors rebuild writes the new table before it drops the old one. On a synthetic archive of 85,000 vectors the file grew by 176 MB and the WAL peaked at 177 MB, so leave at least 360 MB free beside the archive and its backup for that step alone.
+
+Afterwards the old table's pages are free pages inside `archive.db`: about 400 MB at 85,000 vectors, more together with #61. `PRAGMA freelist_count` counts them in 4 KiB pages. SQLite reuses them as the archive grows, so the file does not shrink and nothing needs to be done. `VACUUM` is optional: it returns the free pages to the filesystem, but in WAL mode it writes the whole database through the WAL, so run it only with `serve` stopped and with free disk of about twice the archive's size:
+
+```sh
+docker stop recall-hub
+docker run --rm -v /srv/recall:/data --entrypoint sqlite3 ghcr.io/maxanderson95/opencode-recall-hub:<tag> /data/archive.db VACUUM
+docker start recall-hub
+```
+
 ## Memory
 
 SPEC §7 budgets about 1 GB: about 280 MB for ONNX Runtime and 115 MB for the vector matrix. The production hub is over it, and ONNX Runtime takes more than that budget allows once it has embedded long inputs (below).

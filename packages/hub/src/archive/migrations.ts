@@ -179,6 +179,23 @@ export const migrations: readonly string[] = [
   `
   CREATE INDEX vectors_chunk_space_idx ON vectors(chunk_id, space_id);
   `,
+  // A WITHOUT ROWID table is an index b-tree, which keeps about 1,002 bytes of a cell inline on a
+  // 4 KiB page, so every 1,536-byte embedding spilled into an overflow page of its own. A rowid
+  // table holds two embeddings inline per page, and its unique index on (chunk_id, space_id) is
+  // narrow and covering, so the planner probes it for "has this chunk a vector" unprompted.
+  // Dropping the old table drops vectors_chunk_space_idx with it.
+  `
+  CREATE TABLE vectors_new (
+    chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+    space_id INTEGER NOT NULL REFERENCES vector_spaces(id) ON DELETE CASCADE,
+    embedding BLOB NOT NULL,
+    UNIQUE (chunk_id, space_id)
+  );
+  INSERT INTO vectors_new (chunk_id, space_id, embedding)
+    SELECT chunk_id, space_id, embedding FROM vectors ORDER BY chunk_id;
+  DROP TABLE vectors;
+  ALTER TABLE vectors_new RENAME TO vectors;
+  `,
 ]
 
 /** The first schema version with segments; parts archived before it are segmented on migration. */
