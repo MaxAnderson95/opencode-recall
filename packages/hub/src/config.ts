@@ -25,6 +25,8 @@ export const Settings = Schema.Struct({
   /** The model this hub embeds with. Changing it (or `chunking`) takes effect through `reindex`. */
   embedding: ModelChoice,
   chunking: Chunking,
+  /** ONNX Runtime's intra-op threads; its own default when unset. Not part of the recipe. */
+  embedThreads: Schema.optionalKey(PositiveInt),
 })
 export interface Settings extends Schema.Schema.Type<typeof Settings> {}
 
@@ -50,6 +52,7 @@ const FileSettings = Schema.Struct({
       turnChars: Schema.optionalKey(Schema.Number),
     }),
   ),
+  embedThreads: Schema.optionalKey(Schema.Number),
 })
 
 export const DEFAULTS: Settings = {
@@ -81,6 +84,7 @@ export const load: Effect.Effect<Settings, Invalid> = Effect.gen(function* () {
     modelsDir: fromEnv("OPENCODE_RECALL_MODELS_DIR"),
     listen: fromEnv("OPENCODE_RECALL_LISTEN"),
     logLevel: fromEnv("OPENCODE_RECALL_LOG_LEVEL"),
+    embedThreads: intFromEnv("OPENCODE_RECALL_EMBED_THREADS"),
     embedding: Config.all({
       model: fromEnv("OPENCODE_RECALL_EMBEDDING_MODEL"),
       revision: fromEnv("OPENCODE_RECALL_EMBEDDING_REVISION"),

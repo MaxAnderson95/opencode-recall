@@ -70,7 +70,7 @@ export const run = Effect.fn("Reindex.run")(
 
 /** The configured model, which a reindex builds with whatever the active space holds. */
 const configuredEmbedder = Layer.unwrap(
-  Effect.map(HubConfig.Service, (config) => Embedder.onnx(Hub.modelsDir(config), config.embedding)),
+  Effect.map(HubConfig.Service, (config) => Embedder.onnx(Hub.modelsDir(config), config.embedding, config.embedThreads)),
 )
 
 /**

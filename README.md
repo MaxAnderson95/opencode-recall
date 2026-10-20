@@ -165,6 +165,9 @@ The hub reads `OPENCODE_RECALL_*` environment variables, or the JSON file named 
 | `OPENCODE_RECALL_LISTEN` | `0.0.0.0:7438` in the image | Listen address |
 | `OPENCODE_RECALL_LOG_LEVEL` | `info` | Log level for the JSON logs on stdout |
 | `OPENCODE_RECALL_MODELS_DIR` | bundled model in the image | Where embedding models are read from or downloaded to |
+| `OPENCODE_RECALL_EMBED_THREADS` | ONNX Runtime's default, one per CPU it sees | Threads per embedding inference. Set it to the CPU limit of a CPU-limited container; ONNX Runtime does not see the limit. Needs no reindex. |
+
+The hub runs ONNX Runtime with its CPU memory arena off, which saved about 400 MB of resident memory for about 5% of embedding throughput in a local measurement; there is no setting for it. See [docs/operations.md](docs/operations.md#onnx-runtimes-cpu-memory-arena).
 
 The embedding model and chunking are configurable too; changing them requires a reindex. Both are covered in [docs/operations.md](docs/operations.md).
 

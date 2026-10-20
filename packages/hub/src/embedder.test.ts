@@ -16,6 +16,19 @@ test("a model wider than the configured dimensions fails instead of shifting vec
   expect(result._tag === "Failure" && result.failure.message).toContain("returned a [2, 4] tensor for 2 texts; expected [2, 2]")
 })
 
+test("the model loads with the CPU memory arena off and ONNX Runtime's threads unless a count is set", () => {
+  expect(Embedder.pipelineOptions(Embedder.BGE_SMALL, undefined)).toEqual({
+    dtype: "q8",
+    revision: Embedder.BGE_SMALL.revision,
+    session_options: { enableCpuMemArena: false },
+  })
+  expect(Embedder.pipelineOptions(Embedder.BGE_SMALL, 2).session_options).toEqual({
+    enableCpuMemArena: false,
+    intraOpNumThreads: 2,
+    interOpNumThreads: 1,
+  })
+})
+
 test("a tensor of another row count or element type fails", async () => {
   expect((await split(new Float32Array(6), [3, 2], 2, 2))._tag).toBe("Failure")
   expect((await split(new Float64Array(4), [2, 2], 2, 2))._tag).toBe("Failure")

@@ -52,7 +52,7 @@ export const dataEmbedder = Layer.unwrap(
         }),
       ),
     )
-    return Embedder.onnx(modelsDir(config), serving ?? config.embedding)
+    return Embedder.onnx(modelsDir(config), serving ?? config.embedding, config.embedThreads)
   }),
 )
 
@@ -79,6 +79,13 @@ const listen = Layer.effect(
     if (reclaimed)
       yield* Effect.logWarning("reclaimed an interrupted reindex").pipe(Effect.annotateLogs({ chunks: reclaimed }))
     yield* Effect.logInfo("vector space").pipe(Effect.annotateLogs({ recipe: activeSpace.recipe, chunks, embeddedChunks }))
+    const { session_options } = Embedder.pipelineOptions(config.embedding, config.embedThreads)
+    yield* Effect.logInfo("embedding session").pipe(
+      Effect.annotateLogs({
+        cpuMemArena: session_options.enableCpuMemArena,
+        threads: session_options.intraOpNumThreads ?? "runtime default",
+      }),
+    )
     if (!activeSpace.matchesConfigured)
       yield* Effect.logError(
         "the configured vector space differs from the active one; serving the active one and embedding nothing into the configured one until `reindex` is run",

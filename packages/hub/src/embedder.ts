@@ -1,5 +1,5 @@
 import type { SpaceRecipe } from "@opencode-recall/protocol"
-import type { FeatureExtractionPipeline } from "@huggingface/transformers"
+import type { FeatureExtractionPipeline, PretrainedModelOptions } from "@huggingface/transformers"
 import { Context, Data, Effect, Layer, Schema, Semaphore } from "effect"
 import hub from "../package.json" with { type: "json" }
 
@@ -73,6 +73,23 @@ export const modelOf = (choice: ModelChoice) =>
 /** Texts per inference call, as the single-machine plugin measured. */
 const BATCH = 8
 
+/**
+ * What `pipeline` loads `choice` with. ONNX Runtime's CPU memory arena is off: it keeps the peak of
+ * the longest batches it has run, about 400 MB more resident memory, for about 5% more throughput
+ * (docs/operations.md). `threads` sizes the intra-op pool; unset, ONNX Runtime sizes it from the
+ * CPUs it sees, which ignores a container's CPU limit. Neither changes a vector, so neither is in
+ * the recipe.
+ */
+export const pipelineOptions = (choice: ModelChoice, threads: number | undefined) =>
+  ({
+    dtype: choice.dtype,
+    revision: choice.revision,
+    session_options: {
+      enableCpuMemArena: false,
+      ...(threads === undefined ? {} : { intraOpNumThreads: threads, interOpNumThreads: 1 }),
+    },
+  }) satisfies PretrainedModelOptions
+
 const failed = (cause: unknown) => new Failed({ message: cause instanceof Error ? cause.message : String(cause), cause })
 
 /**
@@ -95,13 +112,14 @@ export const splitRows = (tensor: { readonly data: unknown; readonly dims: reado
 /**
  * The chosen model (by default `bge-small-en-v1.5`) on ONNX Runtime, in-process. The model loads
  * on `load` or first use, from `cacheDir` or downloaded into it, and a failed load is retried on
- * the next call. Calls run one at a time.
+ * the next call. Calls run one at a time. `threads` is as in {@link pipelineOptions}.
  */
-export const onnx = (cacheDir: string, choice: ModelChoice = BGE_SMALL) =>
+export const onnx = (cacheDir: string, choice: ModelChoice = BGE_SMALL, threads?: number) =>
   Layer.effect(
     Service,
     Effect.gen(function* () {
       const model = modelOf(choice)
+      const options = pipelineOptions(choice, threads)
       const serial = yield* Semaphore.make(1)
       let loaded: FeatureExtractionPipeline | undefined
       let state: ModelState = ModelState.Loading()
@@ -114,7 +132,7 @@ export const onnx = (cacheDir: string, choice: ModelChoice = BGE_SMALL) =>
                 // Imported here so nothing that never embeds loads the native runtime.
                 const { pipeline, env } = await import("@huggingface/transformers")
                 env.cacheDir = cacheDir
-                return pipeline("feature-extraction", model.model, { dtype: model.dtype, revision: model.revision })
+                return pipeline("feature-extraction", model.model, options)
               },
               catch: failed,
             }).pipe(
