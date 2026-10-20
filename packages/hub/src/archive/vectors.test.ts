@@ -6,7 +6,7 @@ const row = (sessionId: string, chunkId: number, scope = "all"): VectorRow => ({
 const ranked = (hits: { row: VectorRow; score: number }[]) => hits.map((h) => [h.row.chunkId, h.score])
 
 test("the scan keeps the best rows by score among those accepted, best first", () => {
-  const matrix = createMatrix(2)
+  const matrix = createMatrix(2, 64)
   matrix.add(row("ses_a", 1), vector(0.6, 0.8))
   matrix.add(row("ses_a", 2), vector(1, 0))
   matrix.add(row("ses_b", 3, "user-messages"), vector(1, 0))
@@ -20,7 +20,7 @@ test("the scan keeps the best rows by score among those accepted, best first", (
 })
 
 test("equal scores rank the lower row index first, in a full scan and a session scan alike, after slots are reused", () => {
-  const matrix = createMatrix(2)
+  const matrix = createMatrix(2, 64)
   for (let i = 0; i < 3; i++) matrix.add(row("ses_old", i), vector(1, 0))
   for (let i = 3; i < 6; i++) matrix.add(row("ses_b", i), vector(1, 0))
   matrix.removeSession("ses_old")
@@ -34,7 +34,7 @@ test("equal scores rank the lower row index first, in a full scan and a session 
 })
 
 test("a session scan visits only that session's rows", () => {
-  const matrix = createMatrix(2)
+  const matrix = createMatrix(2, 64)
   for (let i = 0; i < 50; i++) matrix.add(row(`ses_${i % 5}`, i), vector(1, 0))
   const visited: string[] = []
   const hits = matrix.scan(new Float32Array([1, 0]), (r) => (visited.push(r.sessionId), true), 60, "ses_3")
