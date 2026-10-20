@@ -215,6 +215,40 @@ test("the client sends gzip-encoded bodies with Content-Encoding set", async () 
   expect(JSON.parse(new TextDecoder().decode(Bun.gunzipSync(body)))).toMatchObject({ contentHash: "hash-1" })
 })
 
+test("a large response is gzipped only for a client that accepts gzip, and a small one never is", async () => {
+  const messages = Array.from({ length: 8 }, (_, i) => ({
+    ...session.messages[0]!,
+    id: `msg_${i}`,
+    parts: [{ kind: "text" as const, text: "word ".repeat(800) }],
+  }))
+  await run(clientFor(handler).snapshot({ ...snapshot, session: { ...session, messages } }))
+  const call = (verb: string, body: object, acceptEncoding?: string) =>
+    handler(
+      new Request(`http://hub/v1/${verb}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, ...(acceptEncoding && { "accept-encoding": acceptEncoding }) },
+        body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, ...body }),
+      }),
+    )
+  const transcript = (acceptEncoding?: string) =>
+    call("transcript", { session: "ses_a", budget: 300_000, maxChars: 4_000 }, acceptEncoding)
+
+  const plain = await transcript()
+  expect(plain.headers.get("content-encoding")).toBeNull()
+  const json = await plain.text()
+  expect(json.length).toBeGreaterThanOrEqual(16_384)
+
+  const gzipped = await transcript("gzip, deflate, br, zstd")
+  expect(gzipped.headers.get("content-encoding")).toBe("gzip")
+  expect(gzipped.headers.get("vary")).toBe("accept-encoding")
+  expect(new TextDecoder().decode(Bun.gunzipSync(new Uint8Array(await gzipped.arrayBuffer())))).toBe(json)
+
+  expect((await transcript("gzip;q=0, br")).headers.get("content-encoding")).toBeNull()
+  const small = await call("status", {}, "gzip")
+  expect(small.headers.get("content-encoding")).toBeNull()
+  expect(await small.json()).toMatchObject({ sessions: 1 })
+})
+
 /** A self-signed certificate made with `openssl`, and its SHA-256 fingerprint as `AA:BB:...`. */
 function selfSigned(dir: string, name: string) {
   const [cert, key] = [join(dir, `${name}.crt`), join(dir, `${name}.key`)]

@@ -1,5 +1,7 @@
 import { isIP } from "node:net"
 import { connect, type PeerCertificate } from "node:tls"
+import { promisify } from "node:util"
+import { gzip as gzipCallback } from "node:zlib"
 import { Effect, Option, Schema } from "effect"
 
 /**
@@ -548,6 +550,8 @@ const ErrorEnvelope = Schema.Struct({
 
 const messageOf = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause))
 
+const gzip = promisify(gzipCallback)
+
 /** `fingerprint` as `AA:BB:...`, the form Node's `fingerprint256` uses, or `undefined` if it is not a SHA-256 hex digest. */
 export function normalizeFingerprint(fingerprint: string): string | undefined {
   const hex = fingerprint.replace(/[\s:]/g, "").toUpperCase()
@@ -600,9 +604,11 @@ const pinnedTls = async (url: URL, pin: string, signal: AbortSignal) => {
 
 /**
  * Typed client for the hub's `POST /v1/<verb>` API. Bodies are gzip-encoded, since Bun's `fetch`
- * never compresses a request on its own. A non-2xx answer fails with {@link HubError}; anything
- * that is not an answer fails with {@link TransportError}, including an `https` hub whose certificate
- * does not match `certSha256`. Interrupting a call aborts its request.
+ * never compresses a request on its own, and compressed off the event loop, since a snapshot can
+ * be megabytes. Responses rely on `fetch` advertising and decoding gzip itself. A non-2xx answer
+ * fails with {@link HubError}; anything that is not an answer fails with {@link TransportError},
+ * including an `https` hub whose certificate does not match `certSha256`. Interrupting a call
+ * aborts its request.
  */
 export function makeClient({ url, token, certSha256, fetch: fetcher = fetch }: ClientOptions): Client {
   const base = url.replace(/\/+$/, "")
@@ -616,7 +622,7 @@ export function makeClient({ url, token, certSha256, fetch: fetcher = fetch }: C
         fetcher(`${base}/v1/${verb}`, {
           method: "POST",
           headers: { "content-type": "application/json", "content-encoding": "gzip", authorization: `Bearer ${token}` },
-          body: Bun.gzipSync(JSON.stringify({ protocolVersion: PROTOCOL_VERSION, ...input })),
+          body: await gzip(JSON.stringify({ protocolVersion: PROTOCOL_VERSION, ...input })),
           signal,
           ...(pin && { tls: await pinnedTls(parsed, pin, signal) }),
         }),
