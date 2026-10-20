@@ -617,12 +617,17 @@ export function makeClient({ url, token, certSha256, fetch: fetcher = fetch }: C
 
   const call = Effect.fnUntraced(function* <V extends Verb>(verb: V, input: Omit<Request<V>, "protocolVersion">) {
     const transport = (cause: unknown) => new TransportError({ message: messageOf(cause), cause })
+    // Compressed in its own effect, so a call interrupted meanwhile ends before it opens a connection.
+    const gzipped = yield* Effect.tryPromise({
+      try: () => gzip(JSON.stringify({ protocolVersion: PROTOCOL_VERSION, ...input })),
+      catch: transport,
+    })
     const res = yield* Effect.tryPromise({
       try: async (signal) =>
         fetcher(`${base}/v1/${verb}`, {
           method: "POST",
           headers: { "content-type": "application/json", "content-encoding": "gzip", authorization: `Bearer ${token}` },
-          body: await gzip(JSON.stringify({ protocolVersion: PROTOCOL_VERSION, ...input })),
+          body: gzipped,
           signal,
           ...(pin && { tls: await pinnedTls(parsed, pin, signal) }),
         }),

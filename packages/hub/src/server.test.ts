@@ -2,8 +2,10 @@ import { afterEach, beforeEach, expect, test } from "bun:test"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { HubError, PROTOCOL_VERSION, makeClient, type Snapshot } from "@opencode-recall/protocol"
-import { Effect, Exit, Layer, Scope } from "effect"
+import { promisify } from "node:util"
+import { gzip } from "node:zlib"
+import { HubError, PROTOCOL_VERSION, makeClient, normalizeFingerprint, type Snapshot } from "@opencode-recall/protocol"
+import { Effect, Exit, Fiber, Layer, Scope } from "effect"
 import { Archive, SCHEMA_VERSION } from "./archive/index.ts"
 import { Embedder } from "./embedder.ts"
 import { fakeEmbedder, fakeLayer } from "./fake-embedder.ts"
@@ -281,6 +283,31 @@ test("a pinned client reaches only the hub presenting the pinned certificate, on
     realHub.stop(true)
     evilHub.stop(true)
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("a pinned call interrupted while its body compresses opens no connection to the hub", async () => {
+  let connections = 0
+  const listener = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: { open: (socket) => void (connections++, socket.end()), data: () => {} },
+  })
+  // A pin nothing has fetched yet, so a call that got past compression would open a TLS handshake.
+  const pin = normalizeFingerprint(crypto.getRandomValues(new Uint8Array(32)).toHex())
+  const client = makeClient({ url: `https://127.0.0.1:${listener.port}`, token, certSha256: pin })
+  const big = withText(crypto.getRandomValues(new Uint8Array(6 * 1024 * 1024)).toBase64())
+  try {
+    const fiber = Effect.runFork(client.snapshot(big))
+    await Bun.sleep(0)
+    await run(Fiber.interrupt(fiber))
+    expect(Exit.hasInterrupts(await run(Fiber.await(fiber)))).toBe(true)
+    // Outlast the abandoned compression, which runs on the thread pool, then let any connect land.
+    await promisify(gzip)(JSON.stringify(big))
+    await Bun.sleep(100)
+    expect(connections).toBe(0)
+  } finally {
+    listener.stop(true)
   }
 })
 
