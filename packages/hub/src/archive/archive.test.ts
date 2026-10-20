@@ -27,6 +27,8 @@ const SPACES = 7
 const ROWID_VECTORS = 12
 /** The first schema version whose FTS index is contentless-delete. */
 const CONTENTLESS_FTS = 13
+/** The first schema version with a hash per message. */
+const MESSAGE_HASHES = 14
 
 /** An in-memory database at the schema the last release before `version` left. */
 function migratedBefore(version: number): Database {
@@ -45,6 +47,9 @@ function restoreExternalFts(db: Database) {
   db.run("INSERT INTO fts (fts) VALUES ('rebuild')")
   previous.close()
 }
+
+/** Drop the message hashes the releases before {@link MESSAGE_HASHES} did not store. */
+const restoreUnhashedMessages = (db: Database) => db.run("ALTER TABLE messages DROP COLUMN hash")
 
 const dirs: string[] = []
 const scopes: Scope.Closeable[] = []
@@ -1081,6 +1086,181 @@ describe("archive (file-backed only)", () => {
     db.close()
   })
 
+  test("appending a message writes only its rows and the chunks whose text changed; the rest keep their ids", async () => {
+    const path = tempPath()
+    const archive = open(path)
+    const laptop = sourceOf(archive)
+    const grown = session("ses_a", ["first question", "first answer", "second question", "second answer"])
+    archive.putSnapshot(session("ses_a", ["first question", "first answer", "second question", "second answer"]), laptop)
+    await archive.embedPending(32)
+
+    const db = new Database(path, { readonly: true })
+    type Row = { id: number; messageId: string }
+    const rows = () => ({
+      parts: db.query("SELECT id, message_id AS messageId FROM parts ORDER BY id").all() as Row[],
+      segments: db
+        .query("SELECT s.id, p.message_id AS messageId FROM segments s JOIN parts p ON p.id = s.part_id ORDER BY s.id")
+        .all() as Row[],
+      chunks: db.query("SELECT id, message_id AS messageId, scope, text FROM chunks ORDER BY id").all() as (Row & {
+        scope: string
+        text: string
+      })[],
+      fts: db.query("SELECT rowid AS id FROM fts ORDER BY rowid").values().flat(),
+    })
+    const before = rows()
+
+    // A follow-up reply in the second turn, which re-renders that turn's `all` chunk.
+    grown.session.messages.push({ id: "ses_a_msg_4", type: "assistant", timeCreated: 14, parts: [{ kind: "text", text: "more" }] })
+    expect(archive.putSnapshot({ ...grown, revision: 5, lastActivity: 15, contentHash: "grown" }, laptop)).toBe("archived")
+    const after = rows()
+    db.close()
+
+    const added = <T extends { id: number }>(now: T[], was: T[]) => now.filter((r) => !was.some((w) => w.id === r.id))
+    expect(after.parts.slice(0, before.parts.length)).toEqual(before.parts)
+    expect(added(after.parts, before.parts).map((r) => r.messageId)).toEqual(["ses_a_msg_4"])
+    expect(after.segments.slice(0, before.segments.length)).toEqual(before.segments)
+    expect(added(after.segments, before.segments).map((r) => r.messageId)).toEqual(["ses_a_msg_4"])
+    expect(after.fts).toEqual(after.segments.map((s) => s.id))
+    // Only the second turn's `all` chunk changed text; the first turn's and both user-messages chunks keep their ids.
+    expect(added(after.chunks, before.chunks)).toEqual([
+      { id: expect.any(Number), messageId: "ses_a_msg_2", scope: "all", text: "USER: second question\nASSISTANT: second answer\nmore" },
+    ])
+    expect(added(before.chunks, after.chunks).map((c) => c.text)).toEqual(["USER: second question\nASSISTANT: second answer"])
+    expect(archive.status()).toMatchObject({ chunks: 4, embeddedChunks: 3 })
+  })
+
+  /** What a fresh ingest and a diffed one must agree on, keyed so that surrogate ids are not compared. */
+  function contents(path: string) {
+    const db = new Database(path)
+    // Throws unless the index's structure is sound.
+    db.run("INSERT INTO fts (fts, rank) VALUES ('integrity-check', 1)")
+    const ftsRowids = db.query("SELECT rowid FROM fts ORDER BY rowid").values()
+    const segmentIds = db.query("SELECT id FROM segments ORDER BY id").values()
+    const tables = {
+      sessions: db.query("SELECT * FROM sessions ORDER BY id").all(),
+      messages: db.query("SELECT id, session_id, ordinal, type, time_created, hash FROM messages ORDER BY id").all(),
+      parts: db
+        .query(
+          `SELECT message_id, ordinal, kind, text, tool_name, tool_title, status, error, searchable FROM parts
+           ORDER BY message_id, ordinal`,
+        )
+        .all(),
+      segments: db
+        .query(
+          `SELECT p.message_id, p.ordinal, s.start, s.length FROM segments s JOIN parts p ON p.id = s.part_id
+           ORDER BY p.message_id, p.ordinal, s.start`,
+        )
+        .all(),
+      chunks: db
+        .query(
+          `SELECT c.message_id, c.scope, c.window_index, c.time_created, c.hash, c.text FROM chunks c
+           JOIN chunk_sets cs ON cs.id = c.chunk_set_id JOIN vector_spaces s ON s.id = cs.space_id AND s.active = 1
+           ORDER BY c.message_id, c.scope, c.window_index`,
+        )
+        .all(),
+    }
+    db.close()
+    expect(ftsRowids).toEqual(segmentIds)
+    return tables
+  }
+
+  const searchesOf = async (archive: Handle) => {
+    const out = []
+    for (const query of ["gateway", "kyverno policy", "walrus", "rollback cleanly"])
+      for (const mode of ["lexical", "semantic", "hybrid"] as const)
+        out.push((await archive.search({ query, limit: 25, mode }, 0)).sessions)
+    return out
+  }
+
+  test("each diffed ingest leaves the archive as a fresh ingest of the same snapshot would", async () => {
+    const tool: Part = { kind: "tool", tool: "bash", title: "kubectl apply", status: "completed", text: "bash kubectl apply\ngateway configured", searchable: true }
+    let draft = session("ses_e", ["deploy the gateway", "the gateway route failed", "rollback the kyverno policy", "rolled back cleanly"])
+    draft.session.messages[1]!.parts.push(tool)
+    let position = 0
+    /** The next snapshot: `edit` applied to a copy of the last, one position later unless it keeps the position. */
+    const next = (edit: (d: Draft) => void, { samePosition = false } = {}) => {
+      draft = structuredClone(draft)
+      edit(draft)
+      if (!samePosition) position++
+      draft.revision = 10 + position
+      draft.lastActivity = 100 + position
+      draft.contentHash = JSON.stringify([draft.session, draft.extractorVersion])
+      return draft
+    }
+    const toolPart = (d: Draft) => {
+      const part = d.session.messages.flatMap((m) => m.parts).find((p) => p.kind === "tool")
+      if (part?.kind !== "tool") throw new Error("expected a tool part")
+      return part
+    }
+    const steps: [string, (d: Draft) => void, { samePosition?: boolean }?][] = [
+      ["append", (d) => void d.session.messages.push({ id: "ses_e_msg_9", type: "user", timeCreated: 50, parts: [{ kind: "text", text: "what about the walrus cluster" }] })],
+      ["change a middle message", (d) => void (d.session.messages[1]!.parts[0]!.text = "the gateway route recovered")],
+      ["remove a middle message", (d) => void d.session.messages.splice(2, 1)],
+      ["rename the session", (d) => void (d.session.title = "gateway incident")],
+      ["toggle a tool part's searchable", (d) => void (toolPart(d).searchable = false)],
+      ["set parentId", (d) => void (d.session.parentId = "ses_parent")],
+      ["clear parentId", (d) => void (d.session.parentId = null)],
+      ["re-extract at a higher extractorVersion", (d) => {
+        d.extractorVersion = 2
+        d.session.messages[0]!.parts[0]!.text = "please deploy the gateway again now"
+      }, { samePosition: true }],
+    ]
+
+    const embedder: Embedder.Interface = { ...fakeEmbedder(), embed: (texts) => Effect.succeed(texts.map(spread)) }
+    const path = tempPath()
+    const diffed = open(path, embedder)
+    const laptop = sourceOf(diffed)
+    expect(diffed.putSnapshot(next(() => {}), laptop)).toBe("archived")
+    const summary = { provider: "p", model: "m", focus: "", recipe: 1, sessionId: "ses_e", summary: "s", omitted: 0, clipped: 0 }
+    for (const [name, edit, options] of steps) {
+      expect(diffed.putSummary({ ...summary, contentHash: draft.contentHash })).toBe("stored")
+      const snapshot = next(edit, options)
+      expect([name, diffed.putSnapshot(snapshot, laptop)]).toEqual([name, "archived"])
+      expect([name, diffed.status().summaries]).toEqual([name, 0])
+      const freshPath = tempPath()
+      const fresh = open(freshPath, embedder)
+      fresh.putSnapshot(snapshot, sourceOf(fresh))
+      while (await diffed.embedPending(64));
+      while (await fresh.embedPending(64));
+      expect([name, contents(path)]).toEqual([name, contents(freshPath)])
+      expect([name, await searchesOf(diffed)]).toEqual([name, await searchesOf(fresh)])
+      fresh.close()
+    }
+  })
+
+  test("an archive from before message hashes migrates, and its held sessions take a diffed snapshot", async () => {
+    const embedder: Embedder.Interface = { ...fakeEmbedder(), embed: (texts) => Effect.succeed(texts.map(spread)) }
+    const path = tempPath()
+    const first = open(path, embedder)
+    first.putSnapshot(session("ses_a", ["deploy the gateway", "done"]), sourceOf(first))
+    await first.embedPending(32)
+    first.close()
+
+    const db = new Database(path)
+    restoreUnhashedMessages(db)
+    db.run(`PRAGMA user_version = ${MESSAGE_HASHES - 1}`)
+    const previous = migratedBefore(MESSAGE_HASHES)
+    expect(schema(db)).toEqual(schema(previous))
+    previous.close()
+    db.close()
+
+    const archive = open(path, embedder)
+    expect(archive.migration).toEqual({ from: MESSAGE_HASHES - 1, to: SCHEMA_VERSION })
+    expect(contents(path).messages.map((m) => (m as { hash: string }).hash)).toEqual(["", ""])
+    const grown = session("ses_a", ["deploy the gateway", "done", "walrus next"])
+    expect(archive.putSnapshot(grown, sourceOf(archive))).toBe("archived")
+    // The unchanged turn's chunks render again with the same text, so their vectors carry over.
+    expect(archive.status()).toMatchObject({ chunks: 4, embeddedChunks: 2 })
+    while (await archive.embedPending(64));
+
+    const freshPath = tempPath()
+    const fresh = open(freshPath, embedder)
+    fresh.putSnapshot(grown, sourceOf(fresh))
+    while (await fresh.embedPending(64));
+    expect(contents(path)).toEqual(contents(freshPath))
+    expect(await searchesOf(archive)).toEqual(await searchesOf(fresh))
+  })
+
   test("tool parts keep their name, title, status, error text, and searchability", async () => {
     const path = tempPath()
     const archive = open(path)
@@ -1315,6 +1495,7 @@ describe("archive (file-backed only)", () => {
     db.run("INSERT INTO vectors SELECT chunk_id, space_id, embedding FROM vectors_current")
     db.run("DROP TABLE vectors_current")
     restoreExternalFts(db)
+    restoreUnhashedMessages(db)
     db.run(`PRAGMA user_version = ${ROWID_VECTORS - 1}`)
     expect(schema(db)).toEqual(schema(previous))
     const stored = () => db.query("SELECT chunk_id, space_id, embedding FROM vectors ORDER BY chunk_id, space_id").all()
@@ -1351,6 +1532,7 @@ describe("archive (file-backed only)", () => {
     expect(before.every((sessions) => sessions.length > 0)).toBe(true)
     expect(ids(before[queries.indexOf("rollback timeout")]!)).toEqual(["ses_a", "ses_b"])
 
+    restoreUnhashedMessages(db)
     db.run(`PRAGMA user_version = ${CONTENTLESS_FTS - 1}`)
     const previous = migratedBefore(CONTENTLESS_FTS)
     expect(schema(db)).toEqual(schema(previous))

@@ -81,7 +81,7 @@ Shape, not literal DDL.
 
 Keying on the id alone means a database copied between machines, or a rebuilt host, updates one row rather than producing a duplicate conversation in results.
 
-**`messages`**: id, session, role, type, time, ordering.
+**`messages`**: id, session, role, type, time, ordering, and a hash of the message's content. An accepted snapshot keeps each held message whose hash it repeats, with its parts, segments, FTS rows, and chunks, and replaces only the rest.
 
 **`parts`**: one row per display-relevant part: message, kind (`text` | `reasoning` | `tool`), `tool_name`, `tool_title`, `status`, error text where a tool failed, and the canonical extracted text.
 
@@ -91,7 +91,7 @@ Searchability is a property, not a condition on existence. Parts excluded from s
 
 **`fts`**: FTS5 **contentless-delete** index (`content=''`, `contentless_delete=1`, SQLite 3.43 or later) whose rowids are segment ids. It stores postings and per-row token counts for BM25, never text. The text lives only in `parts`, and a **view**, `segment_text`, reads each segment as `CAST(substr(CAST(parts.text AS BLOB), start + 1, length) AS TEXT)` over `segments` joined to `parts`: segments are indexed from it, and snippets read it. `deletemerge` is 50, so merges drop deleted rows' tombstones as the index churns.
 
-Two consequences an implementer must honour. Offsets are **zero-based UTF-8 byte positions** in the part text, which are not JavaScript UTF-16 code-unit offsets; the segmenter must emit one convention and the schema must state which. The view slices the text as a BLOB because SQLite's text `substr` stops at an embedded NUL, which tool output such as `find -print0` contains, and SQLite has no NUL-safe character slice; everything after the NUL would otherwise go unindexed. And FTS rows are deleted by rowid, without re-reading or re-tokenizing their text, so **a session's FTS rows must be deleted before its `segments` rows** inside the per-session replace transaction: the cascade from the session row removes the segments that name the rowids, and an FTS row left behind matches text the archive no longer holds.
+Two consequences an implementer must honour. Offsets are **zero-based UTF-8 byte positions** in the part text, which are not JavaScript UTF-16 code-unit offsets; the segmenter must emit one convention and the schema must state which. The view slices the text as a BLOB because SQLite's text `substr` stops at an embedded NUL, which tool output such as `find -print0` contains, and SQLite has no NUL-safe character slice; everything after the NUL would otherwise go unindexed. And FTS rows are deleted by rowid, without re-reading or re-tokenizing their text, so **a message's FTS rows must be deleted before its `segments` rows** inside the snapshot's transaction: the cascade from the message or session row removes the segments that name the rowids, and an FTS row left behind matches text the archive no longer holds.
 
 **`chunks`**: the **exact embedding-input text**, stored, plus provenance (session, anchor message, window index, scope), time, and the chunk content hash. Chunks belong to a chunk set, which belongs to a vector space.
 

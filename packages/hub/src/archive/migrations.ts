@@ -125,9 +125,9 @@ export const migrations: readonly string[] = [
     PRIMARY KEY (chunk_id, space_id)
   ) WITHOUT ROWID;
   `,
-  // Every accepted snapshot replaces the session row, so the cascade drops summaries of content the
-  // archive no longer holds, and a tombstone drops them with the transcript. `variant` is '' for
-  // the provider's default.
+  // Every accepted snapshot deletes the session's summaries, since the archive no longer holds the
+  // content they summarize, and a tombstone's delete of the session row cascades to them. `variant`
+  // is '' for the provider's default.
   `
   CREATE TABLE summaries (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -145,9 +145,10 @@ export const migrations: readonly string[] = [
     PRIMARY KEY (session_id, content_hash, provider, model, variant, focus, recipe)
   ) WITHOUT ROWID;
   `,
-  // A divergence is one source's copy refused at the held copy's position with other content. The
-  // cascade clears it once any copy is accepted or the session is deleted, since either replaces
-  // the copy it diverged from. Rewinds are a history of acceptances, so they outlive the row.
+  // A divergence is one source's copy refused at the held copy's position with other content. It is
+  // cleared once any copy is accepted (explicitly) or the session is deleted (by the cascade), since
+  // either replaces the copy it diverged from. Rewinds are a history of acceptances, so they outlive
+  // the row.
   `
   CREATE TABLE divergences (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -208,6 +209,12 @@ export const migrations: readonly string[] = [
   CREATE VIRTUAL TABLE fts USING fts5(text, content='', contentless_delete=1);
   INSERT INTO fts (fts, rank) VALUES ('deletemerge', 50);
   INSERT INTO fts (rowid, text) SELECT id, text FROM segment_text;
+  `,
+  // An accepted snapshot keeps each held message whose hash it repeats, with its parts, segments,
+  // FTS rows, and chunks. Messages archived before this have no hash, so each session's next
+  // accepted snapshot replaces all of its messages once.
+  `
+  ALTER TABLE messages ADD COLUMN hash TEXT NOT NULL DEFAULT '';
   `,
 ]
 

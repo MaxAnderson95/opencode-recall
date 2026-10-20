@@ -90,8 +90,11 @@ export interface Interface {
   readonly migration: { from: number; to: number }
   /**
    * Resolve the snapshot against the held copy by position `(lastActivity, revision)` and, when it
-   * is accepted, replace the session and its whole transcript in one transaction, attributing it to
-   * `sourceId`. A matching content hash is `unchanged` at any position and moves nothing.
+   * is accepted, make the archive hold exactly the snapshot in one transaction, attributing it to
+   * `sourceId`. The snapshot is applied as a diff: a held message it repeats unchanged keeps its
+   * parts, segments, and FTS rows, a held chunk that renders again unchanged keeps its id and vector,
+   * and only the rest is deleted or written. Acceptance drops the session's cached summaries and
+   * divergences. A matching content hash is `unchanged` at any position and moves nothing.
    *
    * A tombstoned session is `tombstoned` unless the snapshot's last activity is after the deletion
    * time, or the tombstone is an exclusion `sourceId` recorded; such a snapshot is archived and
@@ -327,6 +330,11 @@ const sameModel = (a: EmbeddingModel, b: EmbeddingModel) =>
 
 const blobOf = (v: Float32Array) => new Uint8Array(v.buffer, v.byteOffset, v.byteLength)
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex")
+/**
+ * What `putSnapshot` compares a held message by. Internal to the hub: changing it costs each session
+ * one full rewrite of its messages on the next accepted snapshot, and changes no result.
+ */
+const messageHash = (m: Message) => sha256(JSON.stringify({ type: m.type, timeCreated: m.timeCreated, parts: m.parts }))
 
 /** Write a searchable part's segments and index each one from the view, under its segment id as the FTS rowid. */
 function segmenter(db: Database) {
@@ -436,11 +444,36 @@ function bind(
      WHERE m.session_id = ? ORDER BY m.ordinal, p.ordinal`,
   )
 
-  /** Chunk a session into the space, reusing `prior` vectors by chunk hash. The rest join the queue. */
-  function writeChunks(space: Space, sessionId: string, source: ChunkSource, prior: Map<string, Uint8Array>): Reused[] {
+  const selectSessionChunks = db.prepare(
+    `SELECT id, message_id AS messageId, scope, window_index AS window, time_created AS time, hash FROM chunks
+     WHERE session_id = ? AND chunk_set_id = ?`,
+  )
+  const deleteChunk = db.prepare("DELETE FROM chunks WHERE id = ?")
+  const chunkKey = (c: { messageId: string; scope: string; window: number; time: number }, hash: string) =>
+    JSON.stringify([c.messageId, c.scope, c.window, c.time, hash])
+
+  /**
+   * Bring the session's chunks in the space's set in line with `source`: a held chunk that renders
+   * again unchanged is kept with its id and vector, the others are deleted, and each new chunk is
+   * inserted, reusing a `prior` vector by chunk hash or joining the queue. Returns the reused vectors
+   * and the ids of the held chunks kept.
+   */
+  function writeChunks(space: Space, sessionId: string, source: ChunkSource, prior: Map<string, Uint8Array>) {
+    type HeldChunk = { id: number; messageId: string; scope: string; window: number; time: number; hash: string }
+    const held = new Map(
+      (selectSessionChunks.all(sessionId, space.setId) as HeldChunk[]).map((c) => [chunkKey(c, c.hash), c.id]),
+    )
+    const kept = new Set<number>()
     const reused: Reused[] = []
     for (const chunk of renderChunks(source, space.recipe)) {
       const hash = sha256(chunk.text)
+      const key = chunkKey(chunk, hash)
+      const same = held.get(key)
+      if (same !== undefined) {
+        kept.add(same)
+        held.delete(key)
+        continue
+      }
       const { lastInsertRowid } = insertChunk.run(
         space.setId,
         sessionId,
@@ -458,7 +491,9 @@ function bind(
       const row = { chunkId, sessionId, messageId: chunk.messageId, time: chunk.time, scope: chunk.scope }
       reused.push({ row, embedding })
     }
-    return reused
+    // Their vectors go with them by the cascade; no vector is deleted while its chunk is kept.
+    for (const id of held.values()) deleteChunk.run(id)
+    return { reused, kept }
   }
 
   /** A held session's chunking input, read back from its stored messages and text parts. */
@@ -664,24 +699,51 @@ function bind(
        JOIN parts p ON p.id = seg.part_id JOIN messages m ON m.id = p.message_id WHERE m.session_id = ?)`,
   )
   const deleteSessionRow = db.prepare("DELETE FROM sessions WHERE id = ?")
-  /** Cascades to messages, parts, and segments, so a shrunken transcript leaves nothing behind. */
+  /** Cascades to messages, parts, segments, chunks, vectors, summaries, and divergences. */
   const deleteSession = (id: string) => {
     unindexSession.run(id)
     return deleteSessionRow.run(id).changes > 0
   }
+  const unindexMessages = db.prepare(
+    `DELETE FROM fts WHERE rowid IN (SELECT seg.id FROM segments seg JOIN parts p ON p.id = seg.part_id
+       WHERE p.message_id IN (SELECT value FROM json_each(?)))`,
+  )
+  const deleteMessageRows = db.prepare("DELETE FROM messages WHERE id IN (SELECT value FROM json_each(?))")
+  /**
+   * Cascades to the messages' parts, segments, and the chunks anchored on them, with their vectors.
+   * One statement each, before any insert: FTS5 flushes its pending writes whenever a rowid arrives
+   * below the last one written, so deleting message by message between inserts wrote an index
+   * segment per message. Replacing every message of a 1,826-message session took 8.4 s that way
+   * on a copy of the production archive, and 1.9 s batched.
+   */
+  const deleteMessages = (ids: readonly string[]) => {
+    if (!ids.length) return
+    const json = JSON.stringify(ids)
+    unindexMessages.run(json)
+    deleteMessageRows.run(json)
+  }
+  const selectHeldMessages = db.prepare("SELECT id, ordinal, hash FROM messages WHERE session_id = ?")
+  const updateOrdinal = db.prepare("UPDATE messages SET ordinal = ? WHERE id = ?")
+  const selectSessionChunkIds = db.prepare("SELECT id FROM chunks WHERE session_id = ? AND chunk_set_id = ?")
+  const deleteSummaries = db.prepare("DELETE FROM summaries WHERE session_id = ?")
+  const deleteDivergences = db.prepare("DELETE FROM divergences WHERE session_id = ?")
   const selectHeld = db.prepare(
     `SELECT revision, last_activity AS lastActivity, extractor_version AS extractorVersion, content_hash AS contentHash
      FROM sessions WHERE id = ?`,
   )
-  const insertSession = db.prepare(
+  const upsertSession = db.prepare(
     `INSERT INTO sessions (id, source_id, slug, title, directory, parent_id, time_created, time_updated,
        revision, last_activity, extractor_version, content_hash)
      VALUES ($id, $sourceId, $slug, $title, $directory, $parentId, $timeCreated, $timeUpdated,
-       $revision, $lastActivity, $extractorVersion, $contentHash)`,
+       $revision, $lastActivity, $extractorVersion, $contentHash)
+     ON CONFLICT (id) DO UPDATE SET source_id = excluded.source_id, slug = excluded.slug, title = excluded.title,
+       directory = excluded.directory, parent_id = excluded.parent_id, time_created = excluded.time_created,
+       time_updated = excluded.time_updated, revision = excluded.revision, last_activity = excluded.last_activity,
+       extractor_version = excluded.extractor_version, content_hash = excluded.content_hash`,
   )
   const insertMessage = db.prepare(
-    `INSERT INTO messages (id, session_id, ordinal, type, time_created)
-     VALUES ($id, $sessionId, $ordinal, $type, $timeCreated)`,
+    `INSERT INTO messages (id, session_id, ordinal, type, time_created, hash)
+     VALUES ($id, $sessionId, $ordinal, $type, $timeCreated, $hash)`,
   )
   const insertPart = db.prepare(
     `INSERT INTO parts (message_id, ordinal, kind, text, tool_name, tool_title, status, error, searchable)
@@ -801,33 +863,36 @@ function bind(
     return match
   }
 
-  const putSnapshotTx = db.transaction((snapshot: Snapshot, sourceId: number): { result: PutResult; reused: Reused[] } => {
+  type Applied = { result: PutResult; reused: Reused[]; removed: number[] }
+
+  const putSnapshotTx = db.transaction((snapshot: Snapshot, sourceId: number): Applied => {
     const { session } = snapshot
+    const unapplied = (result: PutResult): Applied => ({ result, reused: [], removed: [] })
     const tombstone = selectTombstone.get(session.id) as (Pick<Tombstone, "timeDeleted" | "reason"> & { sourceId: number }) | null
     // The host that excluded the session uploading it again means its exclusion was lifted.
     const lifted = tombstone?.reason === "excluded" && tombstone.sourceId === sourceId
     // Revisions are not compared: a delete-then-reimport restarts the counter below the tombstone's.
-    if (tombstone && !lifted && snapshot.lastActivity <= tombstone.timeDeleted) return { result: "tombstoned", reused: [] }
+    if (tombstone && !lifted && snapshot.lastActivity <= tombstone.timeDeleted) return unapplied("tombstoned")
     const held = selectHeld.get(session.id) as Held | null
     const result = held ? resolve(snapshot, held) : "archived"
     if (result === "hash_divergence")
       upsertDivergence.run({ sessionId: session.id, sourceId, contentHash: snapshot.contentHash, time: Date.now() })
     // This source now holds the archived content, so it no longer diverges.
     if (result === "unchanged") deleteDivergence.run(session.id, sourceId)
-    if (result !== "archived" && result !== "rewound") return { result, reused: [] }
+    if (result !== "archived" && result !== "rewound") return unapplied(result)
 
     if (result === "rewound" && held)
       insertRewind.run({ sessionId: session.id, sourceId, from: held.revision, to: snapshot.revision, time: Date.now() })
     if (tombstone) deleteTombstone.run(session.id)
-    // A growing session re-renders mostly the same chunks; their vectors survive the replace.
+    // Read before any chunk goes: a changed message's chunks often render again with the same text.
     const prior = new Map(
       (selectPriorVectors.all(space.id, session.id) as { hash: string; embedding: Uint8Array }[]).map((r) => [
         r.hash,
         r.embedding,
       ]),
     )
-    deleteSession(session.id)
-    insertSession.run({
+    const chunksBefore = (selectSessionChunkIds.all(session.id, space.setId) as { id: number }[]).map((c) => c.id)
+    upsertSession.run({
       id: session.id,
       sourceId,
       slug: session.slug,
@@ -841,13 +906,36 @@ function bind(
       extractorVersion: snapshot.extractorVersion,
       contentHash: snapshot.contentHash,
     })
+    // Both describe content the archive no longer holds; the session row stays, so no cascade drops them.
+    deleteSummaries.run(session.id)
+    deleteDivergences.run(session.id)
+
+    const heldMessages = new Map(
+      (selectHeldMessages.all(session.id) as { id: string; ordinal: number; hash: string }[]).map((m) => [m.id, m]),
+    )
+    const hashes = session.messages.map(messageHash)
+    /** Held messages the snapshot repeats unchanged, by id, with their held ordinal. */
+    const kept = new Map(
+      session.messages.flatMap((m, i) => {
+        const was = heldMessages.get(m.id)
+        return was && was.hash === hashes[i] ? [[m.id, was.ordinal] as const] : []
+      }),
+    )
+    deleteMessages([...heldMessages.keys()].filter((id) => !kept.has(id)))
     session.messages.forEach((message, ordinal) => {
+      const hash = hashes[ordinal]!
+      const heldOrdinal = kept.get(message.id)
+      if (heldOrdinal !== undefined) {
+        if (heldOrdinal !== ordinal) updateOrdinal.run(ordinal, message.id)
+        return
+      }
       insertMessage.run({
         id: message.id,
         sessionId: session.id,
         ordinal,
         type: message.type,
         timeCreated: message.timeCreated,
+        hash,
       })
       message.parts.forEach((part, partOrdinal) => {
         const tool = part.kind === "tool" ? part : undefined
@@ -866,7 +954,8 @@ function bind(
         if (searchable) segment(Number(lastInsertRowid), part.text)
       })
     })
-    return { result, reused: writeChunks(space, session.id, session, prior) }
+    const chunks = writeChunks(space, session.id, session, prior)
+    return { result, reused: chunks.reused, removed: chunksBefore.filter((id) => !chunks.kept.has(id)) }
   })
 
   const putTombstoneTx = db.transaction((tombstone: Tombstone, sourceId: number) => {
@@ -1104,9 +1193,9 @@ function bind(
 
   const putSnapshot = Effect.fn("Archive.putSnapshot")(function* (snapshot: Snapshot, sourceId: number) {
     // Immediate: the read-then-write must not race a `token` subcommand writing the same file.
-    const { result, reused } = putSnapshotTx.immediate(snapshot, sourceId)
-    if (matrix && (result === "archived" || result === "rewound")) {
-      matrix.removeSession(snapshot.session.id)
+    const { result, reused, removed } = putSnapshotTx.immediate(snapshot, sourceId)
+    if (matrix) {
+      matrix.removeChunks(snapshot.session.id, removed)
       for (const { row, embedding } of reused) matrix.add(row, embedding)
     }
     return result

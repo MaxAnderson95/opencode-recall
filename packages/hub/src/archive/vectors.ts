@@ -62,6 +62,21 @@ export function createMatrix(dims: number, capacity: number) {
       bySession.delete(sessionId)
     },
 
+    /** Remove the rows of `chunkIds`, every one of them a chunk of `sessionId`; ids with no row are skipped. */
+    removeChunks(sessionId: string, chunkIds: Iterable<number>) {
+      const indexes = bySession.get(sessionId)
+      const removed = new Set(chunkIds)
+      if (!indexes || !removed.size) return
+      const kept = indexes.filter((i) => {
+        if (!removed.has(rows[i]!.chunkId)) return true
+        rows[i] = null
+        free.push(i)
+        return false
+      })
+      if (kept.length) bySession.set(sessionId, kept)
+      else bySession.delete(sessionId)
+    },
+
     stats: (): MatrixStats => ({ capacity: data.length / dims, slots: rows.length, live: rows.length - free.length }),
 
     /**
