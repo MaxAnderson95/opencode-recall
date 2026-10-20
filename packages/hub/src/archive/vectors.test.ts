@@ -19,18 +19,18 @@ test("the scan keeps the best rows by score among those accepted, best first", (
   expect(matrix.scan(query, () => true, 0)).toEqual([])
 })
 
-test("equal scores rank the lower row index first, in a full scan and a session scan alike, after slots are reused", () => {
+test("equal scores rank the lower chunkId first, in a full scan and a session scan alike, after slots are reused", () => {
   const matrix = createMatrix(2, 64)
   for (let i = 0; i < 3; i++) matrix.add(row("ses_old", i), vector(1, 0))
   for (let i = 3; i < 6; i++) matrix.add(row("ses_b", i), vector(1, 0))
   matrix.removeSession("ses_old")
-  // The free slots are taken last-freed first, so chunk 6 takes row 2 and chunk 8 takes row 0.
+  // The free slots are taken last-freed first, so chunk 6 takes slot 2 and chunk 8 takes slot 0, ahead of chunks 3 to 5.
   for (let i = 6; i < 9; i++) matrix.add(row("ses_new", i), vector(1, 0))
   const query = new Float32Array([1, 0])
   const all = () => true
-  expect(matrix.scan(query, all, 10).map((h) => h.row.chunkId)).toEqual([8, 7, 6, 3, 4, 5])
-  expect(matrix.scan(query, all, 2).map((h) => h.row.chunkId)).toEqual([8, 7])
-  expect(matrix.scan(query, all, 10, "ses_new").map((h) => h.row.chunkId)).toEqual([8, 7, 6])
+  expect(matrix.scan(query, all, 10).map((h) => h.row.chunkId)).toEqual([3, 4, 5, 6, 7, 8])
+  expect(matrix.scan(query, all, 2).map((h) => h.row.chunkId)).toEqual([3, 4])
+  expect(matrix.scan(query, all, 10, "ses_new").map((h) => h.row.chunkId)).toEqual([6, 7, 8])
 })
 
 test("a session scan visits only that session's rows", () => {

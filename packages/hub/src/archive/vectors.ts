@@ -66,8 +66,8 @@ export function createMatrix(dims: number, capacity: number) {
 
     /**
      * The `limit` best rows by dot product with `query` (the cosine, as both are normalized) among those `accept` keeps,
-     * best first. With `sessionId`, only that session's rows are visited. Equal scores rank the lower row index first,
-     * whichever rows are visited: a reused slot ranks by its index, not by when its row was added.
+     * best first. With `sessionId`, only that session's rows are visited. Equal scores rank the lower `chunkId` first,
+     * by comparison rather than visiting order, so the order holds for a session's rows and for reused slots alike.
      */
     scan(
       query: Float32Array,
@@ -102,7 +102,7 @@ export function createMatrix(dims: number, capacity: number) {
         let score = s0 + s1 + s2 + s3
         for (; d < dims; d++) score += query[d]! * data[offset + d]!
         let at = held
-        while (at > 0 && (scores[at - 1]! < score || (scores[at - 1] === score && kept[at - 1]! > i))) at--
+        while (at > 0 && (scores[at - 1]! < score || (scores[at - 1] === score && rows[kept[at - 1]!]!.chunkId > row.chunkId))) at--
         if (at === limit) continue
         if (held < limit) held++
         scores.copyWithin(at + 1, at, held - 1)
