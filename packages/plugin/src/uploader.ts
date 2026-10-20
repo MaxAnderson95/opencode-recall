@@ -138,9 +138,10 @@ const defectMessage = (defect: unknown) => (defect instanceof Error ? defect.mes
 
 /**
  * Uploads dirty sessions one at a time from a work list in `ctx.storage`, building each snapshot
- * at send time. There is no lease: several instances may upload one session, and the hub turns the
- * duplicate into a no-op. An acknowledgement removes a work-list entry only when the position it
- * uploaded covers the entry's observed position, so a change made mid-upload is sent afterwards.
+ * at send time. There is no lease: the uploaders of several OpenCode processes may upload one
+ * session, and the hub turns the duplicate into a no-op. An acknowledgement removes a work-list
+ * entry only when the position it uploaded covers the entry's observed position, so a change made
+ * mid-upload is sent afterwards.
  *
  * Absence is never deletion: a queued session that has vanished from the database is dropped, and
  * only an observed deletion or an exclusion produces a tombstone.
@@ -152,7 +153,7 @@ const defectMessage = (defect: unknown) => (defect instanceof Error ? defect.mes
  *
  * Due sessions are sent newest first, by the latest activity recorded with their work, so a
  * backfill of thousands of sessions reaches recent history first and a live turn is never queued
- * behind old ones. Requests are spaced by `uploadIntervalMs`, which bounds this instance to one
+ * behind old ones. Requests are spaced by `uploadIntervalMs`, which bounds this uploader to one
  * request in flight and at most two a second by default: about the rate the hub embeds at (45
  * chunks/s over roughly 17 chunks a session), and slow enough that building snapshots does not
  * monopolise OpenCode's event loop.
@@ -378,7 +379,7 @@ export const layer = ({
         if (deletions.length > 0) return yield* sendTombstone(client, sessionId, deletions)
 
         const pending = yield* entries(sessionId)
-        if (pending.length === 0) return "done" // Another instance already uploaded it.
+        if (pending.length === 0) return "done" // Another uploader already uploaded it.
         const snapshot = yield* source.snapshot(sessionId)
         const excluded = Effect.map(config.excludeDirectories, (roots) =>
           Option.isSome(snapshot) && PluginConfig.isExcluded(roots, snapshot.value.session.directory),
@@ -445,7 +446,7 @@ export const layer = ({
         return ids
       })
 
-      /** Find work left by a previous run or another instance. */
+      /** Find work left by a previous run or another process. */
       const resume = Effect.gen(function* () {
         const found = [
           ...(yield* scanKept(DIRTY, Position)).map(({ key, value }) => ({ key, time: value.lastActivity })),
@@ -574,7 +575,7 @@ export const layer = ({
       }).pipe(Effect.delay(configPollMs), Effect.repeat(Schedule.forever))
       yield* Effect.forkIn(watchExclusions, scope)
 
-      // Read before the layer is ready, so the list is the one left before this instance records anything.
+      // Read before the layer is ready, so the list is the one left before this uploader records anything.
       yield* resume.pipe(logAndContinue((reason) => `work list could not be read: ${reason}`))
       yield* background(drain)
 
