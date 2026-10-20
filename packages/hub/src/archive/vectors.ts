@@ -10,12 +10,16 @@ export type Matrix = ReturnType<typeof createMatrix>
 /** Rows the matrix has room for, slots in use (live rows and removed rows' slots waiting for the next added rows), and live rows. */
 export type MatrixStats = { capacity: number; slots: number; live: number }
 
-/** Each growth during ingest adds a quarter, so at most a fifth of a grown matrix is unused. */
-const GROWTH = 1.25
-const MIN_GROWN_ROWS = 1024
+const HEADROOM_ROWS = 1024
 
-/** A matrix with room for `capacity` rows: the count about to be loaded, so loading allocates once. */
-export function createMatrix(dims: number, capacity = 0) {
+/** Room for `count` vectors about to be loaded plus a tenth, so loading allocates once and ingest grows rarely. */
+export const loadCapacity = (count: number) => Math.max(HEADROOM_ROWS, Math.ceil(count * 1.1))
+
+/**
+ * A matrix with room for `capacity` rows. Capacity never shrinks: removed rows' slots go to the next
+ * added rows, so it stays within about 1.25 times the most live rows since load, plus 1,024.
+ */
+export function createMatrix(dims: number, capacity: number) {
   let data = new Float32Array(capacity * dims)
   let bytes = new Uint8Array(data.buffer)
   /** `null` marks a removed row, whose slot is on `free` for the next added row. */
@@ -27,7 +31,8 @@ export function createMatrix(dims: number, capacity = 0) {
     const reused = free.pop()
     if (reused !== undefined) return reused
     if (rows.length * dims === data.length) {
-      const grown = new Float32Array(Math.max(MIN_GROWN_ROWS, Math.ceil((data.length / dims) * GROWTH)) * dims)
+      const full = data.length / dims
+      const grown = new Float32Array(Math.max(full + HEADROOM_ROWS, Math.ceil(full * 1.25)) * dims)
       grown.set(data)
       data = grown
       bytes = new Uint8Array(data.buffer)

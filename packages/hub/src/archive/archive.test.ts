@@ -667,26 +667,6 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     expect(await semantic("walrus")).toEqual(["ses_b"])
   })
 
-  test("the matrix loads with room for exactly its vectors, and re-ingesting sessions reuses their slots", async () => {
-    const archive = open(path())
-    const laptop = sourceOf(archive)
-    const held = ["ses_a", "ses_b", "ses_c"]
-    const texts = (id: string) => Array.from({ length: 6 }, (_, i) => `${id} turn ${i} about walrus migration`)
-    for (const id of held) archive.putSnapshot(session(id, texts(id)), laptop)
-    while (await archive.embedPending(32));
-    archive.loadVectors()
-    const loaded = archive.vectorStats()
-    expect(loaded).toEqual({ dims: 64, capacity: archive.status().embeddedChunks, slots: archive.status().embeddedChunks, live: archive.status().embeddedChunks })
-
-    for (let round = 1; round <= 20; round++)
-      for (const id of held)
-        archive.putSnapshot(session(id, texts(id), { revision: 6 + round, lastActivity: 100 + round, contentHash: `${id}@${round}` }), laptop)
-    expect(archive.status()).toMatchObject({ chunks: loaded.live, embeddedChunks: loaded.live })
-    expect(archive.vectorStats()).toEqual(loaded)
-    const { sessions } = await archive.search({ query: "walrus migration", limit: 8, mode: "semantic" }, 0)
-    expect(ids(sessions)).toEqual(held)
-  })
-
   test("every filter narrows the semantic branch before its candidate cut", async () => {
     const archive = open(path())
     const [laptop, desktop] = [sourceOf(archive, "laptop"), sourceOf(archive, "desktop")]
@@ -929,7 +909,49 @@ test("per-source status finds each session's chunks through an index on session 
   ])
 })
 
+/** A normalized pseudo-random vector seeded by `text`, so no two chunks score alike and no result order rests on a tie. */
+function spread(text: string): Float32Array {
+  let seed = 2166136261
+  for (let i = 0; i < text.length; i++) seed = Math.imul(seed ^ text.charCodeAt(i), 16777619)
+  const v = new Float32Array(fakeEmbedder().model.dims).map(() => {
+    seed = (seed + 0x6d2b79f5) | 0
+    let t = Math.imul(seed ^ (seed >>> 15), seed | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return ((t ^ (t >>> 14)) >>> 0) / 2 ** 31 - 1
+  })
+  const norm = Math.hypot(...v)
+  return v.map((x) => x / norm)
+}
+
 describe("archive (file-backed only)", () => {
+  test("re-ingesting growing sessions keeps the matrix near its live rows, and search matches a fresh load", async () => {
+    const embedder: Embedder.Interface = { ...fakeEmbedder(), embed: (texts) => Effect.succeed(texts.map(spread)) }
+    const path = tempPath()
+    const archive = open(path, embedder)
+    const laptop = sourceOf(archive)
+    const held = ["ses_a", "ses_b", "ses_c", "ses_d", "ses_e", "ses_f"]
+    const texts = (id: string, n: number) => Array.from({ length: n }, (_, i) => `${id} message ${i}`)
+    for (const id of held) archive.putSnapshot(session(id, texts(id, 4)), laptop)
+    while (await archive.embedPending(64));
+    archive.loadVectors()
+    const loaded = archive.vectorStats()
+    expect(loaded.capacity).toBe(Math.max(1024, Math.ceil(loaded.live * 1.1)))
+
+    for (let round = 1; round <= 50; round++) {
+      for (const id of held) archive.putSnapshot(session(id, texts(id, 4 + round)), laptop)
+      while (await archive.embedPending(64));
+      const { capacity, live } = archive.vectorStats()
+      expect(live).toBe(archive.status().embeddedChunks)
+      expect(capacity).toBeLessThanOrEqual(1.25 * live + 1024)
+    }
+
+    const fresh = open(path, embedder)
+    for (const query of ["ses_b message 30", "message 7", "ses_d"]) {
+      const request = { query, limit: 25, mode: "semantic" } as const
+      expect((await archive.search(request, 0)).sessions).toEqual((await fresh.search(request, 0)).sessions)
+    }
+  })
+
   test("a divergence and a rewind are still reported after the archive is reopened", async () => {
     const path = tempPath()
     const archive = open(path)
