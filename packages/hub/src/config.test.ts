@@ -38,6 +38,30 @@ test("the embedding recipe merges field by field, the environment over the file 
   expect(settings.chunking).toEqual({ chunkChars: 800, chunkOverlap: 100, turnChars: 60_000 })
 })
 
+test("the embedding thread count comes from the file or the environment, which wins, and is unset by default", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "recall-config-"))
+  dirs.push(dir)
+  const file = join(dir, "hub.json")
+  writeFileSync(file, JSON.stringify({ embedThreads: 2 }))
+
+  expect((await load({})).embedThreads).toBeUndefined()
+  expect((await load({ OPENCODE_RECALL_EMBED_THREADS: "3" })).embedThreads).toBe(3)
+  expect((await load({ OPENCODE_RECALL_CONFIG: file })).embedThreads).toBe(2)
+  expect((await load({ OPENCODE_RECALL_CONFIG: file, OPENCODE_RECALL_EMBED_THREADS: "4" })).embedThreads).toBe(4)
+})
+
+test("an embedding thread count that is not a positive integer is rejected", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "recall-config-"))
+  dirs.push(dir)
+  for (const threads of ["0", "-1", "1.5", "two"])
+    await expect(load({ OPENCODE_RECALL_EMBED_THREADS: threads })).rejects.toThrow()
+  for (const [i, threads] of [0, -1, 1.5, "2"].entries()) {
+    const file = join(dir, `hub-${i}.json`)
+    writeFileSync(file, JSON.stringify({ embedThreads: threads }))
+    await expect(load({ OPENCODE_RECALL_CONFIG: file })).rejects.toThrow()
+  }
+})
+
 test("an invalid value is rejected", async () => {
   await expect(load({ OPENCODE_RECALL_LOG_LEVEL: "loud" })).rejects.toThrow()
   await expect(load({ OPENCODE_RECALL_EMBEDDING_DTYPE: "auto" })).rejects.toThrow()

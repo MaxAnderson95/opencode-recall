@@ -47,6 +47,16 @@ When the configured model's files are missing, the hub downloads them from Huggi
 
 Nothing needs restarting once the files are reachable; the next retry loads them. To use another model with the image, set `OPENCODE_RECALL_MODELS_DIR=/data/models` so its download lands on the volume, then reindex (below).
 
+## Embedding threads
+
+`OPENCODE_RECALL_EMBED_THREADS`, or `embedThreads` in the `OPENCODE_RECALL_CONFIG` file, is the number of threads ONNX Runtime runs one inference on (its intra-op pool), a positive integer. When it is set, ONNX Runtime also runs one operator at a time (`interOpNumThreads: 1`). Unset, which is how the image ships, ONNX Runtime sizes the pool from the CPUs it sees. It sees every CPU on the host, not a container's `--cpus` limit, so a CPU-limited container should set this to its limit: in a noisy local run on `oven/bun:1.4.2-debian` linux/amd64 under `--cpus=2` and `--cpus=4`, the runtime default embedded 2 to 5 chunks/s against 19 to 28 with an explicit 1, 2 or 4 threads. A container with no CPU limit needs no value.
+
+The thread count does not change any vector, so it is not part of the recipe and needs no reindex; a restart applies it. `serve` logs the effective settings once at startup:
+
+```json
+{"level":"info","msg":"embedding session","cpuMemArena":false,"threads":"runtime default"}
+```
+
 ## Changing the embedding recipe
 
 The recipe is `OPENCODE_RECALL_EMBEDDING_MODEL`, `_REVISION` (a Hugging Face commit), `_DTYPE`, `_DIMS`, and `_QUERY_PREFIX`, with `OPENCODE_RECALL_CHUNK_CHARS`, `OPENCODE_RECALL_CHUNK_OVERLAP`, and `OPENCODE_RECALL_TURN_CHARS`, or the `embedding` and `chunking` objects in the `OPENCODE_RECALL_CONFIG` file with those fields in camelCase.
@@ -206,8 +216,21 @@ The hub's request handler, on the fake embedder (so nothing is embedded) and an 
 
 The saving is the permit count: at four uploads at once the median peak falls from 1,592 MB to 1,162 MB because two of them are refused and retried later. Parsing from the stream makes no difference this method can see at one or two uploads; at four its runs spread from 1,091 MB to 1,679 MB, too wide to call. A single-process run of the same steps in sequence, on the same payload, shows where one upload's peak comes from: parsing the gzipped body takes RSS from about 105 MB to 330-380 MB while the JS heap grows by 70 MB, and `putSnapshot` takes it to 740-810 MB. After a forced GC the heap is back to 74 MB but RSS stays above 670 MB, so the allocator keeps most of what ingest touched. In that run, keeping the body text alive as a variable held 67 MB more heap after the GC and raised the peak to 909-917 MB.
 
+### ONNX Runtime's CPU memory arena
+
+The hub creates its embedding session with ONNX Runtime's CPU memory arena off (`enableCpuMemArena: false`), and there is no setting to turn it back on. With the arena on, ONNX Runtime keeps the memory of the largest batches it has run and reuses it; with it off, it returns that memory after each run, at a small cost in throughput.
+
+Measured on 2026-10-20 in `oven/bun:1.4.2-debian` linux/arm64 containers under OrbStack on an M5 Pro, Bun 1.4.2, pinned to 4 CPUs (`--cpuset-cpus=0-3`), 4 threads, with the bundled model (`bge-small-en-v1.5` q8, from the v0.1.2 image). Each run is a fresh container: load the model, embed 1,600 chunks of 1,600 characters of this repository's Markdown (385 to 490 tokens each) in 200 batches of 8, then 200 inputs truncated to 512 tokens in batches of 8, then 40 single queries. RSS is `VmRSS` after a forced collection, in MB; runs alternated between the two settings.
+
+| arena | chunks/s, 3 runs (median) | 512-token inputs/s (median) | RSS after the chunks | RSS after the 512-token inputs | `VmHWM` | single query, median ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| on (before) | 21.9, 17.1, 17.6 (17.6) | 20.5, 17.1, 17.2 (17.2) | 889, 884, 889 | 843, 838, 831 | 909, 932, 926 | 2.4, 2.6, 3.2 |
+| off | 18.6, 16.7, 16.5 (16.7) | 16.1, 16.1, 17.2 (16.1) | 453, 464, 443 | 394, 458, 445 | 713, 707, 707 | 3.2, 3.3, 3.2 |
+
+Turning the arena off cost 5% of chunk throughput and about 0.6 ms per query, and saved about 400 MB of steady RSS and 200 MB of peak. Both settings start at about 200 MB with the model loaded.
+
 ### Causes and the issues that address them
 
 - The matrix's dead slots: before #54, removed rows kept their slots until half the matrix was dead, and capacity doubled on growth. #54 presizes the matrix at load, grows it by a quarter, and gives a removed row's slot to the next added row; production readings with it are not yet taken.
-- ONNX Runtime's CPU memory arena, which keeps the peak of the longest batches it has embedded. #72.
+- ONNX Runtime's CPU memory arena, which kept the peak of the longest batches it had embedded. #72 turns it off (above); production readings with it off are not yet taken.
 - Upload parse residue: each snapshot's body and its parsed form, and the allocator pages ingest leaves resident. #71 caps ingest at two snapshots at once (see above).
