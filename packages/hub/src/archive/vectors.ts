@@ -64,17 +64,53 @@ export function createMatrix(dims: number, capacity: number) {
 
     stats: (): MatrixStats => ({ capacity: data.length / dims, slots: rows.length, live: rows.length - free.length }),
 
-    /** The `limit` best rows by dot product with `query` (the cosine, as both are normalized) among those `accept` keeps. */
-    scan(query: Float32Array, accept: (row: VectorRow) => boolean, limit: number): { row: VectorRow; score: number }[] {
-      const scored: { row: VectorRow; score: number }[] = []
-      rows.forEach((row, i) => {
-        if (!row || !accept(row)) return
-        let score = 0
+    /**
+     * The `limit` best rows by dot product with `query` (the cosine, as both are normalized) among those `accept` keeps,
+     * best first. With `sessionId`, only that session's rows are visited. Equal scores rank the lower `chunkId` first,
+     * by comparison rather than visiting order, so the order holds for a session's rows and for reused slots alike.
+     */
+    scan(
+      query: Float32Array,
+      accept: (row: VectorRow) => boolean,
+      limit: number,
+      sessionId?: string,
+    ): { row: VectorRow; score: number }[] {
+      const indexes = sessionId === undefined ? undefined : (bySession.get(sessionId) ?? [])
+      const count = indexes ? indexes.length : rows.length
+      // The kept rows so far, best first, so a row that cannot beat the last is rejected in one comparison.
+      const scores = new Float64Array(limit)
+      const kept = new Int32Array(limit)
+      let held = 0
+      for (let n = 0; n < count; n++) {
+        const i = indexes ? indexes[n]! : n
+        const row = rows[i]
+        if (!row || !accept(row)) continue
+        // Four accumulators run in parallel; the sum can differ from a sequential one in its last bits, but equal
+        // vectors still score exactly equal, so the tie rule above holds.
         const offset = i * dims
-        for (let d = 0; d < dims; d++) score += query[d]! * data[offset + d]!
-        scored.push({ row, score })
-      })
-      return scored.sort((a, b) => b.score - a.score).slice(0, limit)
+        let s0 = 0
+        let s1 = 0
+        let s2 = 0
+        let s3 = 0
+        let d = 0
+        for (; d + 4 <= dims; d += 4) {
+          s0 += query[d]! * data[offset + d]!
+          s1 += query[d + 1]! * data[offset + d + 1]!
+          s2 += query[d + 2]! * data[offset + d + 2]!
+          s3 += query[d + 3]! * data[offset + d + 3]!
+        }
+        let score = s0 + s1 + s2 + s3
+        for (; d < dims; d++) score += query[d]! * data[offset + d]!
+        let at = held
+        while (at > 0 && (scores[at - 1]! < score || (scores[at - 1] === score && rows[kept[at - 1]!]!.chunkId > row.chunkId))) at--
+        if (at === limit) continue
+        if (held < limit) held++
+        scores.copyWithin(at + 1, at, held - 1)
+        kept.copyWithin(at + 1, at, held - 1)
+        scores[at] = score
+        kept[at] = i
+      }
+      return Array.from({ length: held }, (_, k) => ({ row: rows[kept[k]!]!, score: scores[k]! }))
     },
   }
 }

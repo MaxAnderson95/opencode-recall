@@ -707,6 +707,26 @@ describe.each(backends)("archive ($name)", ({ path }) => {
     expect(await semantic("walrus")).toEqual(["ses_b"])
   })
 
+  test("sessions holding identical text rank the lower chunkId first, even when the later one reuses lower slots", async () => {
+    const archive = open(path())
+    const laptop = sourceOf(archive)
+    archive.putSnapshot(single("ses_filler", "walrus"), laptop)
+    await archive.embedPending(32)
+    archive.loadVectors()
+    archive.putSnapshot(single("ses_first", "zebra"), laptop)
+    await archive.embedPending(32)
+    // Deleting the filler frees the matrix's lowest slots, which the second session's chunks then take.
+    archive.putTombstone({ sessionId: "ses_filler", revision: 3, timeDeleted: 30, reason: "deleted" }, laptop)
+    archive.putSnapshot(single("ses_second", "zebra"), laptop)
+    await archive.embedPending(32)
+
+    const { sessions } = await archive.search({ query: "zebra", limit: 8, mode: "semantic" }, 0)
+    expect(sessions.map((s) => s.sessionId)).toEqual(["ses_first", "ses_second"])
+    const [first, second] = sessions.map((s) => s.hits[0]!)
+    if (first?.branch !== "semantic" || second?.branch !== "semantic") throw new Error("expected semantic hits")
+    expect(first.score).toBe(second.score)
+  })
+
   test("every filter narrows the semantic branch before its candidate cut", async () => {
     const archive = open(path())
     const [laptop, desktop] = [sourceOf(archive, "laptop"), sourceOf(archive, "desktop")]
