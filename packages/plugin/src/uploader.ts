@@ -69,7 +69,9 @@ const deletedPrefix = (sessionId: string) => `${DELETED}${sessionId}/`
 
 const later = (a: Position, b: Position) => a.lastActivity - b.lastActivity || a.revision - b.revision
 
-/** Sessions in the order a backfill sends them, so their quiet periods also end newest first. */
+const keyCount = (value: unknown) => (typeof value === "object" && value !== null ? Object.keys(value).length : 0)
+
+/** Sessions in the order a backfill sends them, so a pass already running when they are queued also takes the newest first. */
 const newestFirst = (sessions: ReadonlyMap<string, Source.Local>) =>
   [...sessions].sort(([, a], [, b]) => later(b.position, a.position))
 
@@ -231,10 +233,12 @@ export const layer = ({
        * would fail every pass that reads its session.
        */
       const scanKept = Effect.fnUntraced(function* <A>(prefix: string, schema: Schema.Codec<A>) {
-        const kept: { key: string; value: A }[] = []
+        const decode = Schema.decodeUnknownOption(schema)
+        /** `excess`: the stored value holds keys `schema` does not, which decoding drops. */
+        const kept: { key: string; value: A; excess: boolean }[] = []
         for (const { key, value } of yield* storage.scan(prefix, Schema.Unknown)) {
-          const decoded = Schema.decodeUnknownOption(schema)(value)
-          if (Option.isSome(decoded)) kept.push({ key, value: decoded.value })
+          const decoded = decode(value)
+          if (Option.isSome(decoded)) kept.push({ key, value: decoded.value, excess: keyCount(value) > keyCount(decoded.value) })
           else {
             yield* warn(`dropped unreadable work-list entry ${key}: ${JSON.stringify(value)}`)
             yield* storage.remove(key)
@@ -246,11 +250,21 @@ export const layer = ({
       const entries = (sessionId: string) =>
         scanKept(sessionPrefix(sessionId), Position).pipe(Effect.map((found) => found.map(({ key, value }) => ({ key, position: value }))))
 
-      const acknowledged = Effect.map(
-        scanKept(ACKED, Position),
-        (found) => new Map(found.map(({ key, value }) => [key.slice(ACKED.length), value])),
-      )
+      /**
+       * The last answered position of every session. An entry holding more than its position, as
+       * earlier builds wrote the whole uploaded snapshot, is rewritten as the position alone the first
+       * time it is read; a racing instance's newer write lost to that rewrite costs one no-op upload.
+       */
+      const acknowledged = Effect.gen(function* () {
+        const held = new Map<string, Position>()
+        for (const { key, value, excess } of yield* scanKept(ACKED, Position)) {
+          held.set(key.slice(ACKED.length), value)
+          if (excess) yield* storage.set(key, value)
+        }
+        return held
+      })
 
+      /** Queue a session once it has been quiet for `ms`, so a burst of live events produces one upload. */
       const schedule = (sessionId: string, ms: number) =>
         Effect.asVoid(
           FiberMap.run(
@@ -263,23 +277,33 @@ export const layer = ({
           ),
         )
 
+      /**
+       * Make `sessionId` due once `work` is written, skipping the quiet period, which only coalesces
+       * bursts of live events. A sweep or reconciliation queues thousands of sessions this way and then
+       * starts one pass, rather than one timer per session.
+       */
+      const dueNow = <E>(sessionId: string, work: Effect.Effect<void, E>) => Effect.tap(work, () => Effect.sync(() => due.add(sessionId)))
+
+      /** Write the work for `position` to the work list; the caller decides when the session comes due. */
       const markDirty = (sessionId: string, position: Position) =>
-        storage.set(entryKey(sessionId, position), position).pipe(
-          Effect.andThen(Effect.sync(() => noteActivity(sessionId, position.lastActivity))),
-          Effect.andThen(schedule(sessionId, quietMs)),
-        )
+        storage
+          .set(entryKey(sessionId, position), position)
+          .pipe(Effect.andThen(Effect.sync(() => noteActivity(sessionId, position.lastActivity))))
 
-      /** Queue a tombstone, which the next pass sends in place of any upload still queued for the session. */
+      /** Write a tombstone to the work list, which a pass sends in place of any upload still queued for the session. */
       const markDeleted = (sessionId: string, queued: Queued) =>
-        storage.set(`${deletedPrefix(sessionId)}${queued.timeDeleted}`, queued).pipe(
-          Effect.andThen(Effect.sync(() => noteActivity(sessionId, queued.timeDeleted))),
-          Effect.andThen(schedule(sessionId, quietMs)),
-        )
+        storage
+          .set(`${deletedPrefix(sessionId)}${queued.timeDeleted}`, queued)
+          .pipe(Effect.andThen(Effect.sync(() => noteActivity(sessionId, queued.timeDeleted))))
 
-      /** Keep the latest answered position; a racing instance writing an older one costs one no-op upload. */
+      /**
+       * Keep the latest answered position, and only the position: `position` may be a whole snapshot.
+       * A racing instance writing an older one costs one no-op upload.
+       */
       const recordAcked = Effect.fnUntraced(function* (sessionId: string, position: Position, held?: Position) {
         const current = held ?? (yield* storage.get(ACKED + sessionId, Position))
-        if (!current || later(position, current) > 0) yield* storage.set(ACKED + sessionId, position)
+        if (!current || later(position, current) > 0)
+          yield* storage.set(ACKED + sessionId, { lastActivity: position.lastActivity, revision: position.revision })
       })
 
       const pause = (reason: string) =>
@@ -319,7 +343,7 @@ export const layer = ({
         yield* recordAcked(sessionId, sent)
       })
 
-      /** Queue a tombstone for a session excluded by configuration, timed by this host's clock. */
+      /** Write a tombstone for a session excluded by configuration, timed by this host's clock. */
       const exclude = Effect.fnUntraced(function* (sessionId: string, revision: number) {
         const timeDeleted = yield* Clock.currentTimeMillis
         yield* markDeleted(sessionId, { revision, timeDeleted, reason: "excluded" })
@@ -388,15 +412,20 @@ export const layer = ({
         if (Option.isNone(snapshot) || (yield* excluded)) {
           for (const { key } of pending) yield* storage.remove(key)
           // Answered before, so the hub may hold it: the session moved into an excluded directory.
-          if (Option.isSome(snapshot) && (yield* storage.get(ACKED + sessionId, Position)))
+          if (Option.isSome(snapshot) && (yield* storage.get(ACKED + sessionId, Position))) {
             yield* exclude(sessionId, snapshot.value.revision)
+            yield* schedule(sessionId, quietMs)
+          }
           return "done"
         }
         const outcome = yield* attempt(sessionId, client.snapshot(snapshot.value))
         if (outcome !== "done") return outcome
         yield* acknowledge(sessionId, snapshot.value)
         // Excluded while the upload was in flight: the hub must not keep what it just accepted.
-        if (yield* excluded) yield* exclude(sessionId, snapshot.value.revision)
+        if (yield* excluded) {
+          yield* exclude(sessionId, snapshot.value.revision)
+          yield* schedule(sessionId, quietMs)
+        }
         return outcome
       })
 
@@ -471,11 +500,12 @@ export const layer = ({
         for (const [sessionId, { position, directory }] of newestFirst(yield* source.positions())) {
           const held = acked.get(sessionId)
           if (PluginConfig.isExcluded(roots, directory)) {
-            if (held && !tombstoning.has(sessionId)) yield* exclude(sessionId, position.revision)
+            if (held && !tombstoning.has(sessionId)) yield* dueNow(sessionId, exclude(sessionId, position.revision))
             continue
           }
-          if (!held || later(position, held) > 0) yield* markDirty(sessionId, position)
+          if (!held || later(position, held) > 0) yield* dueNow(sessionId, markDirty(sessionId, position))
         }
+        if (due.size > 0) yield* background(drain)
       })
 
       const sweepForever = sweep.pipe(
@@ -507,7 +537,7 @@ export const layer = ({
           const hubCopy = held.get(sessionId)
           if (PluginConfig.isExcluded(roots, directory)) {
             // Archived before the exclusion: purge it, and the summaries cached for it.
-            if (hubCopy !== undefined) yield* exclude(sessionId, local.revision)
+            if (hubCopy !== undefined) yield* dueNow(sessionId, exclude(sessionId, local.revision))
             continue
           }
           // A tombstone this host recorded by excluding the session is lifted by its upload.
@@ -523,8 +553,9 @@ export const layer = ({
             // Work queued by an earlier run, such as a backfill cut short, would re-send what the hub holds.
             for (const { key, position } of queued.get(sessionId) ?? []) if (later(position, local) <= 0) yield* storage.remove(key)
             yield* recordAcked(sessionId, local, acked.get(sessionId))
-          } else yield* markDirty(sessionId, local)
+          } else yield* dueNow(sessionId, markDirty(sessionId, local))
         }
+        if (due.size > 0) yield* background(drain)
 
         reconcileOnResume = false
         lastReconciled = yield* Clock.currentTimeMillis
@@ -582,11 +613,17 @@ export const layer = ({
       return Service.of({
         enqueue: (sessionId) =>
           source.position(sessionId).pipe(
-            Effect.flatMap(Option.match({ onNone: () => Effect.void, onSome: (position) => markDirty(sessionId, position) })),
+            Effect.flatMap(
+              Option.match({
+                onNone: () => Effect.void,
+                onSome: (position) => markDirty(sessionId, position).pipe(Effect.andThen(schedule(sessionId, quietMs))),
+              }),
+            ),
             logAndContinue((reason) => `could not record ${sessionId} as dirty: ${reason}`),
           ),
         delete: (sessionId, deletion) =>
           markDeleted(sessionId, { ...deletion, reason: "deleted" }).pipe(
+            Effect.andThen(schedule(sessionId, quietMs)),
             logAndContinue((reason) => `could not record ${sessionId} as deleted: ${reason}`),
           ),
         reconcile,

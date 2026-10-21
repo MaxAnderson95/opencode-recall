@@ -15,7 +15,7 @@ const saved = { ...process.env }
 
 // Effect's default ConfigProvider snapshots the environment when first read, so every test in
 // this file shares the one setting. The hub is configured through the config file instead, which
-// the plugin reads fresh.
+// the plugin reads again whenever it changes.
 beforeAll(() => {
   dir = mkdtempSync(join(tmpdir(), "recall-plugin-setup-"))
   source = sourceDb(join(dir, "opencode.db"))
@@ -296,6 +296,23 @@ test("one session change with several instances in one process reaches the hub a
   for (const cleanup of cleanups) await cleanup!()
   await hub.stop()
 }, 20_000)
+
+test("events of other types never reach the uploader", async () => {
+  const events = bus()
+  const { ctx, entries, storageCalls } = host({ events })
+  const cleanup = await plugin.setup(ctx)
+  source.addSession("ses_ignored", { time: 300 })
+  source.addSession("ses_barrier", { time: 300 })
+  for (const type of ["message.part.delta", "session.updated", "session.status", "session.execution.started"])
+    events.emit({ type, data: { sessionID: "ses_ignored" } })
+  events.emit({ type: "session.execution.interrupted", data: { sessionID: "ses_ignored", reason: "shutdown" } })
+  // Events are handled in order, so once this one is queued every earlier one has been seen.
+  events.emit(succeeded("ses_barrier"))
+  await until(() => queued(entries).some((key) => key.startsWith("dirty/ses_barrier/")))
+
+  expect(storageCalls.filter((call) => call.includes("ses_ignored"))).toEqual([])
+  await cleanup!()
+})
 
 test("the installable package bundles its pinned Effect runtime instead of importing OpenCode's", async () => {
   const out = join(dir, "plugin-package")

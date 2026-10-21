@@ -45,6 +45,17 @@ const storage: Storage.Domain = {
   scan: (options) => oldest().storage.scan(options),
 }
 
+/** The event types the uploader acts on; every other event, such as a streaming delta, is dropped before it reaches the handler. */
+const RELEVANT: ReadonlySet<string> = new Set([
+  "server.connected",
+  "session.deleted",
+  "session.execution.succeeded",
+  "session.execution.failed",
+  "session.execution.interrupted",
+  "session.renamed",
+  "session.moved",
+])
+
 /** OpenCode's event stream, read through one instance at a time. */
 class Subscription extends Context.Service<
   Subscription,
@@ -69,6 +80,7 @@ const subscription = Layer.effect(
           (abort) => Effect.sync(() => abort.abort()),
         )
         yield* Stream.fromAsyncIterable(ctx.event.subscribe({ signal: abort.signal }), (e) => e).pipe(
+          Stream.filter((event) => RELEVANT.has(event.type)),
           Stream.runForEach((event) =>
             Effect.gen(function* () {
               // Sent at the start of every (re)connection; events may have been missed while it was down.

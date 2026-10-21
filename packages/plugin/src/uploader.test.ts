@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
 import { Database } from "bun:sqlite"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { PROTOCOL_VERSION, makeClient, type ErrorBody, type ErrorCode } from "@opencode-recall/protocol"
@@ -12,26 +12,34 @@ import { Log } from "../../hub/src/log.ts"
 import { DEFAULT_LIMITS, makeHandler, type Limits } from "../../hub/src/server.ts"
 import { PluginConfig } from "./config.ts"
 import { sourceDb, type SourceDb } from "./fixture.ts"
-import { EXTRACTOR_VERSION, Source, readPosition, readSnapshot } from "./source.ts"
+import { EXTRACTOR_VERSION, Position, Source, readPosition, readSnapshot } from "./source.ts"
 import { Storage } from "./storage.ts"
 import { Uploader } from "./uploader.ts"
 
 type Json = Parameters<Storage.Domain["set"]>[1]
 
-/** `ctx.storage` as OpenCode implements it: prefix scan over keys with the namespace stripped. */
+/**
+ * `ctx.storage` as OpenCode implements it: a prefix scan over keys in order with the namespace
+ * stripped, paged by `limit` (100 by default, at most 1,000) and resumed after `next`.
+ */
 function memoryStorage() {
   const entries = new Map<string, Json>()
+  const calls = { scan: 0 }
   const storage: Storage.Domain = {
     get: async (key) => entries.get(key),
     set: async (key, value) => void entries.set(key, value),
     remove: async (key) => void entries.delete(key),
-    scan: async ({ prefix }) => ({
-      entries: [...entries].filter(([key]) => key.startsWith(prefix)).map(([key, value]) => ({ key, value })),
-    }),
+    scan: async ({ prefix, after, limit = 100 }) => {
+      calls.scan++
+      const size = Math.min(Math.max(Math.floor(limit), 1), 1_000)
+      const matching = [...entries.keys()].filter((key) => key.startsWith(prefix) && (after === undefined || key > after)).sort()
+      const page = matching.slice(0, size).map((key) => ({ key, value: entries.get(key)! }))
+      return matching.length > size ? { entries: page, next: page.at(-1)!.key } : { entries: page }
+    },
   }
   /** Queued work, leaving out the acknowledged positions kept for the sweep. */
   const pending = () => [...entries.keys()].filter((key) => !key.startsWith("acked/")).length
-  return { storage, entries, pending }
+  return { storage, entries, pending, calls }
 }
 
 type Intercept = (req: Request, forward: (req: Request) => Promise<Response>) => Promise<Response>
@@ -169,6 +177,35 @@ test("updating a session uploads a newer revision that replaces the archived cop
   expect(outcomes).toEqual(["archived", "archived"])
   expect(archivedTexts()).toEqual(["first", "second"])
   await until(() => pending() === 0)
+})
+
+test("an upload records only the position it acknowledged, not the snapshot it sent", async () => {
+  configure()
+  const { storage, entries } = memoryStorage()
+  await (await start(storage)).enqueue("ses_a")
+  await until(() => entries.has("acked/ses_a"))
+  expect(entries.get("acked/ses_a")).toStrictEqual(readPosition(source.db, "ses_a"))
+})
+
+test("an acknowledged entry stored with the whole snapshot is rewritten as its position by the next read", async () => {
+  configure()
+  const { storage, entries } = memoryStorage()
+  const snapshot = readSnapshot(source.db, "ses_a")!
+  // What earlier builds wrote: the uploaded snapshot, whose position fields make it decode as one.
+  await storage.set("acked/ses_a", JSON.parse(JSON.stringify(snapshot)))
+  const uploader = await start(storage)
+  expect(await uploader.state()).toMatchObject({ local: 1, answered: 1 })
+  expect(entries.get("acked/ses_a")).toStrictEqual({ lastActivity: snapshot.lastActivity, revision: snapshot.revision })
+})
+
+test("a scan reads up to 1,000 entries per call into OpenCode's database", async () => {
+  const { storage, calls } = memoryStorage()
+  for (let i = 0; i < 5_018; i++) await storage.set(`acked/ses_${String(i).padStart(5, "0")}`, { lastActivity: i, revision: 1 })
+  await storage.set("dirty/ses_other/1-1", { lastActivity: 1, revision: 1 })
+  const found = await Effect.runPromise(Storage.Service.use((s) => s.scan("acked/", Position)).pipe(Effect.provide(Storage.fromDomain(storage))))
+  expect(found).toHaveLength(5_018)
+  expect(found.at(-1)).toEqual({ key: "acked/ses_05017", value: { lastActivity: 5_017, revision: 1 } })
+  expect(calls.scan).toBe(6)
 })
 
 test("a lost acknowledgement is retried and the retry is a no-op", async () => {
@@ -418,6 +455,35 @@ test("a certificate pin is normalized, the environment overrides it, and a malfo
   await expect(loadHubConfig({}, configFile)).rejects.toThrow("is not https")
 })
 
+test("the config file is read again only when its mtime or size changes, so an edit applies without a restart", async () => {
+  const config = ManagedRuntime.make(Layer.mergeAll(PluginConfig.layer(configFile), noEnvironment))
+  const token = () => config.runPromise(PluginConfig.Service.use((c) => c.hub).pipe(Effect.map((hub) => Option.getOrNull(hub)?.token)))
+  const stamped = new Date("2026-01-01T00:00:00Z")
+  const write = (value: string, mtime?: Date) => {
+    writeConfig({ url: "http://file", token: value })
+    if (mtime) utimesSync(configFile, mtime, mtime)
+  }
+
+  write("aaaa", stamped)
+  expect(await token()).toBe("aaaa")
+  // Same size and mtime: the decoded file is kept.
+  write("bbbb", stamped)
+  expect(await token()).toBe("aaaa")
+  utimesSync(configFile, new Date(), new Date())
+  expect(await token()).toBe("bbbb")
+  write("longer", stamped)
+  expect(await token()).toBe("longer")
+  // A file that cannot be read is read again once it can, though chmod changes neither mtime nor size.
+  write("unreadable", stamped)
+  chmodSync(configFile, 0o000)
+  await expect(token()).rejects.toThrow()
+  chmodSync(configFile, 0o600)
+  expect(await token()).toBe("unreadable")
+  rmSync(configFile)
+  expect(await token()).toBeUndefined()
+  await config.dispose()
+})
+
 const clientFor = (name: string) => makeClient({ url: hub.url.href, token: sync(archive.issueToken(name)) })
 
 test("deleting a session tombstones it, and a later upload from before the deletion is rejected", async () => {
@@ -585,6 +651,27 @@ test("a backfill into an empty hub uploads every eligible session, newest first"
   await until(async () => (await uploader.state()).queued === 0)
   // The excluded session is not eligible, so the backfill is complete without it.
   expect(await uploader.state()).toMatchObject({ local: 4, answered: 4 })
+})
+
+test("sessions queued by reconciliation or the sweep skip the quiet period and are sent newest first", async () => {
+  configure()
+  addHistory(["ses_b", "ses_c"])
+  const order: string[] = []
+  intercept = async (req, forward) => {
+    if (new URL(req.url).pathname === "/v1/snapshot") order.push(await uploadedSession(req))
+    return forward(req)
+  }
+  // A quiet period longer than the test: a session queued behind its timer would never be sent.
+  const uploader = await start(memoryStorage().storage, { quietMs: 60_000, sweepIntervalMs: 20 })
+  await uploader.reconcile()
+  await until(() => outcomes.length === 3)
+  expect(order).toEqual(["ses_b", "ses_c", "ses_a"])
+
+  // No enqueue: only the sweep finds these.
+  source.addSession("ses_d", { time: 400 })
+  source.addSession("ses_e", { time: 500 })
+  await until(() => outcomes.length === 5)
+  expect(order.slice(3)).toEqual(["ses_e", "ses_d"])
 })
 
 test("uploads are spaced by the upload interval", async () => {

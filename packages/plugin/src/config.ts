@@ -1,7 +1,8 @@
+import { stat } from "node:fs/promises"
 import { homedir } from "node:os"
 import { isAbsolute, join, relative, resolve as resolvePath, sep } from "node:path"
 import { normalizeFingerprint } from "@opencode-recall/protocol"
-import { Config, Context, Effect, Layer, Option, Schema } from "effect"
+import { Config, Context, Effect, Exit, Layer, Option, Schema } from "effect"
 
 export const Hub = Schema.Struct({ url: Schema.String, token: Schema.String, certSha256: Schema.optionalKey(Schema.String) })
 export interface Hub extends Schema.Schema.Type<typeof Hub> {}
@@ -45,13 +46,55 @@ export const filePath = optional("XDG_CONFIG_HOME").pipe(
   Config.map((configHome) => join(configHome ?? join(homedir(), ".config"), "opencode", "recall.json")),
 )
 
-const readFile = Effect.fnUntraced(function* (path: string) {
-  const file = Bun.file(path)
-  const json = (yield* Effect.tryPromise({ try: () => file.exists(), catch: invalid }))
-    ? yield* Effect.tryPromise({ try: () => file.json(), catch: invalid })
-    : {}
+/** A read of the decoded file. */
+type Read = Effect.Effect<typeof File.Type, Invalid>
+
+const isMissing = (e: unknown) => e instanceof Error && "code" in e && e.code === "ENOENT"
+
+/** The file's text, or `undefined` when there is no file. */
+const readText = (path: string) =>
+  Effect.tryPromise({
+    try: () =>
+      Bun.file(path)
+        .text()
+        .catch((e) => (isMissing(e) ? undefined : Promise.reject(e))),
+    catch: invalid,
+  })
+
+const parse = Effect.fnUntraced(function* (text: string | undefined) {
+  const json = text === undefined ? {} : yield* Effect.try({ try: () => JSON.parse(text), catch: invalid })
   return yield* Schema.decodeUnknownEffect(File)(json).pipe(Effect.mapError(invalid))
 })
+
+const readFile = (path: string) => Effect.flatMap(readText(path), parse)
+
+/** What identifies one version of the file: its mtime and size, or that it is missing. */
+const stamp = (path: string) =>
+  Effect.tryPromise({
+    try: () =>
+      stat(path).then(
+        ({ mtimeMs, size }) => `${mtimeMs}:${size}`,
+        (e) => (isMissing(e) ? "missing" : Promise.reject(e)),
+      ),
+    catch: invalid,
+  })
+
+/**
+ * Reads and decodes the file at `path` again only when its stamp changes. Content that does not
+ * decode is kept like content that does, since only an edit can change it; a failed read of the
+ * file is not, since repairing it, such as with `chmod`, changes neither mtime nor size.
+ */
+const cachedRead = (path: string): Read => {
+  let cached: { stamp: string; read: Exit.Exit<typeof File.Type, Invalid> } | undefined
+  return Effect.gen(function* () {
+    const current = yield* stamp(path)
+    if (cached?.stamp !== current) {
+      const text = yield* readText(path)
+      cached = { stamp: current, read: yield* Effect.exit(parse(text)) }
+    }
+    return yield* cached.read
+  })
+}
 
 /**
  * Resolve the hub address, token, and certificate pin: `OPENCODE_RECALL_HUB_URL`,
@@ -61,8 +104,8 @@ const readFile = Effect.fnUntraced(function* (path: string) {
  * or one set for an `http` address, is invalid rather than ignored, since ignoring it would send the
  * token without the protection it asked for.
  */
-const resolve = Effect.fnUntraced(function* (path: string) {
-  const { hub } = yield* readFile(path)
+const resolve = Effect.fnUntraced(function* (path: string, read: Read) {
+  const { hub } = yield* read
   const env = yield* Config.all({
     url: optional("OPENCODE_RECALL_HUB_URL"),
     token: optional("OPENCODE_RECALL_TOKEN"),
@@ -88,7 +131,7 @@ const resolve = Effect.fnUntraced(function* (path: string) {
 })
 
 export const load = Effect.fn("PluginConfig.load")(function* (path: string) {
-  return (yield* resolve(path)).hub
+  return (yield* resolve(path, readFile(path))).hub
 })
 
 /** Today's plugin's variant names, so a trailing one is not read as part of a slash-containing model id. */
@@ -109,13 +152,17 @@ function parseModelSpec(spec: string): SummaryModel | undefined {
  * neither is set.
  */
 export const loadSummaryModel = Effect.fn("PluginConfig.loadSummaryModel")(function* (path: string) {
+  return yield* summaryModel(readFile(path))
+})
+
+const summaryModel = Effect.fnUntraced(function* (read: Read) {
   const env = yield* optional("OPENCODE_RECALL_SUMMARY_MODEL").pipe(Effect.mapError(invalid))
   if (env) {
     const parsed = parseModelSpec(env)
     if (!parsed) return yield* invalid(`OPENCODE_RECALL_SUMMARY_MODEL=${env} is not provider/model[/variant]`)
     return parsed
   }
-  const { summary } = yield* readFile(path)
+  const { summary } = yield* read
   if (summary?.model === undefined) return DEFAULT_SUMMARY_MODEL
   return yield* Schema.decodeUnknownEffect(SummaryModel)(summary.model).pipe(Effect.mapError(invalid))
 })
@@ -138,7 +185,11 @@ export const loadExcludeDirectories = Effect.fn("PluginConfig.loadExcludeDirecto
   path: string,
   home: string = homedir(),
 ) {
-  const { index } = yield* readFile(path)
+  return yield* excludeDirectories(readFile(path), home)
+})
+
+const excludeDirectories = Effect.fnUntraced(function* (read: Read, home: string = homedir()) {
+  const { index } = yield* read
   if (index?.excludeDirectories === undefined) return []
   const entries = yield* Schema.decodeUnknownEffect(Schema.Array(Schema.String))(index.excludeDirectories).pipe(
     Effect.mapError((e) => invalid(`index.excludeDirectories: ${e.message}`)),
@@ -163,28 +214,32 @@ export const isExcluded = (roots: readonly string[], directory: string) =>
 export interface Interface {
   /** The host-wide config file, for `recall_status`. */
   readonly file: string
-  /** Read fresh on every run, so an edited file takes effect without restarting OpenCode. */
+  /**
+   * Resolved on every run against the environment as it is then and the file as it was last read.
+   * Each run checks the file's mtime and size and reads and decodes it again only when either has
+   * changed, so an edited file takes effect without restarting OpenCode.
+   */
   readonly hub: Effect.Effect<Option.Option<Hub>, Invalid>
-  /** Where the hub URL and token currently come from, for `recall_status`. Read fresh, as `hub` is. */
+  /** Where the hub URL and token currently come from, for `recall_status`. Resolved as `hub` is. */
   readonly hubSource: Effect.Effect<string, Invalid>
-  /** Read fresh on every run, as `hub` is. */
+  /** Resolved as `hub` is. */
   readonly summaryModel: Effect.Effect<SummaryModel, Invalid>
-  /** The resolved `index.excludeDirectories` roots, read fresh on every run; see {@link loadExcludeDirectories}. */
+  /** The resolved `index.excludeDirectories` roots, from the file as `hub` reads it; see {@link loadExcludeDirectories}. */
   readonly excludeDirectories: Effect.Effect<readonly string[], Invalid>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode-recall/plugin/PluginConfig") {}
 
 export const layer = (path: string) =>
-  Layer.succeed(
-    Service,
-    Service.of({
+  Layer.sync(Service, () => {
+    const read = cachedRead(path)
+    return Service.of({
       file: path,
-      hub: load(path),
-      hubSource: Effect.map(resolve(path), (r) => r.source),
-      summaryModel: loadSummaryModel(path),
-      excludeDirectories: loadExcludeDirectories(path),
-    }),
-  )
+      hub: Effect.map(resolve(path, read), (r) => r.hub),
+      hubSource: Effect.map(resolve(path, read), (r) => r.source),
+      summaryModel: summaryModel(read),
+      excludeDirectories: excludeDirectories(read),
+    })
+  })
 
 export * as PluginConfig from "./config.ts"
