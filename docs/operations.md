@@ -91,12 +91,59 @@ A hub never runs against an archive a newer binary migrated: it logs `archive sc
 
 ## Memory
 
-The budget is about 1 GB (SPEC §7). It has been measured once, not on the production Linux host: in a linux/arm64 container under OrbStack on an M5 Pro, limited with `--memory 1g`, against a synthetic archive at the measured production scale (4,200 sessions, 75,600 chunks with 384-dimension vectors under the real recipe, a 1.05 GB `archive.db`) and the real model. The load was 400 hybrid searches, four at a time, while 40 twelve-message snapshots were ingested and embedded.
+SPEC §7 budgets about 1 GB: about 280 MB for ONNX Runtime and 115 MB for the vector matrix. The production hub is over it, and ONNX Runtime takes more than that budget allows once it has embedded long inputs (below).
 
-| point | hub process RSS |
+### The `memory` line
+
+`serve` logs `memory` at info once after `vectors loaded`, then every hour until it stops. Each line forces a full garbage collection first. The numbers come from the serving process; the `status` subcommand opens the archive in a process of its own and cannot report them.
+
+```sh
+docker logs opencode-recall-hub 2>&1 | grep '"msg":"memory"'
+```
+
+| field | meaning |
 | --- | --- |
-| ready, model loaded, no search yet | 207 MB |
-| peak during the load (`VmHWM`) | 661 MB |
-| after the load | 525 MB |
+| `rss` | resident bytes, after the collection |
+| `jscHeapSize`, `jscHeapCapacity` | bytes of live JS objects and the JS heap's capacity, from `heapStats()` in `bun:jsc`; both include `jscExtraMemory` |
+| `jscExtraMemory` | bytes JSC tracks outside its heap, such as array buffers; the matrix is one |
+| `jscObjects` | live JS objects |
+| `matrixCapacity` | rows the vector matrix has room for |
+| `matrixSlots` | slots in use: live rows and removed rows not yet compacted away |
+| `matrixLive` | live rows, one per embedded chunk of the active space |
+| `matrixBytes` | the matrix's allocation, `matrixCapacity` times the dimension times 4 |
 
-The container's page cache filled the rest of the 1 GiB limit and was reclaimed as needed; the kernel recorded no OOM event. Re-measure on the production host before treating these as its budget.
+`matrixSlots - matrixLive` is the matrix's dead slots. Pages of the matrix never written are not resident, so the matrix's resident share is closer to `matrixSlots` rows than to `matrixBytes`. What `rss` holds beyond `jscHeapCapacity` is native: ONNX Runtime, SQLite, Bun, and allocator pages freed but not returned to the kernel.
+
+### Production, 2026-10-19
+
+v0.1.2 after 25 days of uptime, before the `memory` line existed, read from `/proc/<pid>/status` and `/proc/<pid>/smaps`: `VmRSS` 1,094,028 kB and `VmHWM` 1,366,976 kB. A second reading at 17:38 UTC gave `VmRSS` 1,108,648 kB, `RssAnon` 1,037,556 kB, and `VmHWM` 1,390,644 kB. The archive held 5,007 sessions and 85,257 embedded chunks.
+
+| mappings | size | attribution |
+| --- | --- | --- |
+| high-address anonymous | about 590 MB | native allocations outside Bun's allocator; mostly ONNX Runtime (inferred) |
+| low-address mimalloc arenas | about 329 MB | the JS heap, including the matrix (inferred) |
+| glibc `brk` heap | 76 MB | native |
+| file-backed | 70 MB | the executable and `libonnxruntime.so.1` |
+
+Replaying the production log through the matrix's growth and compaction rules estimates about 131,000 written slots (about 201 MB), about 43,000 of them removed; that is an estimate, not a reading. Loading the vectors at the restart on 2026-09-24 took 59.4 s (the `vectors loaded` line).
+
+Readings from a build that logs the `memory` line are not yet recorded: the startup line, the first hourly line, and a line at least 24 hours after start.
+
+### Local reproductions
+
+On `oven/bun:1.4.2-debian`, linux/amd64, with the real model: resident memory grew from 218 MB with the model loaded to about 720 MB after embedding batches of 8 sequences of 512 tokens, and held at about 315 MB with ONNX Runtime's CPU memory arena off (`session_options: { enableCpuMemArena: false }`). 130,000 `VectorRow` objects took about 51 MB.
+
+A replay of production uploads against a copy of the 2026-10-19 09:15 backup, in a linux/arm64 container under OrbStack pinned to 4 CPUs, re-sent each upload in the production hub's log with the session cut to the logged message count. It ran an earlier version of the report, so the columns are its fields converted to MB (10^6 bytes); "JS heap" excludes JSC's extra memory. ONNX Runtime ran 15 threads there, one per host core, against 4 in production.
+
+| point | RSS | `VmHWM` | JS heap | JSC extra memory | matrix capacity / live / removed |
+| --- | --- | --- | --- | --- | --- |
+| model loaded | 356 | 437 | 22 | 214 | 131,072 / 85,257 / 0 |
+| after one hybrid search | 391 | 437 | 22 | 214 | 131,072 / 85,257 / 0 |
+| after the last 24 hours of uploads (125) | 486 | 540 | 22 | 216 | 131,072 / 85,257 / 12,136 |
+| after the first 3,206 uploads since production's last start, 7,400 chunks embedded | 1,247 | 1,623 | 21 | 272 | 170,136 / 85,180 / 4,831 |
+
+### Causes and the issues that address them
+
+- The matrix's dead slots: removed rows keep their slots until half the matrix is dead, and capacity doubles on growth. #54.
+- ONNX Runtime's CPU memory arena, which keeps the peak of the longest batches it has embedded. #72.
+- Upload parse residue: each snapshot's body and its parsed form, with up to four ingests at once. #71.
