@@ -706,8 +706,10 @@ function bind(
      JOIN parts p ON p.message_id = m.id AND p.kind = 'text'
      WHERE m.session_id = ? AND m.type = 'user' ORDER BY m.ordinal, p.ordinal`,
   )
+  // Reading renders only a text part's text. A tool part's text is its output, up to 16,000
+  // characters, and reasoning is never shown, so neither is loaded.
   const selectWindowParts = db.prepare(
-    `SELECT kind, text, tool_name AS tool, tool_title AS title, status, error FROM parts
+    `SELECT kind, CASE WHEN kind = 'text' THEN text END AS text, tool_name AS tool, tool_title AS title, status, error FROM parts
      WHERE message_id = ? ORDER BY ordinal`,
   )
   const selectSummary = db.prepare(
@@ -1002,9 +1004,12 @@ function bind(
 
   /** A stored message cut down for reading; `clipped` when its text was longer than `maxChars`. */
   function readMessage(m: MessageRow, maxChars: number): { message: WindowMessage; clipped: boolean } {
-    type PartRow = { kind: Part["kind"]; text: string; tool: string | null; title: string | null; status: string | null; error: string | null }
+    type PartRow = { tool: string | null; title: string | null; status: string | null; error: string | null } & (
+      | { kind: "text"; text: string }
+      | { kind: Exclude<Part["kind"], "text">; text: null }
+    )
     const parts = selectWindowParts.all(m.messageId) as PartRow[]
-    const texts = parts.filter((p) => p.kind === "text").map((p) => p.text)
+    const texts = parts.flatMap((p) => (p.kind === "text" ? [p.text] : []))
     const tools = parts.flatMap((p) =>
       p.kind === "tool" && p.tool !== null
         ? [
