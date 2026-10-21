@@ -1,0 +1,12 @@
+{
+  "name": "opencode-recall",
+  "version": "0.2.0",
+  "type": "module",
+  "main": "./index.js",
+  "engines": {
+    "opencode": ">=2.0.14"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "2.0.14"
+  }
+}
