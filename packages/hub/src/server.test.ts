@@ -374,11 +374,19 @@ test.each([
   expect(sync(archive.status())).toMatchObject({ sessions: 0 })
 })
 
-test("a body that is not JSON is rejected", async () => {
+test.each([
+  ["identity", "{"],
+  ["gzip", Bun.gzipSync("{")],
+])("a %s body that is not JSON is rejected as such", async (encoding, body) => {
   const res = await handler(
-    new Request("http://hub/v1/snapshot", { method: "POST", headers: { authorization: `Bearer ${token}` }, body: "{" }),
+    new Request("http://hub/v1/snapshot", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-encoding": encoding },
+      body,
+    }),
   )
   expect(res.status).toBe(400)
+  expect(await res.json()).toEqual({ error: { code: "invalid_request", message: "body is not valid JSON" } })
 })
 
 test("an unknown verb is rejected", async () => {

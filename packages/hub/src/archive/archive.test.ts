@@ -1113,11 +1113,13 @@ describe("archive (file-backed only)", () => {
     db.run(
       "INSERT INTO parts (message_id, ordinal, kind, text, searchable) VALUES ('msg_old', 1, 'tool', 'hidden needle', 0)",
     )
+    db.run("INSERT INTO parts (message_id, ordinal, kind, text) VALUES ('msg_old', 2, 'text', 'later haystack')")
     db.close()
 
     const archive = open(path)
     expect(archive.migration.from).toBe(SEGMENTED - 1)
     expect((await search(archive, "needle"))[0]!.hits.map((h) => h.snippet)).toEqual(["legacy «needle»"])
+    expect((await search(archive, "haystack"))[0]!.hits.map((h) => h.snippet)).toEqual(["later «haystack»"])
     expect(await search(archive, "hidden")).toEqual([])
   })
 

@@ -164,8 +164,20 @@ During ingest the old build keeps removed rows resident until a compaction. A re
 
 In the last pair the matrices' written bytes differ by 45 MB while RSS differs by 269 MB; the rest is native memory this report does not attribute, from one sample of each build.
 
+### Ingesting a 64 MiB snapshot
+
+The hub's request handler, on the fake embedder (so nothing is embedded) and an empty archive, in a `oven/bun:1.4.2-debian` linux/arm64 container under OrbStack on an M5 Pro, pinned to 4 CPUs, on 2026-10-19. Each upload is one synthetic session of 2,054 messages: 67.0 MB of JSON, 29.4 MB gzipped. `VmHWM` after the uploads finished, from a start of 77 MB; each number is a separate process.
+
+| uploads at once | before #71 (4 permits, body read as text) | #71 (2 permits, body parsed from the stream) | #71 parsing with 4 permits |
+| --- | --- | --- | --- |
+| 1 | 748, 899, 893, 877 | 875, 872, 876, 871 | |
+| 2 | 1,023, 918, 933 | 937, 930, 926 | |
+| 4 | 1,650, 1,592, 1,663, 1,590, 1,346 | 1,162, 1,350, 1,035, 1,376, 1,036 (2 of 4 refused with `rate_limited`) | 1,132, 1,091, 1,599, 1,679, 1,321 |
+
+The saving is the permit count: at four uploads at once the median peak falls from 1,592 MB to 1,162 MB because two of them are refused and retried later. Parsing from the stream makes no difference this method can see at one or two uploads; at four its runs spread from 1,091 MB to 1,679 MB, too wide to call. A single-process run of the same steps in sequence, on the same payload, shows where one upload's peak comes from: parsing the gzipped body takes RSS from about 105 MB to 330-380 MB while the JS heap grows by 70 MB, and `putSnapshot` takes it to 740-810 MB. After a forced GC the heap is back to 74 MB but RSS stays above 670 MB, so the allocator keeps most of what ingest touched. In that run, keeping the body text alive as a variable held 67 MB more heap after the GC and raised the peak to 909-917 MB.
+
 ### Causes and the issues that address them
 
 - The matrix's dead slots: before #54, removed rows kept their slots until half the matrix was dead, and capacity doubled on growth. #54 presizes the matrix at load, grows it by a quarter, and gives a removed row's slot to the next added row; production readings with it are not yet taken.
 - ONNX Runtime's CPU memory arena, which keeps the peak of the longest batches it has embedded. #72.
-- Upload parse residue: each snapshot's body and its parsed form, with up to four ingests at once. #71.
+- Upload parse residue: each snapshot's body and its parsed form, and the allocator pages ingest leaves resident. #71 caps ingest at two snapshots at once (see above).

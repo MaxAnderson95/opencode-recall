@@ -255,8 +255,10 @@ function migrate(db: Database): Effect.Effect<{ from: number; to: number }, Newe
         for (const sql of migrations.slice(from)) db.run(sql)
         if (from > 0 && from < SEGMENTED) {
           const segment = segmenter(db)
-          const rows = db.query("SELECT id, text FROM parts WHERE searchable = 1").all() as { id: number; text: string }[]
-          for (const { id, text } of rows) segment(id, text)
+          // Streamed: every searchable part at once is hundreds of megabytes. The loop writes only
+          // segments and fts, never parts, so the open read is unaffected by it.
+          const rows = db.query<{ id: number; text: string }, []>("SELECT id, text FROM parts WHERE searchable = 1")
+          for (const { id, text } of rows.iterate()) segment(id, text)
         }
         // PRAGMA takes no bound parameters; SCHEMA_VERSION is a compile-time integer.
         db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`)
