@@ -2,8 +2,10 @@ import { afterEach, beforeEach, expect, test } from "bun:test"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { HubError, PROTOCOL_VERSION, makeClient, type Snapshot } from "@opencode-recall/protocol"
-import { Effect, Exit, Layer, Scope } from "effect"
+import { promisify } from "node:util"
+import { gzip } from "node:zlib"
+import { HubError, PROTOCOL_VERSION, makeClient, normalizeFingerprint, type Snapshot } from "@opencode-recall/protocol"
+import { Effect, Exit, Fiber, Layer, Scope } from "effect"
 import { Archive, SCHEMA_VERSION } from "./archive/index.ts"
 import { Embedder } from "./embedder.ts"
 import { fakeEmbedder, fakeLayer } from "./fake-embedder.ts"
@@ -215,6 +217,40 @@ test("the client sends gzip-encoded bodies with Content-Encoding set", async () 
   expect(JSON.parse(new TextDecoder().decode(Bun.gunzipSync(body)))).toMatchObject({ contentHash: "hash-1" })
 })
 
+test("a large response is gzipped only for a client that accepts gzip, and a small one never is", async () => {
+  const messages = Array.from({ length: 8 }, (_, i) => ({
+    ...session.messages[0]!,
+    id: `msg_${i}`,
+    parts: [{ kind: "text" as const, text: "word ".repeat(800) }],
+  }))
+  await run(clientFor(handler).snapshot({ ...snapshot, session: { ...session, messages } }))
+  const call = (verb: string, body: object, acceptEncoding?: string) =>
+    handler(
+      new Request(`http://hub/v1/${verb}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, ...(acceptEncoding && { "accept-encoding": acceptEncoding }) },
+        body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, ...body }),
+      }),
+    )
+  const transcript = (acceptEncoding?: string) =>
+    call("transcript", { session: "ses_a", budget: 300_000, maxChars: 4_000 }, acceptEncoding)
+
+  const plain = await transcript()
+  expect(plain.headers.get("content-encoding")).toBeNull()
+  const json = await plain.text()
+  expect(json.length).toBeGreaterThanOrEqual(16_384)
+
+  const gzipped = await transcript("gzip, deflate, br, zstd")
+  expect(gzipped.headers.get("content-encoding")).toBe("gzip")
+  expect(gzipped.headers.get("vary")).toBe("accept-encoding")
+  expect(new TextDecoder().decode(Bun.gunzipSync(new Uint8Array(await gzipped.arrayBuffer())))).toBe(json)
+
+  expect((await transcript("gzip;q=0, br")).headers.get("content-encoding")).toBeNull()
+  const small = await call("status", {}, "gzip")
+  expect(small.headers.get("content-encoding")).toBeNull()
+  expect(await small.json()).toMatchObject({ sessions: 1 })
+})
+
 /** A self-signed certificate made with `openssl`, and its SHA-256 fingerprint as `AA:BB:...`. */
 function selfSigned(dir: string, name: string) {
   const [cert, key] = [join(dir, `${name}.crt`), join(dir, `${name}.key`)]
@@ -247,6 +283,31 @@ test("a pinned client reaches only the hub presenting the pinned certificate, on
     realHub.stop(true)
     evilHub.stop(true)
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("a pinned call interrupted while its body compresses opens no connection to the hub", async () => {
+  let connections = 0
+  const listener = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: { open: (socket) => void (connections++, socket.end()), data: () => {} },
+  })
+  // A pin nothing has fetched yet, so a call that got past compression would open a TLS handshake.
+  const pin = normalizeFingerprint(crypto.getRandomValues(new Uint8Array(32)).toHex())
+  const client = makeClient({ url: `https://127.0.0.1:${listener.port}`, token, certSha256: pin })
+  const big = withText(crypto.getRandomValues(new Uint8Array(6 * 1024 * 1024)).toBase64())
+  try {
+    const fiber = Effect.runFork(client.snapshot(big))
+    await Bun.sleep(0)
+    await run(Fiber.interrupt(fiber))
+    expect(Exit.hasInterrupts(await run(Fiber.await(fiber)))).toBe(true)
+    // Outlast the abandoned compression, which runs on the thread pool, then let any connect land.
+    await promisify(gzip)(JSON.stringify(big))
+    await Bun.sleep(100)
+    expect(connections).toBe(0)
+  } finally {
+    listener.stop(true)
   }
 })
 

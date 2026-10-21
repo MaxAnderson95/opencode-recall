@@ -56,6 +56,13 @@ export const dataEmbedder = Layer.unwrap(
   }),
 )
 
+/**
+ * Seconds an idle connection stays open. It must exceed a reverse proxy's upstream keepalive
+ * (Caddy's default is 2 minutes) so the proxy always closes an idle connection first; otherwise
+ * the proxy can reuse one the hub has just closed and answer 502. Bun caps it at 255.
+ */
+const IDLE_TIMEOUT_SECONDS = 150
+
 /** The hub's listening HTTP server. */
 export class Listening extends Context.Service<Listening, { readonly url: URL }>()("@opencode-recall/hub/Listening") {}
 
@@ -87,7 +94,12 @@ const listen = Layer.effect(
     const separator = config.listen.lastIndexOf(":")
     const server = yield* Effect.acquireRelease(
       Effect.sync(() =>
-        Bun.serve({ hostname: config.listen.slice(0, separator), port: Number(config.listen.slice(separator + 1)), fetch }),
+        Bun.serve({
+          hostname: config.listen.slice(0, separator),
+          port: Number(config.listen.slice(separator + 1)),
+          idleTimeout: IDLE_TIMEOUT_SECONDS,
+          fetch,
+        }),
       ),
       (server) => Effect.promise(() => server.stop()),
     )

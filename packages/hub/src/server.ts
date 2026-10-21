@@ -1,3 +1,5 @@
+import { promisify } from "node:util"
+import { gzip as gzipCallback } from "node:zlib"
 import {
   Envelope,
   ErrorCode,
@@ -98,6 +100,33 @@ const readJson = Effect.fnUntraced(function* (req: Request, limits: Limits) {
   })
 })
 
+const gzip = promisify(gzipCallback)
+
+/** Characters of JSON below which a response goes out uncompressed, since gzip would save little. */
+const GZIP_MIN_CHARS = 16_384
+
+/** Whether the request's `Accept-Encoding` lists `gzip` with a nonzero q-value. */
+const acceptsGzip = (req: Request) =>
+  (req.headers.get("accept-encoding") ?? "").split(",").some((entry) => {
+    const [coding, ...params] = entry.split(";").map((s) => s.trim().toLowerCase())
+    const q = params.find((p) => p.startsWith("q="))
+    return coding === "gzip" && (q === undefined || Number(q.slice(2)) > 0)
+  })
+
+/**
+ * A verb's successful answer: its JSON gzipped, off the event loop, when it is large and the
+ * client accepts gzip, and as `Response.json` would send it otherwise.
+ */
+const answer = Effect.fnUntraced(function* (req: Request, result: unknown) {
+  const json = JSON.stringify(result)
+  if (json.length < GZIP_MIN_CHARS || !acceptsGzip(req))
+    return new Response(json, { headers: { "content-type": "application/json;charset=utf-8" } })
+  const body = yield* Effect.promise(() => gzip(json))
+  return new Response(body, {
+    headers: { "content-type": "application/json", "content-encoding": "gzip", vary: "accept-encoding" },
+  })
+})
+
 type Handlers = {
   [V in Verb]: (request: VerbRequest<V>, source: Source) => Effect.Effect<Responses[V], Rejected>
 }
@@ -190,11 +219,11 @@ export const makeHandler = Effect.fnUntraced(function* ({
     status: () => archive.status(),
   }
 
-  const dispatch = <V extends Verb>(verb: V, body: unknown, source: Source) =>
+  const dispatch = <V extends Verb>(req: Request, verb: V, body: unknown, source: Source) =>
     decodeRequest(verb, body).pipe(
       Effect.mapError((e) => reject("invalid_request", e.message)),
       Effect.flatMap((request) => handlers[verb](request, source)),
-      Effect.map((result) => Response.json(result)),
+      Effect.flatMap((result) => answer(req, result)),
       Effect.catchDefect((defect) =>
         Effect.logError("request failed").pipe(
           Effect.annotateLogs({ verb, error: messageOf(defect) }),
@@ -213,7 +242,7 @@ export const makeHandler = Effect.fnUntraced(function* ({
         "protocol_version",
         `client speaks protocol version ${envelope.protocolVersion}; this hub serves version ${PROTOCOL_VERSION}`,
       )
-    return yield* dispatch(verb, body, source)
+    return yield* dispatch(req, verb, body, source)
   })
 
   const handle = Effect.fnUntraced(function* (req: Request) {

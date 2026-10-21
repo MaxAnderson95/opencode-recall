@@ -21,7 +21,7 @@ docker exec recall-hub opencode-recall-hub token issue <source>
 docker exec recall-hub opencode-recall-hub status
 ```
 
-The hub speaks plain HTTP. Put it behind a Tailscale tailnet or a TLS-terminating reverse proxy, never on an open network (SPEC §4). `docker stop` sends SIGTERM, which stops the listener, waits for an in-flight embedding batch, and closes the archive.
+The hub speaks plain HTTP. Put it behind a Tailscale tailnet or a TLS-terminating reverse proxy, never on an open network (SPEC §4). The hub closes a connection after it has been idle for 150 seconds, so a proxy in front of it must keep idle upstream connections for less than that; otherwise the proxy can reuse a connection the hub has just closed and answer 502. Caddy's default upstream keepalive is 2 minutes, so the README's Caddyfile needs no setting for it. `docker stop` sends SIGTERM, which stops the listener, waits for an in-flight embedding batch, and closes the archive.
 
 ## Health and readiness
 
