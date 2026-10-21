@@ -33,6 +33,25 @@ test("equal scores rank the lower chunkId first, in a full scan and a session sc
   expect(matrix.scan(query, all, 10, "ses_new").map((h) => h.row.chunkId)).toEqual([6, 7, 8])
 })
 
+test("removing chunks frees only their rows, and the session's other rows stay in its scan", () => {
+  const matrix = createMatrix(2, 64)
+  for (let i = 0; i < 4; i++) matrix.add(row("ses_a", i), vector(1, 0))
+  matrix.add(row("ses_b", 4), vector(1, 0))
+  const query = new Float32Array([1, 0])
+  const scanned = (sessionId?: string) => matrix.scan(query, () => true, 10, sessionId).map((h) => h.row.chunkId)
+
+  matrix.removeChunks("ses_a", [1, 3, 99])
+  expect(scanned()).toEqual([0, 2, 4])
+  expect(scanned("ses_a")).toEqual([0, 2])
+  expect(matrix.stats()).toEqual({ capacity: 64, slots: 5, live: 3 })
+
+  matrix.removeChunks("ses_a", [0, 2])
+  expect(scanned("ses_a")).toEqual([])
+  matrix.add(row("ses_a", 5), vector(1, 0))
+  expect(scanned("ses_a")).toEqual([5])
+  expect(matrix.stats()).toEqual({ capacity: 64, slots: 5, live: 2 })
+})
+
 test("a session scan visits only that session's rows", () => {
   const matrix = createMatrix(2, 64)
   for (let i = 0; i < 50; i++) matrix.add(row(`ses_${i % 5}`, i), vector(1, 0))

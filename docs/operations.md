@@ -113,6 +113,12 @@ docker run --rm -v /srv/recall:/data --entrypoint sqlite3 ghcr.io/maxanderson95/
 docker start recall-hub
 ```
 
+### Upgrading to schema version 14
+
+Version 14 adds a `hash` column to `messages`, so an accepted snapshot replaces only the messages that changed instead of the whole session (#62). If it ships in the same release as 12 and 13, it runs last in the same startup transaction; otherwise it is a separate schema bump from 13. Either way the step is an `ALTER TABLE ... ADD COLUMN` with a constant default, which changes only the schema, so it adds no measurable time to the pause.
+
+Messages archived before version 14 have an empty hash, so the first snapshot accepted for each held session afterwards replaces all of that session's messages, as every snapshot did before; later snapshots diff. The plugins upload a session only when it changes, so this one-time cost spreads over normal use. On a copy of the 2026-10-20 production backup on an M5 Pro, that first snapshot of the largest session (1,826 messages held, a 6.02 MB snapshot) took 1.9 s, against 2.0 s for the same snapshot before version 14. Each later one-message append took 12 ms and wrote 0.1 MB of WAL, against 0.5 to 8.0 s and 13 to 246 MB before.
+
 ## Memory
 
 SPEC §7 budgets about 1 GB: about 280 MB for ONNX Runtime and 115 MB for the vector matrix. The production hub is over it, and ONNX Runtime takes more than that budget allows once it has embedded long inputs (below).
