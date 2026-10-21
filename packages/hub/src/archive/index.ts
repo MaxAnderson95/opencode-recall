@@ -328,7 +328,7 @@ const sameModel = (a: EmbeddingModel, b: EmbeddingModel) =>
 const blobOf = (v: Float32Array) => new Uint8Array(v.buffer, v.byteOffset, v.byteLength)
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex")
 
-/** Write a searchable part's segments and index each one from the view, so indexed text is what a delete re-reads. */
+/** Write a searchable part's segments and index each one from the view, under its segment id as the FTS rowid. */
 function segmenter(db: Database) {
   const insertSegment = db.prepare("INSERT INTO segments (part_id, start, length) VALUES (?, ?, ?)")
   const indexSegments = db.prepare(
@@ -658,12 +658,10 @@ function bind(
       }))
   }
 
-  // FTS rows first: the delete re-reads each row's text through the view to find its postings.
+  // FTS rows first: their rowids are segment ids, and the cascade deletes the segments that name them.
   const unindexSession = db.prepare(
-    `INSERT INTO fts (fts, rowid, text)
-     SELECT 'delete', v.id, v.text FROM segment_text v
-     JOIN segments seg ON seg.id = v.id JOIN parts p ON p.id = seg.part_id JOIN messages m ON m.id = p.message_id
-     WHERE m.session_id = ?`,
+    `DELETE FROM fts WHERE rowid IN (SELECT seg.id FROM segments seg
+       JOIN parts p ON p.id = seg.part_id JOIN messages m ON m.id = p.message_id WHERE m.session_id = ?)`,
   )
   const deleteSessionRow = db.prepare("DELETE FROM sessions WHERE id = ?")
   /** Cascades to messages, parts, and segments, so a shrunken transcript leaves nothing behind. */

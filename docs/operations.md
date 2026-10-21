@@ -89,13 +89,23 @@ Recovery from a failed migration:
 
 A hub never runs against an archive a newer binary migrated: it logs `archive schema version N is newer than this binary supports` and exits 1. So rolling back past a migration that succeeded means restoring the backup taken before the upgrade, and then accepting the restore's consequences above.
 
-### Upgrading to schema version 12
+### Upgrading to schema version 13
 
-Schema version 12 rebuilds the `vectors` table as a rowid table, so each embedding sits inline on its page instead of spilling into an overflow page (#60). The same release rebuilds the FTS index (#61). Both run before the listener opens, in the one startup transaction, and hold the archive's write lock until they finish: about 40 s locally for the two together, and likely 1 to 5 minutes on the production disk. Until then neither probe answers, searches fail, and the plugins retry their uploads. Take the backup first, as above.
+One release takes the archive from schema version 11 to 13. Version 12 rebuilds the `vectors` table as a rowid table, so each embedding sits inline on its page instead of spilling into an overflow page (#60). Version 13 rebuilds the FTS index as a contentless-delete index, which deletes a session's rows by rowid instead of re-reading and re-tokenizing their text (#61). Both run before the listener opens, in the one startup transaction, and hold the archive's write lock until they finish. Until then neither probe answers, searches fail, and the plugins retry their uploads. Take one backup first, as above.
 
-The vectors rebuild writes the new table before it drops the old one. On a synthetic archive of 85,000 vectors the file grew by 176 MB and the WAL peaked at 177 MB, so leave at least 360 MB free beside the archive and its backup for that step alone.
+On an M5 Pro, against a synthetic archive of 5,036 sessions ingested from a local OpenCode database (500,580 segments, 790 MB of part text, `fts_data` 260 MB) with 87,161 random 1,536-byte vectors, on 2026-10-20:
 
-Afterwards the old table's pages are free pages inside `archive.db`: about 400 MB at 85,000 vectors, more together with #61. `PRAGMA freelist_count` counts them in 4 KiB pages. SQLite reuses them as the archive grows, so the file does not shrink and nothing needs to be done. `VACUUM` is optional: it returns the free pages to the filesystem, but in WAL mode it writes the whole database through the WAL, so run it only with `serve` stopped and with free disk of about twice the archive's size:
+| step | time | peak WAL | file growth |
+| --- | --- | --- | --- |
+| vectors (11 to 12) alone | 4.7 s, 5.4 s | 182 MB | |
+| FTS (12 to 13) alone | 18.6 s | 272 MB | 5 MB |
+| both, as the release runs them | 22.2 s, 22.4 s | 454 MB | 180 MB |
+
+The FTS rebuild is about four fifths of the pause. One transaction cannot checkpoint partway, so the WAL holds both steps at once: leave at least 650 MB free beside the archive and its backup. The production disk is slower than this one, so expect the pause there to be longer; it has not been measured.
+
+The FTS index's size depends on the segments it holds, not on its history: the rebuild above left `fts_data` at 261 MB. Production's index, 366 MB on 2026-10-19, has grown under replace churn, so it should shrink by about 100 MB (inferred from the synthetic archive, not measured on a copy of production).
+
+Afterwards the old tables' pages are free pages inside `archive.db`: about 400 MB at 85,000 vectors, plus whatever the FTS index shrinks by. `PRAGMA freelist_count` counts them in 4 KiB pages. SQLite reuses them as the archive grows, so the file does not shrink and nothing needs to be done. `VACUUM` is optional: it returns the free pages to the filesystem, but in WAL mode it writes the whole database through the WAL, so run it only with `serve` stopped and with free disk of about twice the archive's size:
 
 ```sh
 docker stop recall-hub

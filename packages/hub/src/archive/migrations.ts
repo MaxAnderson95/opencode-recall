@@ -196,6 +196,19 @@ export const migrations: readonly string[] = [
   DROP TABLE vectors;
   ALTER TABLE vectors_new RENAME TO vectors;
   `,
+  // Deleting from the external-content index re-read every row through segment_text and tokenized
+  // it again, copying each part's text once per segment. A contentless-delete index removes a row
+  // by rowid alone, and no query reads its text: snippets read segment_text. FTS is derived data,
+  // so it is rebuilt here; 'rebuild' is refused on a contentless table, hence the INSERT ... SELECT.
+  // Each delete leaves a tombstone until a merge drops it: deletemerge 50 (persisted in fts_config)
+  // keeps the index near its fresh size under replace churn, where the default of 10 made inserts
+  // 6.8 times slower and 0 lets it grow as the old index did.
+  `
+  DROP TABLE fts;
+  CREATE VIRTUAL TABLE fts USING fts5(text, content='', contentless_delete=1);
+  INSERT INTO fts (fts, rank) VALUES ('deletemerge', 50);
+  INSERT INTO fts (rowid, text) SELECT id, text FROM segment_text;
+  `,
 ]
 
 /** The first schema version with segments; parts archived before it are segmented on migration. */
