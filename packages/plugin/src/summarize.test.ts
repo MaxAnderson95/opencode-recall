@@ -40,14 +40,17 @@ afterEach(async () => {
 })
 
 type Input = Parameters<Generate["text"]>[0]
+type Options = Parameters<Generate["text"]>[1]
 
 /** A model that records every prompt it is given and answers with `answer`. */
-function fakeModel(answer: (input: Input) => Promise<string> | string = () => "SUMMARY: rebased and pushed") {
+function fakeModel(
+  answer: (input: Input, options: Options) => Promise<string> | string = () => "SUMMARY: rebased and pushed",
+) {
   const calls: Input[] = []
   const generate: Generate = {
-    text: async (input) => {
+    text: async (input, options) => {
       calls.push(input)
-      return { text: await answer(input) }
+      return { text: await answer(input, options) }
     },
   }
   return { calls, generate }
@@ -59,7 +62,7 @@ async function summarize(
   generate: Generate,
   input: object,
   hubConfig: PluginConfig.Hub = config,
-  signal: AbortSignal = new AbortController().signal,
+  overrides: Partial<Pick<ToolContext, "signal" | "progress">> = {},
 ): Promise<string> {
   const layer = Layer.succeed(PluginConfig.Service, {
     hub: Effect.succeed(Option.some(hubConfig)),
@@ -69,7 +72,7 @@ async function summarize(
     excludeDirectories: Effect.succeed([]),
   })
   const tool = await Effect.runPromise(SummarizeTool.make(generate).pipe(Effect.provide(layer)))
-  const { content } = await tool.execute(input, { ...context, signal })
+  const { content } = await tool.execute(input, { ...context, signal: new AbortController().signal, ...overrides })
   if (typeof content !== "string") throw new Error("expected text content")
   return content
 }
@@ -170,10 +173,71 @@ test("cancelling a batch starts no further model call", async () => {
   })
 
   const ids = ["ses_remote", "ses_0", "ses_1", "ses_2", "ses_3"]
-  await expect(summarize(model.generate, { session_ids: ids }, config, abort.signal)).rejects.toThrow()
+  await expect(summarize(model.generate, { session_ids: ids }, config, { signal: abort.signal })).rejects.toThrow()
   // Long enough for a fifth session's hub reads and model call to start, had the batch gone on.
   await Bun.sleep(100)
   expect(model.calls).toHaveLength(4)
+})
+
+test("cached sessions in a batch return without waiting for model calls, and the output keeps input order", async () => {
+  for (let i = 0; i < 8; i++) {
+    desktop.addSession(`ses_${i}`, { title: `Session ${i}`, time: 300 + i })
+    desktop.addMessage(`ses_${i}`, "user", { text: `question ${i}` }, 301 + i)
+    await archive(`ses_${i}`)
+  }
+  const cachedIds = ["ses_0", "ses_1", "ses_2", "ses_3"]
+  await summarize(fakeModel().generate, { session_ids: cachedIds })
+
+  // Five sessions need the model, one more than may call it at once; calls are held until opened.
+  const held: (() => void)[] = []
+  let opened = false
+  let reported = 0
+  const ready = Promise.withResolvers<void>()
+  const check = () => {
+    if (reported >= cachedIds.length && held.length >= 4) ready.resolve()
+  }
+  const model = fakeModel(async () => {
+    if (!opened)
+      await new Promise<void>((resolve) => {
+        held.push(resolve)
+        check()
+      })
+    return "SUMMARY"
+  })
+  const progress = async () => {
+    reported++
+    check()
+  }
+
+  const ids = ["ses_remote", "ses_4", "ses_5", "ses_6", "ses_0", "ses_7", "ses_1", "ses_2", "ses_3"]
+  const output = summarize(model.generate, { session_ids: ids }, config, { progress })
+  await Promise.race([ready.promise, Bun.sleep(2_000)])
+  expect(reported).toBe(cachedIds.length)
+  expect(held).toHaveLength(4)
+
+  opened = true
+  for (const release of held.splice(0)) release()
+  const blocks = (await output).split("\n\n---\n\n")
+  expect(model.calls).toHaveLength(5)
+  expect(blocks.map((block) => block.split("\n")[0])).toEqual([
+    "# Fixing the ingress",
+    ...["4", "5", "6", "0", "7", "1", "2", "3"].map((i) => `# Session ${i}`),
+  ])
+  expect(blocks.filter((block) => block.includes("(cached "))).toHaveLength(cachedIds.length)
+})
+
+test("the model call gets an abort signal that aborts when the tool call is cancelled", async () => {
+  const abort = new AbortController()
+  let received: AbortSignal | undefined
+  const model = fakeModel(async (_input, options) => {
+    received = options?.signal
+    abort.abort()
+    await new Promise(() => {})
+    return "SUMMARY"
+  })
+  await expect(summarize(model.generate, { session_id: "ses_remote" }, config, { signal: abort.signal })).rejects.toThrow()
+  expect(received).toBeInstanceOf(AbortSignal)
+  expect(received!.aborted).toBe(true)
 })
 
 test("a batch of 24 sessions runs four at a time, and a larger one is refused", async () => {
