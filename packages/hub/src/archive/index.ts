@@ -391,7 +391,18 @@ function lexicalQuery(match: string, f: Filters): { sql: string; args: (string |
   return { sql, args }
 }
 
-type Space = { id: number; setId: number; recipe: SpaceRecipe }
+type Space = {
+  id: number
+  setId: number
+  recipe: SpaceRecipe
+  /**
+   * No chunk of the set below this id waits to be embedded, so finding the next batch skips the
+   * embedded ones. Held in memory only and 0 at open. It moves only past chunks that have a vector
+   * or no longer exist, a vector is deleted only with its chunk or its space, and a new chunk gets
+   * a higher id than any before it (AUTOINCREMENT), so no waiting chunk is ever below it.
+   */
+  pendingFrom: number
+}
 /** A vector already in the space, carried over to the new chunk with the same text. */
 type Reused = { row: VectorRow; embedding: Uint8Array }
 
@@ -462,7 +473,7 @@ function bind(
     const { id: setId } = db
       .query("INSERT INTO chunk_sets (space_id, time_created) VALUES (?, ?) RETURNING id")
       .get(id, Date.now()) as { id: number }
-    const created = { id, setId, recipe }
+    const created = { id, setId, recipe, pendingFrom: 0 }
     const held = db.query("SELECT id, parent_id AS parentId FROM sessions").all() as { id: string; parentId: string | null }[]
     for (const s of held) writeChunks(created, s.id, readChunkSource(s.id, s.parentId), new Map())
     return created
@@ -478,7 +489,7 @@ function bind(
            WHERE s.active = 1`,
         )
         .get() as { id: number; setId: number; recipe: string } | null
-      if (held) return { ...held, recipe: JSON.parse(held.recipe) as SpaceRecipe }
+      if (held) return { ...held, recipe: JSON.parse(held.recipe) as SpaceRecipe, pendingFrom: 0 }
       // Sessions archived before vector spaces existed are chunked into the first one.
       return createSpace(configured, true)
     })
@@ -493,9 +504,11 @@ function bind(
   const selectPending = db.prepare(
     `SELECT c.id AS chunkId, c.session_id AS sessionId, c.message_id AS messageId, c.time_created AS time, c.scope, c.text
      FROM chunks c
-     WHERE c.chunk_set_id = ? AND NOT EXISTS (SELECT 1 FROM vectors v INDEXED BY vectors_chunk_space_idx WHERE v.chunk_id = c.id AND v.space_id = ?)
+     WHERE c.chunk_set_id = ? AND c.id >= ?
+       AND NOT EXISTS (SELECT 1 FROM vectors v INDEXED BY vectors_chunk_space_idx WHERE v.chunk_id = c.id AND v.space_id = ?)
      ORDER BY c.id LIMIT ?`,
   )
+  const selectLastChunkId = db.prepare("SELECT coalesce(max(id), 0) AS id FROM chunks WHERE chunk_set_id = ?")
   const selectSpaceVectors = db.prepare(
     `SELECT c.id AS chunkId, c.session_id AS sessionId, c.message_id AS messageId, c.time_created AS time, c.scope,
        v.embedding
@@ -525,14 +538,27 @@ function bind(
   /** Embed up to `limit` of `target`'s unembedded chunks, oldest first; `stored` are the vectors written. */
   const embedInto = Effect.fnUntraced(function* (target: Space, limit: number) {
     type Pending = VectorRow & { text: string }
-    const pending = (selectPending.all(target.setId, target.id, limit) as Pending[]).map(({ text, ...row }) => ({ row, text }))
-    if (!pending.length) return { taken: 0, stored: [] }
+    // LIMIT 0 finds no rows even with chunks waiting, which would pass the cursor over them.
+    if (limit === 0) return { taken: 0, stored: [] }
+    const pending = (selectPending.all(target.setId, target.pendingFrom, target.id, limit) as Pending[]).map(
+      ({ text, ...row }) => ({ row, text }),
+    )
+    // Overlapping calls on one space may finish out of order, so the cursor only ever moves up.
+    const advance = (to: number) => void (target.pendingFrom = Math.max(target.pendingFrom, to))
+    if (!pending.length) {
+      // Nothing waits now, and any chunk written later gets a higher id than every one held.
+      advance((selectLastChunkId.get(target.setId) as { id: number }).id + 1)
+      return { taken: 0, stored: [] }
+    }
     const embedded = yield* embedder.embed(pending.map((p) => p.text))
     if (embedded.length !== pending.length || embedded.some((v) => v.length !== target.recipe.dims))
       return yield* new BadVectors({
         message: `embedder returned ${embedded.length} vectors for ${pending.length} chunks, or the wrong dimensions`,
       })
-    return { taken: pending.length, stored: storeVectors.immediate(target, pending.map((p) => p.row), embedded) }
+    const stored = storeVectors.immediate(target, pending.map((p) => p.row), embedded)
+    // Only once the batch commits: every chunk it took now has a vector or was deleted meanwhile.
+    advance(pending.at(-1)!.row.chunkId + 1)
+    return { taken: pending.length, stored }
   })
 
   const embedPending = Effect.fn("Archive.embedPending")(function* (limit: number) {
