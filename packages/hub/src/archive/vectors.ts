@@ -7,52 +7,62 @@ export type VectorRow = { chunkId: number; sessionId: string; messageId: string;
 
 export type Matrix = ReturnType<typeof createMatrix>
 
-/** Rows the matrix has room for, slots in use (live rows and removed rows not yet compacted away), and live rows. */
+/** Rows the matrix has room for, slots in use (live rows and removed rows' slots waiting for the next added rows), and live rows. */
 export type MatrixStats = { capacity: number; slots: number; live: number }
 
-export function createMatrix(dims: number) {
-  let data = new Float32Array(0)
-  /** `null` marks a removed row, reclaimed by the next compaction. */
-  let rows: (VectorRow | null)[] = []
-  let bySession = new Map<string, number[]>()
-  let removed = 0
+const HEADROOM_ROWS = 1024
 
-  function append(row: VectorRow, vector: Float32Array) {
-    if ((rows.length + 1) * dims > data.length) {
-      const grown = new Float32Array(Math.max(1024, rows.length * 2) * dims)
+/** Room for `count` vectors about to be loaded plus a tenth, so loading allocates once and ingest grows rarely. */
+export const loadCapacity = (count: number) => Math.max(HEADROOM_ROWS, Math.ceil(count * 1.1))
+
+/**
+ * A matrix with room for `capacity` rows. Capacity never shrinks: removed rows' slots go to the next
+ * added rows, so it stays within about 1.25 times the most live rows since load, plus 1,024.
+ */
+export function createMatrix(dims: number, capacity: number) {
+  let data = new Float32Array(capacity * dims)
+  let bytes = new Uint8Array(data.buffer)
+  /** `null` marks a removed row, whose slot is on `free` for the next added row. */
+  const rows: (VectorRow | null)[] = []
+  const free: number[] = []
+  const bySession = new Map<string, number[]>()
+
+  function slot(): number {
+    const reused = free.pop()
+    if (reused !== undefined) return reused
+    if (rows.length * dims === data.length) {
+      const full = data.length / dims
+      const grown = new Float32Array(Math.max(full + HEADROOM_ROWS, Math.ceil(full * 1.25)) * dims)
       grown.set(data)
       data = grown
+      bytes = new Uint8Array(data.buffer)
     }
-    data.set(vector, rows.length * dims)
-    const indexes = bySession.get(row.sessionId)
-    if (indexes) indexes.push(rows.length)
-    else bySession.set(row.sessionId, [rows.length])
-    rows.push(row)
-  }
-
-  function compact() {
-    // The subarrays keep the old buffer alive until they are copied into the new one.
-    const live = rows.flatMap((row, i) => (row ? [{ row, vector: data.subarray(i * dims, (i + 1) * dims) }] : []))
-    data = new Float32Array(Math.max(1024, live.length * 2) * dims)
-    rows = []
-    bySession = new Map()
-    removed = 0
-    for (const { row, vector } of live) append(row, vector)
+    rows.push(null)
+    return rows.length - 1
   }
 
   return {
-    add: append,
+    /** Add `row` with its vector's bytes as stored in the database, copied straight into the matrix. */
+    add(row: VectorRow, embedding: Uint8Array) {
+      const i = slot()
+      bytes.set(embedding, i * dims * Float32Array.BYTES_PER_ELEMENT)
+      rows[i] = row
+      const indexes = bySession.get(row.sessionId)
+      if (indexes) indexes.push(i)
+      else bySession.set(row.sessionId, [i])
+    },
 
     removeSession(sessionId: string) {
       const indexes = bySession.get(sessionId)
       if (!indexes) return
-      for (const i of indexes) rows[i] = null
-      removed += indexes.length
+      for (const i of indexes) {
+        rows[i] = null
+        free.push(i)
+      }
       bySession.delete(sessionId)
-      if (removed > 1024 && removed * 2 > rows.length) compact()
     },
 
-    stats: (): MatrixStats => ({ capacity: data.length / dims, slots: rows.length, live: rows.length - removed }),
+    stats: (): MatrixStats => ({ capacity: data.length / dims, slots: rows.length, live: rows.length - free.length }),
 
     /** The `limit` best rows by dot product with `query` (the cosine, as both are normalized) among those `accept` keeps. */
     scan(query: Float32Array, accept: (row: VectorRow) => boolean, limit: number): { row: VectorRow; score: number }[] {

@@ -29,7 +29,7 @@ import { Embedder, type EmbeddingModel } from "../embedder.ts"
 import { DEFAULT_CHUNKING, RENDERING_VERSION, renderChunks, type ChunkParams, type ChunkSource } from "./chunks.ts"
 import { SEGMENTED, migrations } from "./migrations.ts"
 import { clean, cut, ftsQuery, fuse, makeSnippet, middleOut, queryTokens, segments, transcriptBlock } from "./text.ts"
-import { createMatrix, type Matrix, type MatrixStats, type VectorRow } from "./vectors.ts"
+import { createMatrix, loadCapacity, type Matrix, type MatrixStats, type VectorRow } from "./vectors.ts"
 
 export const SCHEMA_VERSION = migrations.length
 
@@ -319,8 +319,6 @@ const sameModel = (a: EmbeddingModel, b: EmbeddingModel) =>
   a.queryPrefix === b.queryPrefix
 
 const blobOf = (v: Float32Array) => new Uint8Array(v.buffer, v.byteOffset, v.byteLength)
-/** Copied, since a blob's bytes need not be aligned for a `Float32Array` view. */
-const vectorOf = (blob: Uint8Array) => new Float32Array(blob.slice().buffer)
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex")
 
 /** Write a searchable part's segments and index each one from the view, so indexed text is what a delete re-reads. */
@@ -395,7 +393,7 @@ function lexicalQuery(match: string, f: Filters): { sql: string; args: (string |
 
 type Space = { id: number; setId: number; recipe: SpaceRecipe }
 /** A vector already in the space, carried over to the new chunk with the same text. */
-type Reused = { row: VectorRow; vector: Float32Array }
+type Reused = { row: VectorRow; embedding: Uint8Array }
 
 function bind(
   db: Database,
@@ -440,7 +438,7 @@ function bind(
       const chunkId = Number(lastInsertRowid)
       insertVector.run(chunkId, space.id, embedding, chunkId)
       const row = { chunkId, sessionId, messageId: chunk.messageId, time: chunk.time, scope: chunk.scope }
-      reused.push({ row, vector: vectorOf(embedding) })
+      reused.push({ row, embedding })
     }
     return reused
   }
@@ -511,16 +509,16 @@ function bind(
   let matrix: Matrix | null = null
   function vectors(): Matrix {
     if (matrix) return matrix
-    const loaded = createMatrix(space.recipe.dims)
+    const loaded = createMatrix(space.recipe.dims, loadCapacity((countVectors.get(space.id) as { n: number }).n))
     for (const { embedding, ...row } of selectSpaceVectors.iterate(space.id) as Iterable<VectorRow & { embedding: Uint8Array }>)
-      loaded.add(row, vectorOf(embedding))
+      loaded.add(row, embedding)
     return (matrix = loaded)
   }
 
   const storeVectors = db.transaction((target: Space, rows: VectorRow[], embedded: Float32Array[]): Reused[] =>
     rows.flatMap((row, i) => {
-      const vector = embedded[i]!
-      return insertVector.run(row.chunkId, target.id, blobOf(vector), row.chunkId).changes ? [{ row, vector }] : []
+      const embedding = blobOf(embedded[i]!)
+      return insertVector.run(row.chunkId, target.id, embedding, row.chunkId).changes ? [{ row, embedding }] : []
     }),
   )
 
@@ -540,7 +538,7 @@ function bind(
   const embedPending = Effect.fn("Archive.embedPending")(function* (limit: number) {
     if (!embedderFits) return 0
     const { taken, stored } = yield* embedInto(space, limit)
-    for (const { row, vector } of stored) matrix?.add(row, vector)
+    for (const { row, embedding } of stored) matrix?.add(row, embedding)
     return taken
   })
 
@@ -1078,7 +1076,7 @@ function bind(
     const { result, reused } = putSnapshotTx.immediate(snapshot, sourceId)
     if (matrix && (result === "archived" || result === "rewound")) {
       matrix.removeSession(snapshot.session.id)
-      for (const { row, vector } of reused) matrix.add(row, vector)
+      for (const { row, embedding } of reused) matrix.add(row, embedding)
     }
     return result
   })
