@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, expect, test } from "bun:test"
+import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test"
+import { heapStats } from "bun:jsc"
 import { Database } from "bun:sqlite"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -6,7 +7,7 @@ import { join } from "node:path"
 import { makeClient } from "@opencode-recall/protocol"
 import { Effect } from "effect"
 import { sourceDb, startHub, type SourceDb } from "./fixture.ts"
-import { EXTRACTOR_VERSION, readPosition, readPositions, readSession, readSnapshot } from "./source.ts"
+import { CACHE_LIMITS, EXTRACTOR_VERSION, cachedSnapshots, readPosition, readPositions, readSession, readSnapshot } from "./source.ts"
 
 function demo(): SourceDb {
   const source = sourceDb()
@@ -176,6 +177,125 @@ test("the content hash changes with content and not with a re-read", () => {
   expect(readSnapshot(source.db, "ses_a")!.contentHash).toBe(first.contentHash)
   source.addMessage("ses_a", "user", { text: "and hidden files?" }, 105)
   expect(readSnapshot(source.db, "ses_a")!.contentHash).not.toBe(first.contentHash)
+})
+
+/** The `data` strings `read` parsed. */
+function parsedBy<A>(read: () => A): { result: A; parsed: unknown[] } {
+  const parse = spyOn(JSON, "parse")
+  try {
+    const result = read()
+    return { result, parsed: parse.mock.calls.map(([text]) => text) }
+  } finally {
+    parse.mockRestore()
+  }
+}
+
+const dataOf = (id: string) => (source.db.query("SELECT data FROM session_message WHERE id = ?").get(id) as { data: string }).data
+
+test("a cached snapshot parses data only for new and changed rows and matches an uncached one", () => {
+  const snapshot = cachedSnapshots(source.db)
+  // Bookkeeping rows are never parsed, cached or not.
+  expect(parsedBy(() => snapshot("ses_a"))).toEqual({
+    result: readSnapshot(source.db, "ses_a"),
+    parsed: [dataOf("msg_ses_a_2"), dataOf("msg_ses_a_4")],
+  })
+  expect(parsedBy(() => snapshot("ses_a"))).toEqual({ result: readSnapshot(source.db, "ses_a"), parsed: [] })
+
+  source.updateMessage("ses_a", "msg_ses_a_2", { text: "how do I list hidden files?" }, 200)
+  expect(parsedBy(() => snapshot("ses_a"))).toEqual({ result: readSnapshot(source.db, "ses_a"), parsed: [dataOf("msg_ses_a_2")] })
+
+  source.addMessage("ses_a", "user", { text: "and sizes?" }, 201)
+  expect(parsedBy(() => snapshot("ses_a"))).toEqual({ result: readSnapshot(source.db, "ses_a"), parsed: [dataOf("msg_ses_a_7")] })
+  expect(parsedBy(() => snapshot("ses_a"))).toEqual({ result: readSnapshot(source.db, "ses_a"), parsed: [] })
+  expect(snapshot("ses_missing")).toBeNull()
+})
+
+test("a cached snapshot drops deleted rows and re-reads a row written in the millisecond of the last read", () => {
+  const snapshot = cachedSnapshots(source.db)
+  snapshot("ses_a")
+  source.db.run("DELETE FROM session_message WHERE id = 'msg_ses_a_4'")
+  expect(snapshot("ses_a")!.session.messages.map((m) => m.id)).toEqual(["msg_ses_a_2"])
+  expect(snapshot("ses_a")).toEqual(readSnapshot(source.db, "ses_a"))
+
+  try {
+    setSystemTime(new Date(1_000))
+    source.addMessage("ses_a", "user", { text: "draft" }, 1_000)
+    expect(snapshot("ses_a")!.session.messages.at(-1)!.parts).toEqual([{ kind: "text", text: "draft" }])
+    source.updateMessage("ses_a", "msg_ses_a_6", { text: "final" }, 1_000)
+    setSystemTime(new Date(2_000))
+    expect(parsedBy(() => snapshot("ses_a"))).toEqual({ result: readSnapshot(source.db, "ses_a"), parsed: [dataOf("msg_ses_a_6")] })
+    expect(parsedBy(() => snapshot("ses_a")).parsed).toEqual([])
+  } finally {
+    setSystemTime()
+  }
+})
+
+test("a cached snapshot re-reads a row another connection rewrote in the same millisecond during the read", () => {
+  const path = join(dataDir, "opencode.db")
+  const writer = sourceDb(path)
+  writer.db.run("PRAGMA journal_mode = WAL")
+  writer.addSession("ses_w")
+  const reader = new Database(path, { readonly: true })
+  try {
+    setSystemTime(new Date(1_000))
+    writer.addMessage("ses_w", "user", { text: "draft" }, 1_000)
+    const snapshot = cachedSnapshots(reader)
+    const query = reader.query.bind(reader)
+    let queries = 0
+    // After the transaction's first query has fixed what it sees, the writer rewrites the row
+    // within the same millisecond, and the clock moves on before the rest of the read.
+    const spy = spyOn(reader, "query").mockImplementation((sql: string) => {
+      if (++queries === 2) {
+        writer.updateMessage("ses_w", "msg_ses_w_2", { text: "final" }, 1_000)
+        setSystemTime(new Date(1_001))
+      }
+      return query(sql)
+    })
+    expect(snapshot("ses_w")!.session.messages[0]!.parts).toEqual([{ kind: "text", text: "draft" }])
+    spy.mockRestore()
+    expect(snapshot("ses_w")!.session.messages[0]!.parts).toEqual([{ kind: "text", text: "final" }])
+  } finally {
+    setSystemTime()
+    reader.close()
+    writer.close()
+  }
+})
+
+test("a cached session holds only the text it kept from oversized tool output", () => {
+  source.addSession("ses_big")
+  for (let i = 0; i < 4; i++) {
+    const output = String.fromCharCode(97 + i).repeat(8 * 1024 * 1024)
+    source.addMessage("ses_big", "assistant", { content: [tool("bash", { status: "completed", input: {}, content: [{ type: "text", text: output }] })] }, 101 + i)
+  }
+  const snapshot = cachedSnapshots(source.db)
+  const heap = () => (Bun.gc(true), heapStats().heapSize)
+  const before = heap()
+  // Each row's extraction allocates its 8 MB output; only 16,000 characters of each are kept.
+  expect(snapshot("ses_big")!.session.messages.map((m) => m.parts[0]!.text.length)).toEqual([16_000, 16_000, 16_000, 16_000])
+  expect(heap() - before).toBeLessThan(4 * 1024 * 1024)
+  expect(snapshot("ses_big")).toEqual(readSnapshot(source.db, "ses_big"))
+})
+
+test("the snapshot cache evicts the least recently read session past its session and byte limits", () => {
+  for (const id of ["ses_b", "ses_c"]) {
+    source.addSession(id)
+    source.addMessage(id, "user", { text: "x".repeat(1_000) }, 101)
+  }
+  const parses = (snapshot: (id: string) => unknown, id: string) => parsedBy(() => snapshot(id)).parsed.length
+
+  const byCount = cachedSnapshots(source.db, { sessions: 2, bytes: CACHE_LIMITS.bytes })
+  for (const id of ["ses_a", "ses_b", "ses_c"]) byCount(id)
+  expect([parses(byCount, "ses_c"), parses(byCount, "ses_b"), parses(byCount, "ses_a")]).toEqual([0, 0, 2])
+  expect(parses(byCount, "ses_c")).toBe(1)
+
+  // One 1,000-character message is a little over 2,000 bytes, so one session fits and two do not.
+  const byBytes = cachedSnapshots(source.db, { sessions: 16, bytes: 3_000 })
+  byBytes("ses_b")
+  byBytes("ses_c")
+  expect([parses(byBytes, "ses_c"), parses(byBytes, "ses_b"), parses(byBytes, "ses_c")]).toEqual([0, 1, 1])
+
+  const tooSmall = cachedSnapshots(source.db, { sessions: 16, bytes: 1_000 })
+  expect([parses(tooSmall, "ses_b"), parses(tooSmall, "ses_b")]).toEqual([1, 1])
 })
 
 test("an uploaded session is stored by the hub as sessions, messages, and parts rows", async () => {

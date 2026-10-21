@@ -52,6 +52,11 @@ export function sourceDb(path = ":memory:") {
         JSON.stringify(data),
       ])
     },
+    /** Rewrite a message's `data`, bumping its `time_updated` as OpenCode does on every update. */
+    updateMessage(sessionId: string, messageId: string, data: object, time: number) {
+      db.run("UPDATE session_message SET data = ?, time_updated = ? WHERE id = ?", [JSON.stringify(data), time, messageId])
+      advance(sessionId)
+    },
     rename(sessionId: string, title: string, time: number) {
       db.run("UPDATE session_v2 SET title = ?, time_updated = ? WHERE id = ?", [title, time, sessionId])
       advance(sessionId)

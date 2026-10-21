@@ -29,6 +29,13 @@ type MessageRow = { id: string; type: string; time_created: number; data: string
 
 const isMessageType = Schema.is(MessageType)
 
+/** The message a kept row contributes, or `null` for a bookkeeping row, which is never parsed. */
+function toMessage(m: MessageRow): Message | null {
+  const type = m.type
+  if (!isMessageType(type)) return null
+  return { id: m.id, type, timeCreated: m.time_created, parts: extractParts(type, JSON.parse(m.data)) }
+}
+
 // Summarizer workers are never uploaded, so they are invisible to everything that reads a session.
 const UPLOADED = `substr(coalesce(s.title, ''), 1, ${WORKER_PREFIX.length}) <> '${WORKER_PREFIX}'`
 
@@ -70,10 +77,108 @@ export function readSnapshot(db: Database, sessionId: string): Snapshot | null {
   return db.transaction(() => {
     const position = readPosition(db, sessionId)
     const session = readSession(db, sessionId)
-    if (!position || !session) return null
-    const contentHash = createHash("sha256").update(JSON.stringify(session)).digest("hex")
-    return { session, ...position, contentHash, extractorVersion: EXTRACTOR_VERSION }
+    return position && session && toSnapshot(position, session)
   })()
+}
+
+function toSnapshot(position: Position, session: Session): Snapshot {
+  const contentHash = createHash("sha256").update(JSON.stringify(session)).digest("hex")
+  return { session, ...position, contentHash, extractorVersion: EXTRACTOR_VERSION }
+}
+
+/** How much `cachedSnapshots` holds: sessions, and bytes counted as extracted message JSON length times 2. */
+export interface CacheLimits {
+  readonly sessions: number
+  readonly bytes: number
+}
+
+export const CACHE_LIMITS: CacheLimits = { sessions: 16, bytes: 64 * 1024 * 1024 }
+
+type MessageMeta = { id: string; type: string; time_created: number; time_updated: number }
+
+interface Extracted {
+  readonly message: Message
+  readonly timeUpdated: number
+  readonly bytes: number
+}
+
+interface Entry {
+  readonly messages: ReadonlyMap<string, Extracted>
+  readonly bytes: number
+}
+
+/**
+ * `readSnapshot`, remembering the extracted messages of the most recently snapshotted sessions so
+ * the next snapshot of one parses `data` only for rows that are new or whose `time_updated`
+ * changed. OpenCode sets `session_message.time_updated` on every insert and update. Its output is
+ * identical to `readSnapshot`'s.
+ */
+export function cachedSnapshots(db: Database, limits: CacheLimits = CACHE_LIMITS): (sessionId: string) => Snapshot | null {
+  // Map order is recency: the first entry is the least recently snapshotted.
+  const entries = new Map<string, Entry>()
+  let held = 0
+
+  const forget = (sessionId: string) => {
+    held -= entries.get(sessionId)?.bytes ?? 0
+    entries.delete(sessionId)
+  }
+
+  return (sessionId) => {
+    // A row written later in the millisecond the read started could carry this same
+    // `time_updated`, so only rows strictly older than the read are remembered. The clock is read
+    // before the transaction's first query, which is where SQLite fixes what the read sees.
+    const readAt = Date.now()
+    return db.transaction(() => {
+      const cached = entries.get(sessionId)?.messages
+      forget(sessionId)
+      const position = readPosition(db, sessionId)
+      const row = readSessionRow(db, sessionId)
+      if (!position || !row) return null
+
+      const rows = (
+        db
+          .query("SELECT id, type, time_created, time_updated FROM session_message WHERE session_id = ? ORDER BY seq")
+          .all(sessionId) as MessageMeta[]
+      ).filter((m) => isMessageType(m.type))
+      const stale = rows.filter((m) => cached?.get(m.id)?.timeUpdated !== m.time_updated).map((m) => m.id)
+      const fresh = new Map(
+        (
+          db
+            .query(
+              `SELECT id, type, time_created, time_updated, data FROM session_message
+               WHERE session_id = ? AND id IN (SELECT value FROM json_each(?))`,
+            )
+            .all(sessionId, JSON.stringify(stale)) as (MessageRow & MessageMeta)[]
+        ).flatMap((m): [string, Extracted][] => {
+          const extracted = toMessage(m)
+          if (!extracted) return []
+          // Extraction slices strings out of ones as large as the row, and a slice keeps its whole
+          // source alive; the copy holds only the kept characters, so the byte count is honest.
+          const message = structuredClone(extracted)
+          return [[m.id, { message, timeUpdated: m.time_updated, bytes: JSON.stringify(message).length * 2 }]]
+        }),
+      )
+
+      const kept = new Map<string, Extracted>()
+      const messages = rows.flatMap((m): Message[] => {
+        const extracted = fresh.get(m.id) ?? cached?.get(m.id)
+        if (!extracted) return []
+        if (extracted.timeUpdated < readAt) kept.set(m.id, extracted)
+        return [extracted.message]
+      })
+
+      const bytes = [...kept.values()].reduce((sum, m) => sum + m.bytes, 0)
+      if (bytes <= limits.bytes) {
+        entries.set(sessionId, { messages: kept, bytes })
+        held += bytes
+        for (const oldest of entries.keys()) {
+          if (entries.size <= limits.sessions && held <= limits.bytes) break
+          forget(oldest)
+        }
+      }
+      return toSnapshot(position, toSession(row, messages))
+    })()
+  }
 }
 
 /** Time of the session's latest completed compaction, or 0 if it never compacted. */
@@ -89,24 +194,26 @@ export function compactionBoundary(db: Database, sessionId: string): number {
 
 /** Read one v2 session's transcript, or `null` if the database does not hold it or it is never uploaded. */
 export function readSession(db: Database, sessionId: string): Session | null {
-  const row = db
-    .query(
-      `SELECT id, slug, title, directory, parent_id, time_created, time_updated FROM session_v2 s
-       WHERE ${UPLOADED} AND id = ?`,
-    )
-    .get(sessionId) as SessionRow | null
+  const row = readSessionRow(db, sessionId)
   if (!row) return null
 
   const rows = db
     .query("SELECT id, type, time_created, data FROM session_message WHERE session_id = ? ORDER BY seq")
     .all(sessionId) as MessageRow[]
 
-  const messages = rows.flatMap((m): Message[] => {
-    const type = m.type
-    if (!isMessageType(type)) return []
-    return [{ id: m.id, type, timeCreated: m.time_created, parts: extractParts(type, JSON.parse(m.data)) }]
-  })
+  return toSession(row, rows.flatMap((m) => toMessage(m) ?? []))
+}
 
+function readSessionRow(db: Database, sessionId: string): SessionRow | null {
+  return db
+    .query(
+      `SELECT id, slug, title, directory, parent_id, time_created, time_updated FROM session_v2 s
+       WHERE ${UPLOADED} AND id = ?`,
+    )
+    .get(sessionId) as SessionRow | null
+}
+
+function toSession(row: SessionRow, messages: Message[]): Session {
   return {
     id: row.id,
     slug: row.slug,
@@ -130,17 +237,17 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode-recall/plugin/Source") {}
 
-/** Read `db`, which the caller owns and closes. */
+/** Read `db`, which the caller owns and closes. Each build holds its own snapshot cache. */
 export const fromDatabase = (db: Database) =>
-  Layer.succeed(
-    Service,
-    Service.of({
+  Layer.sync(Service, () => {
+    const snapshot = cachedSnapshots(db)
+    return Service.of({
       position: (sessionId) => Effect.sync(() => Option.fromNullishOr(readPosition(db, sessionId))),
       positions: () => Effect.sync(() => readPositions(db)),
-      snapshot: (sessionId) => Effect.sync(() => Option.fromNullishOr(readSnapshot(db, sessionId))),
+      snapshot: (sessionId) => Effect.sync(() => Option.fromNullishOr(snapshot(sessionId))),
       compactionBoundary: (sessionId) => Effect.sync(() => compactionBoundary(db, sessionId)),
-    }),
-  )
+    })
+  })
 
 /** Open the database at `path` read-only for the layer's lifetime. */
 export const layer = (path: string) =>
