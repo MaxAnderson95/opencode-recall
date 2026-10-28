@@ -123,6 +123,8 @@ docker run --rm -v /srv/recall:/data --entrypoint sqlite3 ghcr.io/maxanderson95/
 docker start recall-hub
 ```
 
+Run the `sqlite3` container as the same user as `serve` (`--user` with the uid it runs as), so the WAL file it creates stays writable by the hub. Until a `VACUUM`, a backup copies the free pages' stale contents too: after the upgrade the production backups grew from 677 MB to about 870 MB compressed. On 2026-10-28 production's `VACUUM`, a week after the upgrade, took 67 s with `serve` stopped (71 s of downtime in all) and took `archive.db` from 2.22 GB, 125,827 of its pages free, to 1.69 GB.
+
 ### Upgrading to schema version 14
 
 Version 14 adds a `hash` column to `messages`, so an accepted snapshot replaces only the messages that changed instead of the whole session (#62). If it ships in the same release as 12 and 13, it runs last in the same startup transaction; otherwise it is a separate schema bump from 13. Either way the step is an `ALTER TABLE ... ADD COLUMN` with a constant default, which changes only the schema, so it adds no measurable time to the pause.
@@ -131,7 +133,7 @@ Messages archived before version 14 have an empty hash, so the first snapshot ac
 
 ## Memory
 
-SPEC §7 budgets about 1 GB: about 280 MB for ONNX Runtime and 115 MB for the vector matrix. The production hub is over it, and ONNX Runtime takes more than that budget allows once it has embedded long inputs (below).
+SPEC §7 budgets about 1 GB: about 280 MB for ONNX Runtime and 115 MB for the vector matrix. v0.1.2 ran over it in production; v0.2.0 runs at about 400 MB (below). With the CPU memory arena on, ONNX Runtime takes more than that budget allows once it has embedded long inputs.
 
 ### The `memory` line
 
@@ -167,7 +169,20 @@ v0.1.2 after 25 days of uptime, before the `memory` line existed, read from `/pr
 
 Replaying the production log through the matrix's growth and compaction rules estimates about 131,000 written slots (about 201 MB), about 43,000 of them removed; that is an estimate, not a reading. Loading the vectors at the restart on 2026-09-24 took 59.4 s (the `vectors loaded` line).
 
-Readings from a build that logs the `memory` line are not yet recorded: the startup line, the first hourly line, and a line at least 24 hours after start.
+### Production, v0.2.0
+
+The `memory` lines from v0.2.0's first week on the production host (4 vCPUs, no CPU limit, threads at the runtime default), started 2026-10-21 13:12 UTC right after the migration to schema version 14. MB are 10^6 bytes.
+
+| point | `rss` | `jscHeapSize` | `jscHeapCapacity` | `jscExtraMemory` | matrix capacity / slots / live |
+| --- | --- | --- | --- | --- | --- |
+| startup, 2026-10-21 13:13 | 337 | 171 | 177 | 155 | 95,745 / 87,040 / 87,040 |
+| first hourly line, 14:13 | 406 | 178 | 186 | 157 | 95,745 / 87,120 / 87,120 |
+| 24 hours, 2026-10-22 13:13 | 395 | 176 | 184 | 155 | 95,745 / 87,717 / 87,717 |
+| 7 days, 2026-10-28 14:13 | 371 | 177 | 185 | 155 | 95,745 / 90,753 / 90,753 |
+
+Over the 170 lines of that week `rss` ranged from 337 to 481 MB, median about 405 MB. `VmHWM` on 2026-10-28 was 740,328 kB; the peak fell between two hourly lines, so its cause is not recorded. The JS heap stayed flat, and the matrix never held a dead slot: live rows grew by 3,713 within the capacity it was loaded with. That week the hub archived 1,659 snapshots and answered 16 uploads `unchanged`.
+
+Against v0.1.2 on 2026-10-19 (above), resident memory fell from about 1.1 GB to about 400 MB and the peak from 1.37 GB to 740 MB, with 6% more vectors held.
 
 ### Local reproductions
 
@@ -231,6 +246,6 @@ Turning the arena off cost 5% of chunk throughput and about 0.6 ms per query, an
 
 ### Causes and the issues that address them
 
-- The matrix's dead slots: before #54, removed rows kept their slots until half the matrix was dead, and capacity doubled on growth. #54 presizes the matrix at load, grows it by a quarter, and gives a removed row's slot to the next added row; production readings with it are not yet taken.
-- ONNX Runtime's CPU memory arena, which kept the peak of the longest batches it had embedded. #72 turns it off (above); production readings with it off are not yet taken.
+- The matrix's dead slots: before #54, removed rows kept their slots until half the matrix was dead, and capacity doubled on growth. #54 presizes the matrix at load, grows it by a quarter, and gives a removed row's slot to the next added row; in production's first week on v0.2.0 the matrix held no dead slot (above).
+- ONNX Runtime's CPU memory arena, which kept the peak of the longest batches it had embedded. #72 turns it off (above). Production on v0.2.0 is in the readings above; they include every change in that release, so they do not separate the arena's share.
 - Upload parse residue: each snapshot's body and its parsed form, and the allocator pages ingest leaves resident. #71 caps ingest at two snapshots at once (see above).
